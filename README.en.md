@@ -24,11 +24,12 @@ See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage dir
 
 ## Current status
 
-**Milestone 1 is complete.**
+**Milestone 1 and the external adapter protocol milestone are complete.**
 
 Currently supported:
 
-- Owncast as the first platform adapter;
+- external executable adapters, with a platform-agnostic Core and Owncast as the first adapter;
+- the foundation for schema-driven adapter input and settings; future settings and authentication interactions can use the same generic protocol surface;
 - ordinary HLS master/media playlists;
 - direct acquisition of MPEG-TS/fMP4-style source objects;
 - SHA-256 and size metadata for captured payloads;
@@ -57,7 +58,9 @@ Not supported yet:
 Requires Go 1.23+.
 
 ```sh
-DATA_DIR=./data ADDR=:8080 go run ./cmd/archiver
+mkdir -p adapters
+go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
+DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=:8080 go run ./cmd/archiver
 ```
 
 Then open `http://localhost:8080/`.
@@ -75,6 +78,9 @@ The container uses `/data` for persistent recording storage. The Docker image/ru
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/healthz` | Health check |
+| `GET` | `/api/adapters` | Available adapters and status |
+| `GET` | `/api/adapters/{id}/schema` | Adapter input and settings schema |
+| `GET` / `PUT` | `/api/adapters/{id}/config` | Plugin-defined settings; secret values are never returned |
 | `POST` | `/api/recordings` | Start recording |
 | `GET` | `/api/recordings` | List recordings |
 | `GET` | `/api/recordings/{id}` | Recording details |
@@ -83,12 +89,12 @@ The container uses `/data` for persistent recording storage. The Docker image/ru
 | `GET` | `/api/recordings/{id}/play/tracks/{track}/playlist.m3u8` | Generated VOD media playlist |
 | `GET` | `/api/recordings/{id}/play/segments/{segmentID}` | Original stored payload |
 
-Start an Owncast recording:
+Start a recording with the first adapter:
 
 ```sh
 curl -X POST http://localhost:8080/api/recordings \
   -H 'Content-Type: application/json' \
-  -d '{"source_url":"https://watch.owncast.online","title":"optional title"}'
+  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title"}'
 ```
 
 ## Development
@@ -102,6 +108,7 @@ go build ./...
 ## Roadmap
 
 - [x] Original segment acquisition + restart-safe VOD playback
+- [x] Platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
 - [ ] Broadcast metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
 - [ ] Full browser UI

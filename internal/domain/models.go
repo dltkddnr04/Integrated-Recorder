@@ -2,6 +2,8 @@ package domain
 
 import "time"
 
+import "github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+
 type RecordingState string
 
 const (
@@ -13,18 +15,21 @@ const (
 
 // Recording is the self-describing root document for one captured stream.
 type Recording struct {
-	FormatVersion int                `json:"format_version"`
-	ID            string             `json:"id"`
-	Title         string             `json:"title,omitempty"`
-	SourceURL     string             `json:"source_url"`
-	State         RecordingState     `json:"state"`
-	CreatedAt     time.Time          `json:"created_at"`
-	StartedAt     time.Time          `json:"started_at"`
-	StoppedAt     *time.Time         `json:"stopped_at,omitempty"`
-	Tracks        map[string]*Track  `json:"tracks"`
-	Gaps          []Gap              `json:"gaps,omitempty"`
-	Snapshots     []ManifestSnapshot `json:"manifest_snapshots,omitempty"`
-	LastError     string             `json:"last_error,omitempty"`
+	FormatVersion int                       `json:"format_version"`
+	ID            string                    `json:"id"`
+	Title         string                    `json:"title,omitempty"`
+	AdapterID     string                    `json:"adapter_id,omitempty"`
+	Resource      *adapterproto.ResourceRef `json:"resource,omitempty"`
+	// SourceURL is retained only to read and report pre-adapter recordings.
+	SourceURL string             `json:"source_url,omitempty"`
+	State     RecordingState     `json:"state"`
+	CreatedAt time.Time          `json:"created_at"`
+	StartedAt time.Time          `json:"started_at"`
+	StoppedAt *time.Time         `json:"stopped_at,omitempty"`
+	Tracks    map[string]*Track  `json:"tracks"`
+	Gaps      []Gap              `json:"gaps,omitempty"`
+	Snapshots []ManifestSnapshot `json:"manifest_snapshots,omitempty"`
+	LastError string             `json:"last_error,omitempty"`
 }
 
 type Track struct {

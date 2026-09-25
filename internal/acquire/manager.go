@@ -10,25 +10,28 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/network"
-	"github.com/dltkddnr04/integrated-recorder/internal/platform/owncast"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 type Resolver interface {
-	Resolve(instanceBase string) (string, error)
+	Resolve(context.Context, string, json.RawMessage, *adapterproto.ResourceRef) (adapterproto.MediaSource, error)
 }
 type SourceValidator func(context.Context, string) error
 
 type entry struct {
-	mu        sync.Mutex
-	recording *domain.Recording
-	cancel    context.CancelFunc
-	done      chan struct{}
+	mu           sync.Mutex
+	recording    *domain.Recording
+	cancel       context.CancelFunc
+	done         chan struct{}
+	headers      map[string]string
+	headerOrigin string
 }
 
 type Manager struct {
@@ -47,15 +50,15 @@ func NewManager(store *storage.Store, client *http.Client, resolver Resolver, va
 	if client == nil {
 		client = network.NewPublicHTTPClient(25 * time.Second)
 	}
-	if resolver == nil {
-		resolver = owncast.Resolver{}
-	}
 	if validate == nil {
 		validate = network.ValidatePublicURL
 	}
 	loaded, err := store.LoadAll()
 	if err != nil {
 		return nil, err
+	}
+	if resolver == nil {
+		resolver = unavailableResolver{}
 	}
 	m := &Manager{store: store, client: client, resolver: resolver, validate: validate, entries: map[string]*entry{}}
 	for _, recording := range loaded {
@@ -64,21 +67,50 @@ func NewManager(store *storage.Store, client *http.Client, resolver Resolver, va
 	return m, nil
 }
 
-func (m *Manager) Start(ctx context.Context, sourceURL, title string) (*domain.Recording, error) {
-	if err := m.validate(ctx, sourceURL); err != nil {
-		return nil, fmt.Errorf("invalid source URL: %w", err)
+func cloneHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
 	}
-	manifestURL, err := m.resolver.Resolve(sourceURL)
-	if err != nil {
+	copy := make(map[string]string, len(headers))
+	for key, value := range headers {
+		copy[key] = value
+	}
+	return copy
+}
+
+type unavailableResolver struct{}
+
+func (unavailableResolver) Resolve(context.Context, string, json.RawMessage, *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
+	return adapterproto.MediaSource{}, fmt.Errorf("no adapter resolver is configured")
+}
+
+func (m *Manager) Start(ctx context.Context, adapterID string, input json.RawMessage, resource *adapterproto.ResourceRef, title string) (*domain.Recording, error) {
+	if strings.TrimSpace(adapterID) == "" || strings.ContainsAny(adapterID, "/\\") {
+		return nil, fmt.Errorf("adapter id is invalid")
+	}
+	if err := adapterproto.ValidateObject(input); err != nil {
 		return nil, err
+	}
+	if err := adapterproto.ValidateResourceRef(resource); err != nil {
+		return nil, fmt.Errorf("invalid resource reference")
+	}
+	media, err := m.resolver.Resolve(ctx, adapterID, input, resource)
+	if err != nil {
+		return nil, fmt.Errorf("adapter resolution failed: %w", err)
+	}
+	if err = adapterproto.ValidateMediaSource(media, []string{"hls"}); err != nil {
+		return nil, err
+	}
+	if err = m.validate(ctx, media.ManifestURL); err != nil {
+		return nil, fmt.Errorf("invalid resolved media URL: %w", err)
 	}
 	id, err := newID()
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now().UTC()
-	recording := &domain.Recording{FormatVersion: 1, ID: id, Title: title, SourceURL: sourceURL, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
-		"main": {ID: "main", SourcePlaylistURL: manifestURL, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
+	recording := &domain.Recording{FormatVersion: 1, ID: id, Title: title, AdapterID: adapterID, Resource: resource, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
+		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
 	}}
 	if err = m.store.NewRecordingDir(id); err != nil {
 		return nil, err
@@ -87,11 +119,11 @@ func (m *Manager) Start(ctx context.Context, sourceURL, title string) (*domain.R
 		return nil, err
 	}
 	workerCtx, cancel := context.WithCancel(context.Background())
-	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{})}
+	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), headers: cloneHeaders(media.Headers), headerOrigin: media.ManifestURL}
 	m.mu.Lock()
 	m.entries[id] = e
 	m.mu.Unlock()
-	go m.run(workerCtx, e, manifestURL)
+	go m.run(workerCtx, e, media)
 	return m.Get(id)
 }
 
@@ -156,7 +188,7 @@ func (m *Manager) update(e *entry, fn func(*domain.Recording) error) error {
 	return m.store.SaveRecording(e.recording)
 }
 
-func (m *Manager) run(ctx context.Context, e *entry, initialURL string) {
+func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSource) {
 	defer close(e.done)
 	defer func() { e.mu.Lock(); e.cancel = nil; e.mu.Unlock() }()
 	defer func() {
@@ -172,14 +204,14 @@ func (m *Manager) run(ctx context.Context, e *entry, initialURL string) {
 			})
 		}
 	}()
-	selectedURL := initialURL
+	selectedURL := media.ManifestURL
 	first := true
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		if first {
-			body, err := fetchManifest(ctx, m.client, selectedURL)
+			body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -212,7 +244,7 @@ func (m *Manager) run(ctx context.Context, e *entry, initialURL string) {
 					m.fail(e, err)
 					return
 				}
-				body, err = fetchManifest(ctx, m.client, selectedURL)
+				body, err = fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL)
 				if err != nil {
 					if ctx.Err() != nil {
 						return
@@ -268,7 +300,7 @@ func (m *Manager) run(ctx context.Context, e *entry, initialURL string) {
 			}
 			continue
 		}
-		body, err := fetchManifest(ctx, m.client, selectedURL)
+		body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

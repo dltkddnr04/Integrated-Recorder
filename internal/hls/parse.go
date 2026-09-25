@@ -273,8 +273,8 @@ func parseProgramDateTime(value string) (time.Time, error) {
 	if err == nil {
 		return parsed, nil
 	}
-	// Owncast emits valid UTC offsets without the RFC3339 colon (for example,
-	// 2026-09-25T02:46:24.040+0000). Accept that common HLS form as well.
+	// Some HLS sources emit valid UTC offsets without the RFC3339 colon. Accept
+	// that common compact offset form as well.
 	return time.Parse("2006-01-02T15:04:05.999999999-0700", value)
 }
 

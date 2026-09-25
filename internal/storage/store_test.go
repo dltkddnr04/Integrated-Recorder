@@ -21,7 +21,7 @@ func TestLoadAllMarksStaleRecordingInterrupted(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now().UTC().Add(-time.Minute)
-	recording := &domain.Recording{FormatVersion: 1, ID: id, SourceURL: "https://owncast.example", State: domain.StateRecording, CreatedAt: started, StartedAt: started, Tracks: map[string]*domain.Track{"main": {ID: "main", PendingSequences: []uint64{3}, Segments: []domain.Segment{{ID: "s2", Sequence: 2}, {ID: "s1", Sequence: 1}}}}}
+	recording := &domain.Recording{FormatVersion: 1, ID: id, SourceURL: "https://source.example", State: domain.StateRecording, CreatedAt: started, StartedAt: started, Tracks: map[string]*domain.Track{"main": {ID: "main", PendingSequences: []uint64{3}, Segments: []domain.Segment{{ID: "s2", Sequence: 2}, {ID: "s1", Sequence: 1}}}}}
 	if err = store.SaveRecording(recording); err != nil {
 		t.Fatal(err)
 	}

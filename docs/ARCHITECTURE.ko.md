@@ -1,6 +1,6 @@
 # Integrated Recorder 아키텍처
 
-[README](../README.md) | [English](ARCHITECTURE.md)
+[README](../README.md) | [English README](../README.en.md)
 
 이 문서는 Integrated Recorder의 장기 아키텍처 방향을 기록합니다. 프로젝트 첫 화면에 넣기에는 너무 상세한 설계 내용을 README에서 분리해 두는 목적입니다.
 
@@ -43,39 +43,62 @@ projection은 버려져도 다시 만들 수 있어야 합니다. application da
 ## 현재 아키텍처
 
 ```text
-                       Browser
-                          │
-                    HTTP API / VOD
-                          │
-                  ┌───────▼───────┐
-                  │ Control/Serve │
-                  └───────┬───────┘
-                          │
-             ┌────────────┴────────────┐
-             │                         │
-      Platform discovery        Playback projection
-             │                         │
-             ▼                         │
-        HLS acquisition                │
-             │                         │
-             ▼                         │
-      Original segments ───────────────┘
-      + manifest snapshots
-      + recording metadata
-             │
-             ▼
-        Working storage
+ Browser ─── HTTP API / VOD ─── Core
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+              adapterhost                 HLS acquisition
+                    │                           │
+          framed JSON over stdio                │
+                    │                           ▼
+          external adapter binary ── resolve  source manifests
+                                                │
+                              Original segments + snapshots
+                                                │
+                                          Working storage
 ```
 
 현재 package 경계:
 
-- `internal/platform/owncast` — 플랫폼별 stream discovery만 담당
-- `internal/hls` — HLS parsing 및 rendition selection
+- `internal/adapterproto` — newline-delimited JSON Protocol v1 envelope, schema, resource, media source, interaction types
+- `internal/adapterhost` — 설정된 adapter directory 검색, 독립 프로세스 실행/handshake/request/shutdown 관리
+- `internal/pluginconfig` — opaque 설정과 별도 secret store. 파일 구현은 경로를 hash하고 제한된 권한으로 저장
+- `internal/interaction` — generic interaction 진행 상태의 최소 state machine
+- `internal/adapters/owncast` + `cmd/adapters/owncast` — standalone Owncast adapter만 포함. Core에서 이 package를 import하지 않음
+- `internal/hls` — 공통 HLS parsing 및 rendition selection
 - `internal/acquire` — recording lifecycle, polling, retry, deduplication, acquisition, gap detection
 - `internal/storage` — recording directory, sidecar, manifest snapshot, payload access
 - `internal/network` — bounded HTTP client와 source-address validation
 - `internal/server` — control API, 최소 browser page, VOD playlist generation, segment serving
-- `cmd/archiver` — process wiring과 HTTP lifecycle
+- `cmd/archiver` — adapter discovery, service wiring과 HTTP lifecycle
+
+## External adapter Protocol v1
+
+각 adapter는 Core에 정적으로 연결된 Go package가 아니라 독립 실행 파일입니다. Core는 `ADAPTER_DIR`만 검색하며 `integrated-recorder-adapter-*` 이름의 executable regular file만 시작합니다. `PATH` 전체는 검색하지 않습니다. adapter 추가/교체는 Core를 다시 빌드하지 않고 이 directory에 binary를 배치하는 것으로 가능합니다.
+
+IPC는 stdin/stdout newline-delimited JSON이며 한 줄이 한 message입니다. 각 envelope는 protocol version, request ID, method를 포함하고 response는 같은 ID와 result 또는 `{code, message, details}` error를 돌려줍니다. frame 크기는 제한됩니다. 한 adapter process 내 request는 직렬화되고 timeout, malformed frame, version/ID 불일치 또는 process exit는 해당 adapter만 unavailable로 처리합니다. stdout은 protocol 전용이고 진단은 별도 stderr로 보냅니다. Core는 `describe` handshake에서 protocol version과 descriptor를 검증한 후 장기 실행 process를 유지하며 shutdown 때 graceful request 후 종료합니다.
+
+v1의 사용 operation은 `describe`, `resolve`, `shutdown`입니다. `get_status`, `configure`, `interaction.begin`, `interaction.continue`, `metadata`, `events`, `refresh`는 generic operation 이름으로 예약되어 있으며 아직 실제 동작을 제공하지 않습니다. 알 수 없는 operation은 구조화된 `unsupported_method` error를 반환합니다.
+
+Descriptor는 adapter ID/name/version, protocol version, opaque capability string, 입력 및 설정 schema, adapter가 선언한 opaque resource type, supported media type을 포함합니다. Core는 capability 값이나 resource type 이름의 플랫폼 의미를 해석하지 않습니다. Core의 media dispatch는 현재 공통 HLS acquisition을 위한 `hls` type만 인식합니다.
+
+## Schema, resource, 설정 및 secret
+
+Adapter 정의 schema는 UI가 adapter 전용 코드를 추가하지 않고 form을 그릴 수 있도록 field key, control, label, description, required/default, constraints, options, opaque `visible_when` 값을 표현합니다. control primitive는 `text`, `secret`, `number`, `boolean`, `select`, `multi-select`, `textarea`, `action`, `status`입니다. 선택형 control에는 option 목록이 필요합니다. schema validation은 key/control/constraint 형태만 확인하고 field key의 의미는 알지 못합니다.
+
+Resource는 `{resource_type, resource_id, parent}`처럼 opaque 값과 재귀적 parent ref로 표현됩니다. adapter가 선언한 resource type과 parent-type 관계는 descriptor에 담기며 Core가 값을 비교하는 목적은 해당 adapter schema 범위를 찾고 해당 scope 문서를 구분하는 것뿐입니다. display name과 opaque attributes를 담는 일반 Resource 타입도 준비되어 있습니다. `account`, `channel`, `recording` 같은 Core enum이나 resource ID 기반 경로는 사용하지 않습니다.
+
+설정 scope는 plugin ID와 선택적인 전체 resource ref입니다. 일반 JSON config와 secret은 별도 interface/store로 유지합니다. 현재 local file backend는 SHA-256 scope key로 경로를 만들고 directory는 `0700`, 파일은 `0600`으로 저장합니다. **이 파일 backend는 암호화하지 않습니다.** 운영 시 data directory 접근을 제한해야 하며 향후 `SecretStore` 구현을 encrypted vault로 교체할 수 있습니다. API GET은 secret 원문을 반환하지 않고 key별 `configured` boolean만 돌려줍니다. Resolve 때만 해당 scope의 configuration/secrets를 adapter process stdin protocol로 전달하며 recording metadata에는 input/config/secret을 저장하지 않습니다.
+
+## Generic interaction model
+
+Protocol message는 `action`, `prompt`, `secret_prompt`, `navigate`, `display`, `status`, `complete`, `error` 타입과 opaque field/data를 표현할 수 있습니다. Core의 interaction tracker는 interaction ID 단위로 active progress message를 누적하고 `complete` 또는 `error`를 terminal state로 처리합니다. 실제 인증 provider, browser handoff, CAPTCHA/OTP workflow는 이 milestone에서 구현하지 않았습니다.
+
+## Resolve와 공통 media acquisition
+
+Core는 recording 시작 시 `{adapter_id, input, resource?, title?}`를 받습니다. adapter-specific input은 JSON object로만 다루고 저장하지 않습니다. Adapter의 `resolve`는 media type, manifest URL, HTTP headers, optional session reference, opaque refresh/metadata를 반환합니다. Core는 manifest URL을 기존 SSRF validator로 검사하고 이후 dial도 safe HTTP client가 재검증합니다. Adapter가 제공한 header는 resolve된 manifest origin에만 전달하고 다른 origin URL/redirect로는 전달하지 않습니다.
+
+HLS master/media parsing, rendition selection, sequence 추적, gap detection, init/media segment 원본 byte 다운로드, SHA-256, recording persistence는 계속 Core의 `internal/hls`와 `internal/acquire` 책임입니다. Adapter는 플랫폼별 URL을 공통 media source로 resolve할 뿐 manifest parsing이나 segment 처리에 참여하지 않습니다.
 
 플랫폼별 특수 동작은 recorder core 위쪽에 머물러야 합니다. CHZZK, SOOP, Twitch 등의 adapter를 추가할 때 HLS acquisition engine이 해당 플랫폼의 API semantics까지 알아야 해서는 안 됩니다.
 

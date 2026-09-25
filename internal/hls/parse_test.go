@@ -67,14 +67,14 @@ chunk.m4s
 	}
 }
 
-func TestParseMediaOwncastProgramDateTimeOffset(t *testing.T) {
+func TestParseMediaCompactProgramDateTimeOffset(t *testing.T) {
 	playlist, err := ParseMedia([]byte(`#EXTM3U
 #EXT-X-TARGETDURATION:3
 #EXT-X-MEDIA-SEQUENCE:248223
 #EXT-X-PROGRAM-DATE-TIME:2026-09-25T02:46:24.040+0000
 #EXTINF:3.000000,
 stream-248223.ts
-`), "https://watch.owncast.online/hls/0/stream.m3u8")
+`), "https://stream.example/hls/0/stream.m3u8")
 	if err != nil {
 		t.Fatal(err)
 	}

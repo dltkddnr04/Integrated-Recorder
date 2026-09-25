@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"path"
 	"sort"
@@ -31,7 +32,7 @@ func chooseVariant(master hls.Master) (hls.Variant, error)          { return hls
 
 func hasMasterTag(data []byte) bool { return strings.Contains(string(data), "#EXT-X-STREAM-INF:") }
 
-func fetchManifest(ctx context.Context, client *http.Client, uri string) ([]byte, error) {
+func fetchManifest(ctx context.Context, client *http.Client, uri string, headers map[string]string, headerOrigin string) ([]byte, error) {
 	var last error
 	for attempt := 0; attempt < manifestAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -42,12 +43,11 @@ func fetchManifest(ctx context.Context, client *http.Client, uri string) ([]byte
 			return nil, err
 		}
 		request.Header.Set("Accept", "application/vnd.apple.mpegurl, application/x-mpegURL, */*")
-		response, err := client.Do(request)
+		response, err := doMediaRequest(client, request, headers, headerOrigin)
 		if err == nil {
 			if response.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
 				response.Body.Close()
-				err = fmt.Errorf("GET manifest returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+				err = fmt.Errorf("GET manifest returned %s", response.Status)
 			} else {
 				data, readErr := io.ReadAll(io.LimitReader(response.Body, hls.MaxManifestBytes+1))
 				response.Body.Close()
@@ -224,7 +224,7 @@ func (m *Manager) acquireInit(ctx context.Context, e *entry, source hls.Map) (st
 		return id, nil
 	}
 	relative := "tracks/main/" + id + extensionFor(source.URI)
-	result, err := m.downloadObject(ctx, source.URI, source.ByteRange, recordingID, relative)
+	result, err := m.downloadObject(ctx, source.URI, source.ByteRange, recordingID, relative, e.headers, e.headerOrigin)
 	if err != nil {
 		return "", fmt.Errorf("init segment download: %w", err)
 	}
@@ -250,7 +250,7 @@ func (m *Manager) acquireInit(ctx context.Context, e *entry, source hls.Map) (st
 func (m *Manager) acquireMedia(ctx context.Context, e *entry, source hls.MediaSegment, initID string) (domain.Segment, error) {
 	recordingID := recordingID(e)
 	relative := fmt.Sprintf("tracks/main/%020d%s", source.Sequence, extensionFor(source.URI))
-	result, err := m.downloadObject(ctx, source.URI, source.ByteRange, recordingID, relative)
+	result, err := m.downloadObject(ctx, source.URI, source.ByteRange, recordingID, relative, e.headers, e.headerOrigin)
 	if err != nil {
 		return domain.Segment{}, fmt.Errorf("sequence %d download: %w", source.Sequence, err)
 	}
@@ -258,7 +258,7 @@ func (m *Manager) acquireMedia(ctx context.Context, e *entry, source hls.MediaSe
 	return segment, nil
 }
 
-func (m *Manager) downloadObject(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string) (storage.PayloadResult, error) {
+func (m *Manager) downloadObject(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, headers map[string]string, headerOrigin string) (storage.PayloadResult, error) {
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return storage.PayloadResult{}, fmt.Errorf("byte range is invalid or exceeds the %d byte payload limit", maxPayloadBytes)
 	}
@@ -275,16 +275,15 @@ func (m *Manager) downloadObject(ctx context.Context, uri string, byteRange *dom
 			end := byteRange.Offset + byteRange.Length - 1
 			request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, end))
 		}
-		response, err := m.client.Do(request)
+		response, err := doMediaRequest(m.client, request, headers, headerOrigin)
 		if err == nil {
 			expected := http.StatusOK
 			if byteRange != nil {
 				expected = http.StatusPartialContent
 			}
 			if response.StatusCode != expected {
-				body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
 				response.Body.Close()
-				err = fmt.Errorf("GET segment returned %s (expected %s): %s", response.Status, http.StatusText(expected), strings.TrimSpace(string(body)))
+				err = fmt.Errorf("GET segment returned %s (expected %s)", response.Status, http.StatusText(expected))
 			} else if byteRange != nil {
 				if err = validateContentRange(response.Header.Get("Content-Range"), *byteRange); err != nil {
 					response.Body.Close()
@@ -313,6 +312,61 @@ func (m *Manager) downloadObject(ctx context.Context, uri string, byteRange *dom
 		}
 	}
 	return storage.PayloadResult{}, fmt.Errorf("download failed after %d attempts: %w", segmentAttempts, last)
+}
+
+func applyHeaders(request *http.Request, headers map[string]string) {
+	for key, value := range headers {
+		canonical := textproto.CanonicalMIMEHeaderKey(key)
+		if canonical != "" {
+			request.Header.Set(canonical, value)
+		}
+	}
+}
+
+func applyHeadersForOrigin(request *http.Request, headers map[string]string, origin string) {
+	if !sameOrigin(origin, request.URL) {
+		return
+	}
+	applyHeaders(request, headers)
+}
+
+func doMediaRequest(client *http.Client, request *http.Request, headers map[string]string, headerOrigin string) (*http.Response, error) {
+	applyHeadersForOrigin(request, headers, headerOrigin)
+	copyClient := *client
+	originalCheck := client.CheckRedirect
+	copyClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if originalCheck != nil {
+			if err := originalCheck(next, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if !sameOrigin(headerOrigin, next.URL) {
+			for key := range headers {
+				next.Header.Del(textproto.CanonicalMIMEHeaderKey(key))
+			}
+		}
+		return nil
+	}
+	return copyClient.Do(request)
+}
+
+func sameOrigin(raw string, candidate *url.URL) bool {
+	base, err := url.Parse(raw)
+	if err != nil || base == nil || candidate == nil {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if value := u.Port(); value != "" {
+			return value
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return strings.EqualFold(base.Scheme, candidate.Scheme) && strings.EqualFold(base.Hostname(), candidate.Hostname()) && port(base) == port(candidate)
 }
 
 func validateContentRange(value string, want domain.ByteRange) error {

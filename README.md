@@ -24,11 +24,12 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 ## 현재 상태
 
-**Milestone 1 완료.**
+**Milestone 1과 external adapter protocol milestone 완료.**
 
 현재 지원:
 
-- 첫 platform adapter로 Owncast
+- Core와 분리된 실행 파일 adapter 구조. Core는 platform semantics를 알지 않으며 Owncast가 첫 adapter입니다.
+- Adapter가 제공하는 schema를 통해 입력과 설정을 노출하는 기반. 이후 설정과 인증 흐름도 같은 schema/interaction protocol로 UI에 연결할 수 있습니다.
 - 일반적인 HLS master/media playlist
 - MPEG-TS/fMP4 형태 source object 직접 수집
 - 저장 payload의 SHA-256 및 size 기록
@@ -57,7 +58,9 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 Go 1.23 이상이 필요합니다.
 
 ```sh
-DATA_DIR=./data ADDR=:8080 go run ./cmd/archiver
+mkdir -p adapters
+go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
+DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=:8080 go run ./cmd/archiver
 ```
 
 실행 후 `http://localhost:8080/`을 엽니다.
@@ -75,6 +78,9 @@ docker compose up --build
 | Method | Endpoint | 용도 |
 | --- | --- | --- |
 | `GET` | `/healthz` | Health check |
+| `GET` | `/api/adapters` | 사용 가능한 adapter 목록 및 상태 |
+| `GET` | `/api/adapters/{id}/schema` | adapter 입력/설정 schema |
+| `GET` / `PUT` | `/api/adapters/{id}/config` | plugin 정의 설정. secret 값은 다시 반환하지 않음 |
 | `POST` | `/api/recordings` | 녹화 시작 |
 | `GET` | `/api/recordings` | 녹화 목록 |
 | `GET` | `/api/recordings/{id}` | 녹화 상세 |
@@ -83,12 +89,12 @@ docker compose up --build
 | `GET` | `/api/recordings/{id}/play/tracks/{track}/playlist.m3u8` | 생성된 VOD media playlist |
 | `GET` | `/api/recordings/{id}/play/segments/{segmentID}` | 저장된 원본 payload |
 
-Owncast 녹화 시작 예시:
+첫 adapter로 녹화 시작 예시:
 
 ```sh
 curl -X POST http://localhost:8080/api/recordings \
   -H 'Content-Type: application/json' \
-  -d '{"source_url":"https://watch.owncast.online","title":"optional title"}'
+  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title"}'
 ```
 
 ## 개발
@@ -102,6 +108,7 @@ go build ./...
 ## Roadmap
 
 - [x] 원본 segment acquisition + restart-safe VOD playback
+- [x] platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
 - [ ] 방송 metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
 - [ ] 전체 browser UI

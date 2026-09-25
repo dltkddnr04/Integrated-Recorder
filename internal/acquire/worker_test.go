@@ -2,12 +2,16 @@ package acquire
 
 import (
 	"context"
+	"encoding/json"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/hls"
-	"github.com/dltkddnr04/integrated-recorder/internal/platform/owncast"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
@@ -16,7 +20,7 @@ func TestObservePlaylistRecordsWindowAndManifestGaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(store, &http.Client{}, owncast.Resolver{}, func(context.Context, string) error { return nil })
+	manager, err := NewManager(store, &http.Client{}, emptyResolver{}, func(context.Context, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +63,7 @@ func TestProcessRecordsExplicitManifestGapWithoutFetchingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := NewManager(store, &http.Client{}, owncast.Resolver{}, func(context.Context, string) error { return nil })
+	manager, err := NewManager(store, &http.Client{}, emptyResolver{}, func(context.Context, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,4 +83,76 @@ func TestProcessRecordsExplicitManifestGapWithoutFetchingIt(t *testing.T) {
 	if len(recording.Tracks["main"].Segments) != 0 || len(recording.Gaps) != 1 || recording.Gaps[0].FromSequence != 7 || recording.Gaps[0].ToSequence != 7 {
 		t.Fatalf("manifest gap was not recorded without capture: %#v", recording)
 	}
+}
+
+type emptyResolver struct{}
+
+func (emptyResolver) Resolve(context.Context, string, json.RawMessage, *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
+	return adapterproto.MediaSource{}, nil
+}
+
+func TestMediaHeadersStayWithinSourceOrigin(t *testing.T) {
+	const headerName = "X-Generic-Session"
+	const headerValue = "opaque-test-value"
+	var sourceHeader string
+	var cdnHeader string
+	var mu sync.Mutex
+	cdn := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cdnHeader = r.Header.Get(headerName)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cdn.Close()
+	source := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sourceHeader = r.Header.Get(headerName)
+		mu.Unlock()
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, cdn.URL+"/segment", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer source.Close()
+	client := &http.Client{}
+	response, err := doMediaRequest(client, mustRequest(t, source.URL+"/manifest"), map[string]string{headerName: headerValue}, source.URL+"/manifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	response, err = doMediaRequest(client, mustRequest(t, source.URL+"/redirect"), map[string]string{headerName: headerValue}, source.URL+"/redirect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if sourceHeader != headerValue {
+		t.Fatalf("same-origin header = %q", sourceHeader)
+	}
+	if cdnHeader != "" {
+		t.Fatal("adapter-provided header was forwarded to a different origin")
+	}
+}
+
+func mustRequest(t *testing.T, raw string) *http.Request {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
+func newIPv4Server(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	return server
 }

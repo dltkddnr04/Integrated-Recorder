@@ -1,3 +1,5 @@
 # Runtime recordings and local environment configuration
 /data/
 /.env
+# Locally built external adapter executables
+/adapters/
