@@ -115,4 +115,4 @@ go build ./...
 
 ## 라이선스
 
-아직 라이선스를 선택하지 않았습니다. repository는 public이지만 LICENSE가 추가되기 전까지 open-source license가 부여된 상태는 아닙니다.
+GNU Affero General Public License v3.0 only (**AGPL-3.0-only**). 자세한 내용은 [LICENSE](LICENSE)를 참고하세요.
