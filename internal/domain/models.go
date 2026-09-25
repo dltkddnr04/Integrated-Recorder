@@ -15,11 +15,13 @@ const (
 
 // Recording is the self-describing root document for one captured stream.
 type Recording struct {
-	FormatVersion int                       `json:"format_version"`
-	ID            string                    `json:"id"`
-	Title         string                    `json:"title,omitempty"`
-	AdapterID     string                    `json:"adapter_id,omitempty"`
-	Resource      *adapterproto.ResourceRef `json:"resource,omitempty"`
+	FormatVersion           int                             `json:"format_version"`
+	ID                      string                          `json:"id"`
+	Title                   string                          `json:"title,omitempty"`
+	AdapterID               string                          `json:"adapter_id,omitempty"`
+	Adapter                 *adapterproto.AdapterProvenance `json:"adapter,omitempty"`
+	Resource                *adapterproto.ResourceRef       `json:"resource,omitempty"`
+	SourceURIClassification string                          `json:"source_uri_classification,omitempty"`
 	// SourceURL is retained only to read and report pre-adapter recordings.
 	SourceURL string             `json:"source_url,omitempty"`
 	State     RecordingState     `json:"state"`

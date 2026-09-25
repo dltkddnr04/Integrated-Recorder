@@ -34,6 +34,9 @@ func New(root string) (*Store, error) {
 	if err = os.MkdirAll(filepath.Join(abs, "recordings"), 0755); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
+	if err = os.Chmod(filepath.Join(abs, "recordings"), 0700); err != nil {
+		return nil, err
+	}
 	return &Store{root: abs}, nil
 }
 
@@ -44,7 +47,12 @@ func (s *Store) NewRecordingDir(id string) error {
 		return fmt.Errorf("invalid recording id")
 	}
 	for _, dir := range []string{"manifests", "tracks/main"} {
-		if err := os.MkdirAll(filepath.Join(s.recordingDir(id), dir), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Join(s.recordingDir(id), dir), 0700); err != nil {
+			return err
+		}
+	}
+	for _, dir := range []string{s.recordingDir(id), filepath.Join(s.recordingDir(id), "manifests"), filepath.Join(s.recordingDir(id), "tracks"), filepath.Join(s.recordingDir(id), "tracks", "main")} {
+		if err := os.Chmod(dir, 0700); err != nil {
 			return err
 		}
 	}
@@ -59,11 +67,14 @@ func (s *Store) SaveRecording(recording *domain.Recording) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(s.recordingDir(recording.ID), "recording.json"), append(data, '\n'), 0644)
+	return atomicWrite(filepath.Join(s.recordingDir(recording.ID), "recording.json"), append(data, '\n'), 0600)
 }
 
 func (s *Store) LoadAll() ([]*domain.Recording, error) {
 	base := filepath.Join(s.root, "recordings")
+	if err := os.Chmod(base, 0700); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return nil, err
@@ -74,6 +85,9 @@ func (s *Store) LoadAll() ([]*domain.Recording, error) {
 			continue
 		}
 		path := filepath.Join(base, entry.Name(), "recording.json")
+		if err = tightenRecordingTree(filepath.Join(base, entry.Name())); err != nil {
+			return nil, fmt.Errorf("restrict recording permissions %s: %w", entry.Name(), err)
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %w", entry.Name(), err)
@@ -147,7 +161,10 @@ func (s *Store) savePayload(id, relativePath string, src io.Reader, limit, expec
 	if err != nil {
 		return PayloadResult{}, err
 	}
-	if err = os.MkdirAll(filepath.Dir(destination), 0755); err != nil {
+	if err = os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return PayloadResult{}, err
+	}
+	if err = os.Chmod(filepath.Dir(destination), 0700); err != nil {
 		return PayloadResult{}, err
 	}
 	f, err := os.CreateTemp(filepath.Dir(destination), ".payload-*.tmp")
@@ -193,7 +210,7 @@ func (s *Store) SaveSidecar(id, relativePath string, v any) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(path+".json", append(data, '\n'), 0644)
+	return atomicWrite(path+".json", append(data, '\n'), 0600)
 }
 
 func (s *Store) SaveSnapshot(id, trackID, sourceURI string, data []byte, at time.Time) (domain.ManifestSnapshot, error) {
@@ -257,7 +274,10 @@ func (s *Store) safePath(id, relative string) (string, error) {
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
 	f, err := os.CreateTemp(filepath.Dir(path), ".metadata-*.tmp")
@@ -283,6 +303,28 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return nil
+}
+
+func tightenRecordingTree(root string) error {
+	if err := os.Chmod(root, 0700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return os.Chmod(path, 0700)
+		}
+		if info.Mode().IsRegular() {
+			return os.Chmod(path, 0600)
+		}
+		return nil
+	})
 }
 
 func within(root, path string) bool {

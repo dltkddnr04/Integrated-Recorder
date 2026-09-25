@@ -19,18 +19,21 @@ const (
 
 // Capabilities name generic protocol behaviors and contain no platform domain.
 const (
-	CapabilityResolve     = "resolve"
-	CapabilityStatus      = "status"
-	CapabilityConfigure   = "configure"
-	CapabilityInteraction = "interaction"
-	CapabilityMetadata    = "metadata"
-	CapabilityEvents      = "events"
-	CapabilityRefresh     = "refresh"
+	CapabilityResolve         = "resolve"
+	CapabilityStatus          = "status"
+	CapabilityConfigure       = "configure"
+	CapabilityInteraction     = "interaction"
+	CapabilityMetadata        = "metadata"
+	CapabilityEvents          = "events"
+	CapabilityRefresh         = "refresh"
+	CapabilityResolveWorkflow = "resolve_workflow"
 )
 
 const (
 	MethodDescribe            = "describe"
 	MethodResolve             = "resolve"
+	MethodResolveBegin        = "resolve.begin"
+	MethodResolveContinue     = "resolve.continue"
 	MethodShutdown            = "shutdown"
 	MethodGetStatus           = "get_status"
 	MethodConfigure           = "configure"

@@ -22,7 +22,7 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
-Adapter headers default to same-origin forwarding, and file-backed secrets are not encrypted at rest.
+Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. Core must restart to discover newly installed adapter binaries. The default file secret store uses restricted permissions but does not encrypt values at rest.
 
 ## Current status
 
@@ -31,7 +31,9 @@ Adapter headers default to same-origin forwarding, and file-backed secrets are n
 Currently supported:
 
 - external executable adapters, with a platform-agnostic Core and Owncast as the first adapter;
-- the foundation for schema-driven adapter input and settings; future settings and authentication interactions can use the same generic protocol surface;
+- schema-rendered input and settings forms with generic resource discovery and configuration challenge/resume;
+- hierarchical settings with separate stored and effective projections;
+- lazy adapter-process restart with bounded backoff and a fresh describe handshake;
 - ordinary HLS master/media playlists;
 - direct acquisition of MPEG-TS/fMP4-style source objects;
 - SHA-256 and size metadata for captured payloads;
@@ -84,6 +86,8 @@ The container uses `/data` for persistent recording storage. The Docker image/ru
 | `GET` | `/api/adapters/{id}/schema` | Adapter input and settings schema |
 | `GET` / `PUT` | `/api/adapters/{id}/config` | Plugin-defined settings; secret values are never returned |
 | `POST` | `/api/recordings` | Start recording |
+| `GET` | `/api/resolve-workflows/{id}` | Inspect a suspended resource/configuration workflow |
+| `POST` | `/api/resolve-workflows/{id}/continue` | Submit answers and resume a workflow |
 | `GET` | `/api/recordings` | List recordings |
 | `GET` | `/api/recordings/{id}` | Recording details |
 | `POST` | `/api/recordings/{id}/stop` | Stop recording |
@@ -111,6 +115,7 @@ go build ./...
 
 - [x] Original segment acquisition + restart-safe VOD playback
 - [x] Platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
+- [x] Resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] Broadcast metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
 - [ ] Full browser UI

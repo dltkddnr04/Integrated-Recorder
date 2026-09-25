@@ -22,7 +22,7 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
-Adapter header는 기본적으로 같은 origin에만 전달하며, 기본 file secret은 저장 시 암호화되지 않습니다.
+Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. 새 adapter binary를 발견하려면 Core를 재시작해야 합니다. 기본 file secret은 권한이 제한되지만 저장 시 암호화되지 않습니다.
 
 ## 현재 상태
 
@@ -31,7 +31,9 @@ Adapter header는 기본적으로 같은 origin에만 전달하며, 기본 file 
 현재 지원:
 
 - Core와 분리된 실행 파일 adapter 구조. Core는 platform semantics를 알지 않으며 Owncast가 첫 adapter입니다.
-- Adapter가 제공하는 schema를 통해 입력과 설정을 노출하는 기반. 이후 설정과 인증 흐름도 같은 schema/interaction protocol로 UI에 연결할 수 있습니다.
+- Adapter schema로 입력 및 설정 form을 생성하고, resource discovery와 설정 challenge를 generic workflow로 이어가는 기반.
+- plugin 및 parent resource 설정을 합성하고, 현재 scope의 저장값과 effective 값을 구분해 노출.
+- timeout/crash 후 다음 요청에서 backoff와 describe 재검증을 거쳐 adapter process를 lazy restart.
 - 일반적인 HLS master/media playlist
 - MPEG-TS/fMP4 형태 source object 직접 수집
 - 저장 payload의 SHA-256 및 size 기록
@@ -84,6 +86,8 @@ docker compose up --build
 | `GET` | `/api/adapters/{id}/schema` | adapter 입력/설정 schema |
 | `GET` / `PUT` | `/api/adapters/{id}/config` | plugin 정의 설정. secret 값은 다시 반환하지 않음 |
 | `POST` | `/api/recordings` | 녹화 시작 |
+| `GET` | `/api/resolve-workflows/{id}` | 일시 중단된 resource/configuration workflow 조회 |
+| `POST` | `/api/resolve-workflows/{id}/continue` | 답변 제출 및 workflow 재개 |
 | `GET` | `/api/recordings` | 녹화 목록 |
 | `GET` | `/api/recordings/{id}` | 녹화 상세 |
 | `POST` | `/api/recordings/{id}/stop` | 녹화 중지 |
@@ -111,6 +115,7 @@ go build ./...
 
 - [x] 원본 segment acquisition + restart-safe VOD playback
 - [x] platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
+- [x] resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] 방송 metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
 - [ ] 전체 browser UI

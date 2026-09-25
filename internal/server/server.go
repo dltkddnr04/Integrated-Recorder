@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
@@ -23,17 +24,21 @@ import (
 )
 
 type Server struct {
-	manager  *acquire.Manager
-	adapters *adapterhost.Host
-	configs  *pluginconfig.Service
-	mux      *http.ServeMux
+	manager        *acquire.Manager
+	adapters       *adapterhost.Host
+	configs        *pluginconfig.Service
+	mux            *http.ServeMux
+	mu             sync.Mutex
+	workflowTitles map[string]string
 }
 
 func New(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginconfig.Service) http.Handler {
-	s := &Server{manager: manager, adapters: adapters, configs: configs, mux: http.NewServeMux()}
+	s := &Server{manager: manager, adapters: adapters, configs: configs, mux: http.NewServeMux(), workflowTitles: map[string]string{}}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
 	s.mux.HandleFunc("POST /api/recordings", s.create)
+	s.mux.HandleFunc("GET /api/resolve-workflows/{id}", s.workflowGet)
+	s.mux.HandleFunc("POST /api/resolve-workflows/{id}/continue", s.workflowContinue)
 	s.mux.HandleFunc("GET /api/adapters", s.adapterList)
 	s.mux.HandleFunc("GET /api/adapters/{id}", s.adapterGet)
 	s.mux.HandleFunc("GET /api/adapters/{id}/schema", s.adapterSchema)
@@ -80,7 +85,76 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "adapter_id and input are required")
 		return
 	}
-	recording, err := s.manager.Start(r.Context(), request.AdapterID, request.Input, request.Resource, strings.TrimSpace(request.Title))
+	if s.adapters == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter resolver is unavailable")
+		return
+	}
+	progress, err := s.adapters.BeginResolution(r.Context(), request.AdapterID, request.Input, request.Resource)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if progress.State != "resolved" || progress.Media == nil {
+		s.mu.Lock()
+		s.workflowTitles[progress.WorkflowID] = strings.TrimSpace(request.Title)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusAccepted, progress)
+		return
+	}
+	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, strings.TrimSpace(request.Title), &progress.Provenance)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, detail(recording))
+}
+
+func (s *Server) workflowGet(w http.ResponseWriter, r *http.Request) {
+	if s.adapters == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter workflows are unavailable")
+		return
+	}
+	progress, err := s.adapters.Workflow(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workflow not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, progress)
+}
+
+type workflowContinueRequest struct {
+	Values  map[string]json.RawMessage `json:"values,omitempty"`
+	Secrets map[string]string          `json:"secrets,omitempty"`
+	Persist bool                       `json:"persist,omitempty"`
+}
+
+func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
+	if s.adapters == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter workflows are unavailable")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request workflowContinueRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid workflow continuation")
+		return
+	}
+	progress, err := s.adapters.ContinueResolution(r.Context(), r.PathValue("id"), request.Values, request.Secrets, request.Persist)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if progress.State != "resolved" || progress.Media == nil {
+		writeJSON(w, http.StatusAccepted, progress)
+		return
+	}
+	s.mu.Lock()
+	title := s.workflowTitles[progress.WorkflowID]
+	delete(s.workflowTitles, progress.WorkflowID)
+	s.mu.Unlock()
+	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, title, &progress.Provenance)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -117,13 +191,24 @@ func (s *Server) adapterSchema(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "adapter schema is unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"input_schema": adapter.Descriptor.InputSchema, "configuration_schema": adapter.Descriptor.ConfigurationSchema, "resource_types": adapter.Descriptor.ResourceTypes, "media_types": adapter.Descriptor.MediaTypes})
+	resource, err := resourceQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid resource scope")
+		return
+	}
+	configurationSchema, err := s.adapters.Schema(r.PathValue("id"), resource)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "adapter configuration schema is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"input_schema": adapter.Descriptor.InputSchema, "configuration_schema": configurationSchema, "resource_types": adapter.Descriptor.ResourceTypes, "media_types": adapter.Descriptor.MediaTypes})
 }
 
 type configPutRequest struct {
-	Resource *adapterproto.ResourceRef  `json:"resource,omitempty"`
-	Values   map[string]json.RawMessage `json:"values,omitempty"`
-	Secrets  map[string]string          `json:"secrets,omitempty"`
+	Resource     *adapterproto.ResourceRef  `json:"resource,omitempty"`
+	Values       map[string]json.RawMessage `json:"values,omitempty"`
+	Secrets      map[string]string          `json:"secrets,omitempty"`
+	ClearSecrets []string                   `json:"clear_secrets,omitempty"`
 }
 type secretState struct {
 	Configured bool `json:"configured"`
@@ -131,6 +216,52 @@ type secretState struct {
 type maskedConfig struct {
 	Values  map[string]json.RawMessage `json:"values"`
 	Secrets map[string]secretState     `json:"secrets"`
+}
+
+type configScopeView struct {
+	Values  map[string]json.RawMessage `json:"values"`
+	Secrets map[string]secretState     `json:"secrets"`
+}
+type configAPIView struct {
+	Schema        adapterproto.Schema        `json:"schema"`
+	Values        map[string]json.RawMessage `json:"values"`
+	Secrets       map[string]secretState     `json:"secrets"`
+	Stored        configScopeView            `json:"stored"`
+	Effective     configScopeView            `json:"effective"`
+	ValueSources  map[string]string          `json:"value_sources"`
+	SecretSources map[string]string          `json:"secret_sources"`
+	CurrentScope  string                     `json:"current_scope"`
+}
+
+func configView(values map[string]json.RawMessage, configured map[string]bool, schema adapterproto.Schema) configScopeView {
+	secretKeys := map[string]bool{}
+	for _, field := range schema.Fields {
+		if field.Control == "secret" {
+			secretKeys[field.Key] = true
+		}
+	}
+	ordinary := map[string]json.RawMessage{}
+	for key, value := range values {
+		if !secretKeys[key] {
+			ordinary[key] = append(json.RawMessage(nil), value...)
+		}
+	}
+	secrets := map[string]secretState{}
+	for key, value := range configured {
+		secrets[key] = secretState{Configured: value}
+	}
+	for key := range secretKeys {
+		if _, ok := secrets[key]; !ok {
+			secrets[key] = secretState{}
+		}
+	}
+	return configScopeView{Values: ordinary, Secrets: secrets}
+}
+
+func configAPI(schema adapterproto.Schema, snapshot pluginconfig.Snapshot, resource *adapterproto.ResourceRef) configAPIView {
+	stored := configView(snapshot.StoredValues, snapshot.StoredSecrets, schema)
+	effective := configView(snapshot.EffectiveValues, snapshot.EffectiveSecret, schema)
+	return configAPIView{Schema: schema, Values: stored.Values, Secrets: stored.Secrets, Stored: stored, Effective: effective, ValueSources: snapshot.ValueSources, SecretSources: snapshot.SecretSources, CurrentScope: pluginconfig.ScopeIdentity(pluginconfig.Scope{Resource: resource})}
 }
 
 func (s *Server) configGet(w http.ResponseWriter, r *http.Request) {
@@ -149,13 +280,12 @@ func (s *Server) configGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "adapter configuration schema is unavailable")
 		return
 	}
-	scope := pluginconfig.Scope{PluginID: id, Resource: resource}
-	values, secrets, err := s.configs.Masked(scope)
+	snapshot, err := s.adapters.ConfigSnapshot(id, resource)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "adapter configuration could not be read")
 		return
 	}
-	writeJSON(w, http.StatusOK, projectConfig(values, secrets, schema))
+	writeJSON(w, http.StatusOK, configAPI(schema, snapshot, resource))
 }
 func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
 	if s.configs == nil || s.adapters == nil {
@@ -176,16 +306,16 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "adapter configuration schema is unavailable")
 		return
 	}
-	if err = s.configs.Put(pluginconfig.Scope{PluginID: id, Resource: request.Resource}, schema, request.Values, request.Secrets); err != nil {
+	if err = s.configs.PutPartial(pluginconfig.Scope{PluginID: id, Resource: request.Resource}, schema, request.Values, request.Secrets, request.ClearSecrets); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	values, secrets, err := s.configs.Masked(pluginconfig.Scope{PluginID: id, Resource: request.Resource})
+	snapshot, err := s.adapters.ConfigSnapshot(id, request.Resource)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "adapter configuration could not be read")
 		return
 	}
-	writeJSON(w, http.StatusOK, projectConfig(values, secrets, schema))
+	writeJSON(w, http.StatusOK, configAPI(schema, snapshot, request.Resource))
 }
 
 func projectConfig(values map[string]json.RawMessage, configured map[string]bool, schema adapterproto.Schema) maskedConfig {
@@ -243,24 +373,37 @@ func resourceQuery(r *http.Request) (*adapterproto.ResourceRef, error) {
 }
 
 type recordingSummary struct {
-	ID           string                    `json:"id"`
-	Title        string                    `json:"title,omitempty"`
-	AdapterID    string                    `json:"adapter_id,omitempty"`
-	Resource     *adapterproto.ResourceRef `json:"resource,omitempty"`
-	SourceURL    string                    `json:"source_url,omitempty"`
-	State        domain.RecordingState     `json:"state"`
-	CreatedAt    time.Time                 `json:"created_at"`
-	StartedAt    time.Time                 `json:"started_at"`
-	StoppedAt    any                       `json:"stopped_at,omitempty"`
-	TrackCount   int                       `json:"track_count"`
-	SegmentCount int                       `json:"segment_count"`
-	Duration     float64                   `json:"duration_seconds"`
-	GapCount     int                       `json:"gap_count"`
-	LastError    string                    `json:"last_error,omitempty"`
+	ID                      string                          `json:"id"`
+	Title                   string                          `json:"title,omitempty"`
+	AdapterID               string                          `json:"adapter_id,omitempty"`
+	Adapter                 *adapterproto.AdapterProvenance `json:"adapter,omitempty"`
+	SourceURIClassification string                          `json:"source_uri_classification"`
+	Resource                *adapterproto.ResourceRef       `json:"resource,omitempty"`
+	SourceURL               string                          `json:"source_url,omitempty"`
+	State                   domain.RecordingState           `json:"state"`
+	CreatedAt               time.Time                       `json:"created_at"`
+	StartedAt               time.Time                       `json:"started_at"`
+	StoppedAt               any                             `json:"stopped_at,omitempty"`
+	TrackCount              int                             `json:"track_count"`
+	SegmentCount            int                             `json:"segment_count"`
+	Duration                float64                         `json:"duration_seconds"`
+	GapCount                int                             `json:"gap_count"`
+	LastError               string                          `json:"last_error,omitempty"`
 }
 
 func summary(r *domain.Recording) recordingSummary {
-	return recordingSummary{ID: r.ID, Title: r.Title, AdapterID: r.AdapterID, Resource: r.Resource, SourceURL: r.SourceURL, State: r.State, CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, StoppedAt: r.StoppedAt, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration(), GapCount: len(r.Gaps), LastError: r.LastError}
+	classification := r.SourceURIClassification
+	if classification == "" {
+		classification = "sensitive"
+	}
+	return recordingSummary{ID: r.ID, Title: r.Title, AdapterID: r.AdapterID, Adapter: r.Adapter, Resource: r.Resource, SourceURIClassification: classification, State: r.State, CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, StoppedAt: r.StoppedAt, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration(), GapCount: len(r.Gaps), LastError: publicLastError(r.LastError)}
+}
+
+func publicLastError(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "acquisition error"
 }
 
 type recordingDetail struct {
@@ -271,7 +414,31 @@ type recordingDetail struct {
 }
 
 func detail(r *domain.Recording) recordingDetail {
-	return recordingDetail{Recording: r, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration()}
+	projected := *r
+	projected.SourceURL = ""
+	projected.LastError = publicLastError(projected.LastError)
+	if projected.SourceURIClassification == "" {
+		projected.SourceURIClassification = "sensitive"
+	}
+	projected.Snapshots = append([]domain.ManifestSnapshot(nil), r.Snapshots...)
+	for index := range projected.Snapshots {
+		projected.Snapshots[index].SourceURI = ""
+	}
+	projected.Tracks = make(map[string]*domain.Track, len(r.Tracks))
+	for key, track := range r.Tracks {
+		copyTrack := *track
+		copyTrack.SourcePlaylistURL = ""
+		copyTrack.Segments = append([]domain.Segment(nil), track.Segments...)
+		for index := range copyTrack.Segments {
+			copyTrack.Segments[index].SourceURI = ""
+		}
+		copyTrack.InitSegments = append([]domain.Segment(nil), track.InitSegments...)
+		for index := range copyTrack.InitSegments {
+			copyTrack.InitSegments[index].SourceURI = ""
+		}
+		projected.Tracks[key] = &copyTrack
+	}
+	return recordingDetail{Recording: &projected, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration()}
 }
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	recordings := s.manager.List()
@@ -496,16 +663,26 @@ const indexHTML = `<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Stream archive</title><body>
 <h1>Stream archive</h1>
-<form id="start"><label>Adapter <select id="adapter" required></select></label> <label>Title <input name="title"></label><fieldset><legend>Input</legend><div id="input-fields"></div></fieldset><div id="schema-info"></div><button>Start recording</button></form>
-<p id="message"></p><ul id="recordings"></ul><video id="player" controls playsinline style="width:min(100%,800px)"></video>
+<form id="start"><label>Adapter <select id="adapter" required></select></label> <label>Title <input name="title"></label><fieldset><legend>Recording input</legend><div id="input-fields"></div></fieldset><button>Start recording</button></form>
+<section id="configuration-panel"><h2>Adapter settings</h2><div id="config-fields"></div><button id="save-config" type="button">Save Settings</button></section>
+<section id="challenge-panel" hidden><h2>Continue adapter workflow</h2><p id="challenge-message"></p><div id="challenge-fields"></div><label id="persist-choice" hidden><input id="persist-answer" type="checkbox"> Save these values for this resource</label><button id="continue-workflow" type="button">Continue</button></section>
+<p id="message" role="status"></p><ul id="recordings"></ul><video id="player" controls playsinline style="width:min(100%,800px)"></video>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 <script>
-const message=document.querySelector('#message'),list=document.querySelector('#recordings'),video=document.querySelector('#player'),adapterSelect=document.querySelector('#adapter'),inputFields=document.querySelector('#input-fields'),schemaInfo=document.querySelector('#schema-info');let hls,adapters=[];
+const message=document.querySelector('#message'),list=document.querySelector('#recordings'),video=document.querySelector('#player'),adapterSelect=document.querySelector('#adapter'),inputFields=document.querySelector('#input-fields'),configFields=document.querySelector('#config-fields'),challengeFields=document.querySelector('#challenge-fields');let hls,inputSchema={fields:[]},activeWorkflow=null;
 async function api(url,opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const body=await r.json();if(!r.ok)throw Error(body.error||r.statusText);return body}
-function fieldControl(field){const label=document.createElement('label');label.append(document.createTextNode(field.label+' '));let control;if(field.control==='textarea'){control=document.createElement('textarea')}else if(field.control==='select'||field.control==='multi-select'){control=document.createElement('select');if(field.control==='multi-select')control.multiple=true;(field.options||[]).forEach(option=>{const item=document.createElement('option');item.value=JSON.stringify(option.value);item.textContent=option.label;control.append(item)})}else if(field.control==='action'||field.control==='status'){control=document.createElement('span');control.textContent=field.description||''}else{control=document.createElement('input');control.type=field.control==='secret'?'password':field.control==='number'?'number':field.control==='boolean'?'checkbox':'text'}control.name=field.key;if(field.required)control.required=true;if(field.default!==undefined){const value=field.default;if(control.type==='checkbox')control.checked=!!value;else if(field.control!=='action'&&field.control!=='status')control.value=field.control==='select'?JSON.stringify(value):value}if(field.control!=='action'&&field.control!=='status')label.append(control);if(field.description){const hint=document.createElement('small');hint.textContent=' '+field.description;label.append(hint)}return label}
-async function loadSchema(){const id=adapterSelect.value;inputFields.replaceChildren();schemaInfo.replaceChildren();if(!id)return;const schema=await api('/api/adapters/'+encodeURIComponent(id)+'/schema');(schema.input_schema.fields||[]).forEach(field=>inputFields.append(fieldControl(field),document.createElement('br')));const heading=document.createElement('h3');heading.textContent='Configuration schema';schemaInfo.append(heading);const fields=schema.configuration_schema.fields||[];if(!fields.length){schemaInfo.append(document.createTextNode('No configuration fields declared.'));return}const list=document.createElement('ul');fields.forEach(field=>{const item=document.createElement('li');item.textContent=field.label+' ('+field.control+')'+(field.required?' — required':'')+(field.description?' — '+field.description:'');list.append(item)});schemaInfo.append(list)}
-async function loadAdapters(){adapters=await api('/api/adapters');adapterSelect.replaceChildren();adapters.forEach(item=>{const option=document.createElement('option');const descriptor=item.descriptor;if(descriptor){option.value=descriptor.id;option.textContent=descriptor.name+' — '+item.status.state+' v'+descriptor.version}else{option.value='';option.textContent=item.status.id+' — '+item.status.state;option.disabled=true}adapterSelect.append(option)});await loadSchema()}
-async function refresh(){const items=await api('/api/recordings');list.replaceChildren(...items.map(item=>{const li=document.createElement('li');const label=document.createTextNode((item.title||item.id)+' — '+item.state+' — '+item.segment_count+' segments ');li.append(label);if(item.state==='recording'){const stop=document.createElement('button');stop.textContent='Stop';stop.onclick=async()=>{try{await api('/api/recordings/'+item.id+'/stop',{method:'POST'});refresh()}catch(e){message.textContent=e.message}};li.append(stop)}else{const play=document.createElement('button');play.textContent='Play VOD';play.onclick=()=>playRecording(item.id);li.append(play)}return li}))}
+function encodedResource(resource){const bytes=new TextEncoder().encode(JSON.stringify(resource));let binary='';bytes.forEach(value=>binary+=String.fromCharCode(value));return btoa(binary).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_')}
+function currentScope(resource){return resource?'resource:'+encodedResource(resource):'plugin'}
+function serialValue(field,control){if(field.control==='boolean')return control.checked;if(field.control==='number')return control.value===''?undefined:Number(control.value);if(field.control==='select')return control.value===''?undefined:JSON.parse(control.value);if(field.control==='multi-select')return Array.from(control.selectedOptions).map(option=>JSON.parse(option.value));return control.value===''?undefined:control.value}
+function renderSchema(target,schema,projection={}){target.replaceChildren();const values=projection.values||{},secrets=projection.secrets||{},sources=projection.sources||{},secretSources=projection.secretSources||{};const resource=projection.resource||null,current=projection.currentScope||currentScope(resource);for(const field of schema.fields||[]){const row=document.createElement('div');const title=document.createElement('label');title.append(document.createTextNode(field.label+' '));if(field.control==='action'||field.control==='status'){const display=document.createElement('span');display.textContent=field.description||'';row.append(title,display);target.append(row);continue}let control;if(field.control==='textarea'){control=document.createElement('textarea')}else if(field.control==='select'||field.control==='multi-select'){control=document.createElement('select');control.multiple=field.control==='multi-select';(field.options||[]).forEach(option=>{const item=document.createElement('option');item.value=JSON.stringify(option.value);item.textContent=option.label;control.append(item)})}else{control=document.createElement('input');control.type=field.control==='secret'?'password':field.control==='number'?'number':field.control==='boolean'?'checkbox':'text'}control.dataset.key=field.key;if(field.required&&field.control!=='secret')control.required=true;const constraint=field.constraints||{};if(control.type==='number'){if(constraint.min!==undefined)control.min=constraint.min;if(constraint.max!==undefined)control.max=constraint.max}if(control.type==='text'||control.tagName==='TEXTAREA'){if(constraint.min_length!==undefined)control.minLength=constraint.min_length;if(constraint.max_length!==undefined)control.maxLength=constraint.max_length;if(constraint.pattern)control.pattern=constraint.pattern}let initial=values[field.key];if(initial===undefined&&field.default!==undefined)initial=field.default;if(field.control==='secret'){control.value='';const state=secrets[field.key]||{configured:false};const status=document.createElement('small');status.textContent=state.configured?' configured':' not configured';title.append(status);const clearLabel=document.createElement('label');const clear=document.createElement('input');clear.type='checkbox';clear.dataset.clearSecret=field.key;clearLabel.append(clear,document.createTextNode(' Clear'));if(state.configured)row.append(clearLabel);control.required=!!field.required&&!state.configured}else if(initial!==undefined){if(field.control==='boolean')control.checked=!!initial;else if(field.control==='select')control.value=JSON.stringify(initial);else if(field.control==='multi-select'){const selected=new Set(initial||[]);Array.from(control.options).forEach(option=>option.selected=selected.has(JSON.parse(option.value)))}else control.value=initial}control.dataset.initial=JSON.stringify(serialValue(field,control));title.append(control);row.append(title);if(field.description){const hint=document.createElement('small');hint.textContent=field.description;row.append(hint)}const source=field.control==='secret'?secretSources[field.key]:sources[field.key];if(source&&source!==current){const inherited=document.createElement('small');inherited.textContent='Inherited from '+source;row.append(inherited)}target.append(row)}}
+function collect(target,schema,partial){const values={},secrets={},clear=[];for(const field of schema.fields||[]){if(field.control==='action'||field.control==='status')continue;if(field.control==='secret'){const control=target.querySelector('[data-key="'+CSS.escape(field.key)+'"]');const clearControl=target.querySelector('[data-clear-secret="'+CSS.escape(field.key)+'"]');if(clearControl&&clearControl.checked){clear.push(field.key);continue}if(control&&control.value!=='')secrets[field.key]=control.value;continue}const control=target.querySelector('[data-key="'+CSS.escape(field.key)+'"]');if(!control)continue;const value=serialValue(field,control);if(value===undefined)continue;if(partial&&control.dataset.initial===JSON.stringify(value))continue;values[field.key]=value}return {values:values,secrets:secrets,clear:clear}}
+async function loadSchema(){const id=adapterSelect.value;inputFields.replaceChildren();configFields.replaceChildren();if(!id)return;const schema=await api('/api/adapters/'+encodeURIComponent(id)+'/schema');inputSchema=schema.input_schema||{fields:[]};renderSchema(inputFields,inputSchema);await loadConfiguration(id,null)}
+async function loadConfiguration(id,resource){const query=resource?'?resource='+encodedResource(resource):'';const data=await api('/api/adapters/'+encodeURIComponent(id)+'/config'+query);const config=data.configuration||data;renderSchema(configFields,data.schema||{fields:[]},{values:config.effective_values||config.effective?.values||{},secrets:config.effective_secrets||config.effective?.secrets||{},sources:data.value_sources||config.value_sources||{},secretSources:data.secret_sources||config.secret_sources||{},resource:resource,currentScope:data.current_scope});document.querySelector('#save-config').onclick=async()=>{try{const fields=data.schema||{fields:[]},submitted=collect(configFields,fields,true);await api('/api/adapters/'+encodeURIComponent(id)+'/config',{method:'PUT',body:JSON.stringify({resource:resource||undefined,values:submitted.values,secrets:submitted.secrets,clear_secrets:submitted.clear})});await loadConfiguration(id,resource);message.textContent='Settings saved.'}catch(error){message.textContent=error.message}}}
+async function loadAdapters(){const adapters=await api('/api/adapters');adapterSelect.replaceChildren();adapters.forEach(item=>{const option=document.createElement('option');if(item.descriptor){option.value=item.descriptor.id;option.textContent=item.descriptor.name+' — '+item.status.state+' v'+item.descriptor.version}else{option.value='';option.textContent=item.status.id+' — '+item.status.state;option.disabled=true}adapterSelect.append(option)});await loadSchema()}
+async function refresh(){const items=await api('/api/recordings');list.replaceChildren(...items.map(item=>{const li=document.createElement('li');li.append(document.createTextNode((item.title||item.id)+' — '+item.state+' — '+item.segment_count+' segments '));if(item.state==='recording'){const stop=document.createElement('button');stop.textContent='Stop';stop.onclick=async()=>{try{await api('/api/recordings/'+item.id+'/stop',{method:'POST'});refresh()}catch(error){message.textContent=error.message}};li.append(stop)}else{const play=document.createElement('button');play.textContent='Play VOD';play.onclick=()=>playRecording(item.id);li.append(play)}return li}))}
 function playRecording(id){const src='/api/recordings/'+id+'/play/master.m3u8';if(hls)hls.destroy();if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=src;video.play()}else if(window.Hls&&Hls.isSupported()){hls=new Hls();hls.loadSource(src);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play())}else{message.textContent='This browser has no HLS playback support.'}}
-document.querySelector('#start').addEventListener('submit',async e=>{e.preventDefault();const input={};inputFields.querySelectorAll('input,select,textarea').forEach(control=>{if(control.type==='checkbox')input[control.name]=control.checked;else if(control.tagName==='SELECT')input[control.name]=control.multiple?Array.from(control.selectedOptions).map(option=>JSON.parse(option.value)):JSON.parse(control.value);else if(control.type==='number'&&control.value!=='')input[control.name]=Number(control.value);else if(control.value!=='')input[control.name]=control.value});const title=e.currentTarget.elements.title.value;try{const result=await api('/api/recordings',{method:'POST',body:JSON.stringify({adapter_id:adapterSelect.value,input,title})});message.textContent='Started '+result.id;e.currentTarget.elements.title.value='';refresh()}catch(err){message.textContent=err.message}});adapterSelect.addEventListener('change',()=>loadSchema().catch(e=>message.textContent=e.message));loadAdapters().catch(e=>message.textContent=e.message);refresh().catch(e=>message.textContent=e.message);setInterval(()=>refresh().catch(()=>{}),5000);
+async function showWorkflow(progress){activeWorkflow=progress;const panel=document.querySelector('#challenge-panel');panel.hidden=false;document.querySelector('#challenge-message').textContent=(progress.challenge.prompt?.title||'Additional configuration is required')+' '+(progress.challenge.prompt?.message||'');await loadConfiguration(adapterSelect.value,progress.resource||null);renderSchema(challengeFields,progress.challenge.schema);const persist=document.querySelector('#persist-choice');persist.hidden=!progress.challenge.persistable;document.querySelector('#persist-answer').checked=false}
+document.querySelector('#continue-workflow').onclick=async()=>{if(!activeWorkflow)return;try{const result=collect(challengeFields,activeWorkflow.challenge.schema,false),persist=activeWorkflow.challenge.persistable&&document.querySelector('#persist-answer').checked;const next=await api('/api/resolve-workflows/'+encodeURIComponent(activeWorkflow.workflow_id)+'/continue',{method:'POST',body:JSON.stringify({values:result.values,secrets:result.secrets,persist:persist})});if(next.workflow_id){await showWorkflow(next);return}document.querySelector('#challenge-panel').hidden=true;activeWorkflow=null;message.textContent='Started '+next.id;refresh()}catch(error){message.textContent=error.message}}
+document.querySelector('#start').addEventListener('submit',async event=>{event.preventDefault();const values=collect(inputFields,inputSchema,false);try{const result=await api('/api/recordings',{method:'POST',body:JSON.stringify({adapter_id:adapterSelect.value,input:values.values,title:event.currentTarget.elements.title.value})});if(result.workflow_id){await showWorkflow(result);message.textContent='Adapter needs additional information.';return}message.textContent='Started '+result.id;event.currentTarget.elements.title.value='';refresh()}catch(error){message.textContent=error.message}})
+adapterSelect.addEventListener('change',()=>loadSchema().catch(error=>message.textContent=error.message));loadAdapters().catch(error=>message.textContent=error.message);refresh().catch(error=>message.textContent=error.message);setInterval(()=>refresh().catch(()=>{}),5000);
 </script></body></html>`

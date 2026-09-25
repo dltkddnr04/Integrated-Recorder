@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -284,3 +285,46 @@ func TestValidateMediaSourceRequestPolicy(t *testing.T) {
 		t.Fatalf("request policy wire field missing: %s, %v", wire, err)
 	}
 }
+
+func TestValidateObjectAgainstSchemaRejectsInvalidInputWithoutEchoingValues(t *testing.T) {
+	schema := Schema{Fields: []Field{
+		{Key: "text", Control: "text", Label: "Text", Required: true, Constraints: &Constraints{Pattern: "^[a-z]+$", MinLength: intPtr(2), MaxLength: intPtr(8)}},
+		{Key: "choice", Control: "select", Label: "Choice", Options: []Option{{Value: "a", Label: "A"}, {Value: "b", Label: "B"}}},
+		{Key: "count", Control: "number", Label: "Count", Constraints: &Constraints{Min: floatPtr(1), Max: floatPtr(4)}},
+		{Key: "many", Control: "multi-select", Label: "Many", Options: []Option{{Value: "x", Label: "X"}, {Value: "y", Label: "Y"}}, Constraints: &Constraints{MaxItems: intPtr(1)}},
+	}}
+	valid := json.RawMessage(`{"text":"abc","choice":"a","count":3,"many":["x"]}`)
+	if err := ValidateObjectAgainstSchema(schema, valid); err != nil {
+		t.Fatalf("valid input rejected: %v", err)
+	}
+	for _, raw := range []string{
+		`{"choice":"a","count":3,"many":["x"]}`,
+		`{"text":false,"choice":"a","count":3,"many":["x"]}`,
+		`{"text":"abc","choice":"other","count":3,"many":["x"]}`,
+		`{"text":"abc","choice":"a","count":9,"many":["x"]}`,
+		`{"text":"bad-value-sentinel","choice":"a","count":3,"many":["x"]}`,
+		`{"text":"abc","choice":"a","count":3,"many":["x","y"]}`,
+		`{"text":"abc","choice":"a","count":3,"many":["x"],"unknown":"sensitive-sentinel"}`,
+	} {
+		err := ValidateObjectAgainstSchema(schema, json.RawMessage(raw))
+		if err == nil {
+			t.Errorf("invalid input accepted: %s", raw)
+		}
+		if strings.Contains(fmt.Sprint(err), "sensitive-sentinel") || strings.Contains(fmt.Sprint(err), "bad-value-sentinel") {
+			t.Errorf("validator echoed submitted value: %v", err)
+		}
+	}
+}
+
+func TestValidateResourceRefDepthLimit(t *testing.T) {
+	var ref *ResourceRef
+	for i := 0; i < 65; i++ {
+		ref = &ResourceRef{Type: "opaque", ID: fmt.Sprint(i), Parent: ref}
+	}
+	if err := ValidateResourceRef(ref); err == nil {
+		t.Fatal("over-depth resource chain accepted")
+	}
+}
+
+func intPtr(v int) *int           { return &v }
+func floatPtr(v float64) *float64 { return &v }

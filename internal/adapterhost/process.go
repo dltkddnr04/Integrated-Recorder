@@ -26,6 +26,7 @@ type process struct {
 	killOnce     sync.Once
 	shutdownOnce sync.Once
 	sequence     atomic.Uint64
+	unusable     atomic.Bool
 	stderr       *boundedCapture
 }
 
@@ -109,6 +110,9 @@ func (p *process) call(ctx context.Context, method string, params any) (json.Raw
 		default:
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	id := fmt.Sprintf("%d", p.sequence.Add(1))
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
@@ -150,6 +154,18 @@ func (p *process) call(ctx context.Context, method string, params any) (json.Raw
 	}
 }
 
+func (p *process) isUnusable() bool {
+	if p == nil || p.unusable.Load() {
+		return true
+	}
+	select {
+	case <-p.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (p *process) shutdown() {
 	p.shutdownOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -167,6 +183,7 @@ func (p *process) shutdown() {
 
 func (p *process) kill() {
 	p.killOnce.Do(func() {
+		p.unusable.Store(true)
 		_ = p.stdin.Close()
 		if p.cmd.Process != nil {
 			_ = p.cmd.Process.Kill()

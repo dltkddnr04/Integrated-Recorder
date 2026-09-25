@@ -99,6 +99,19 @@ func (m *Manager) Start(ctx context.Context, adapterID string, input json.RawMes
 	if err != nil {
 		return nil, fmt.Errorf("adapter resolution failed: %w", err)
 	}
+	return m.StartResolved(ctx, adapterID, media, resource, title, nil)
+}
+
+// StartResolved creates a recording from a media source already resolved by
+// an adapter workflow. The shared HLS acquisition path is identical to Start.
+func (m *Manager) StartResolved(ctx context.Context, adapterID string, media adapterproto.MediaSource, resource *adapterproto.ResourceRef, title string, provenance *adapterproto.AdapterProvenance) (*domain.Recording, error) {
+	if strings.TrimSpace(adapterID) == "" || strings.ContainsAny(adapterID, "/\\") {
+		return nil, fmt.Errorf("adapter id is invalid")
+	}
+	if err := adapterproto.ValidateResourceRef(resource); err != nil {
+		return nil, fmt.Errorf("invalid resource reference")
+	}
+	var err error
 	if err = adapterproto.ValidateMediaSource(media, []string{"hls"}); err != nil {
 		return nil, err
 	}
@@ -110,7 +123,8 @@ func (m *Manager) Start(ctx context.Context, adapterID string, input json.RawMes
 		return nil, err
 	}
 	now := time.Now().UTC()
-	recording := &domain.Recording{FormatVersion: 1, ID: id, Title: title, AdapterID: adapterID, Resource: resource, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
+	classification := media.SourceURIClassification()
+	recording := &domain.Recording{FormatVersion: 1, ID: id, Title: title, AdapterID: adapterID, Adapter: provenance, Resource: resource, SourceURIClassification: classification, State: domain.StateRecording, CreatedAt: now, StartedAt: now, Tracks: map[string]*domain.Track{
 		"main": {ID: "main", SourcePlaylistURL: media.ManifestURL, Segments: []domain.Segment{}, InitSegments: []domain.Segment{}},
 	}}
 	if err = m.store.NewRecordingDir(id); err != nil {

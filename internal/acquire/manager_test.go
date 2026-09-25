@@ -52,12 +52,11 @@ func runAcquireAdapterHelper() int {
 			var params adapterproto.ResolveParams
 			_ = json.Unmarshal(request.Params, &params)
 			var input struct {
-				ManifestURL string            `json:"manifest_url"`
-				Headers     map[string]string `json:"headers"`
+				ManifestURL string `json:"manifest_url"`
 			}
 			_ = json.Unmarshal(params.Input, &input)
 			metadata, _ := json.Marshal(map[string]bool{"secret_received": params.Secrets["opaque_secret"] != "", "value_received": len(params.Configuration["opaque_value"]) > 0})
-			response, _ = adapterproto.Success(request.ID, adapterproto.MediaSource{Type: "hls", ManifestURL: input.ManifestURL, Headers: input.Headers, Metadata: metadata})
+			response, _ = adapterproto.Success(request.ID, adapterproto.MediaSource{Type: "hls", ManifestURL: input.ManifestURL, Headers: map[string]string{"X-Generic-Session": "test-only-sensitive-value"}, Metadata: metadata})
 		case adapterproto.MethodShutdown:
 			response, _ = adapterproto.Success(request.ID, map[string]bool{"stopped": true})
 		default:
@@ -87,19 +86,27 @@ func writeAcquireAdapter(t *testing.T, dir string) {
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 
 func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
+	const manifestCredential = "manifest-proof"
+	const playlistCredential = "playlist-proof"
+	const initCredential = "init-proof"
+	const segmentCredential = "segment-proof"
 	initBytes := []byte{0, 1, 2, 3, 4, 5, 6, 7}
 	blobBytes := []byte{0xff, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50}
 	var mu sync.Mutex
 	mediaRequests := 0
 	segmentRequests := map[string]int{}
+	requestURIs := []string{}
 	secondCaptured := make(chan struct{})
 	thirdMedia := make(chan struct{})
 	var secondOnce, thirdOnce sync.Once
 
 	source := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestURIs = append(requestURIs, r.URL.RequestURI())
+		mu.Unlock()
 		switch r.URL.Path {
 		case "/hls/stream.m3u8":
-			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000\nrendition.m3u8\n")
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000\nrendition.m3u8?sig="+playlistCredential+"\n")
 		case "/hls/rendition.m3u8":
 			mu.Lock()
 			mediaRequests++
@@ -108,9 +115,9 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 			if requestNum >= 3 {
 				thirdOnce.Do(func() { close(thirdMedia) })
 			}
-			playlist := "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:1.25,\n#EXT-X-BYTERANGE:4@0\nblob.m4s\n"
+			playlist := "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-MAP:URI=\"init.mp4?key=" + initCredential + "\"\n#EXTINF:1.25,\n#EXT-X-BYTERANGE:4@0\nblob.m4s?token=" + segmentCredential + "\n"
 			if requestNum >= 2 {
-				playlist += "#EXTINF:1.5,\n#EXT-X-BYTERANGE:3@4\nblob.m4s\n"
+				playlist += "#EXTINF:1.5,\n#EXT-X-BYTERANGE:3@4\nblob.m4s?token=" + segmentCredential + "\n"
 			}
 			_, _ = io.WriteString(w, playlist)
 		case "/hls/init.mp4":
@@ -143,7 +150,7 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 		t.Fatal(err)
 	}
 	validate := func(context.Context, string) error { return nil }
-	resolver := fixtureResolver{manifestURL: source.URL + "/hls/stream.m3u8"}
+	resolver := fixtureResolver{manifestURL: source.URL + "/hls/stream.m3u8?signature=" + manifestCredential}
 	manager, err := acquire.NewManager(store, source.Client(), resolver, validate)
 	if err != nil {
 		t.Fatal(err)
@@ -180,6 +187,26 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 	if firstCount != 1 || secondCount != 1 {
 		t.Fatalf("range fetch counts = %d, %d; duplicate suppression failed", firstCount, secondCount)
 	}
+	mu.Lock()
+	observedURIs := append([]string(nil), requestURIs...)
+	mu.Unlock()
+	for _, expected := range []string{
+		"/hls/stream.m3u8?signature=" + manifestCredential,
+		"/hls/rendition.m3u8?sig=" + playlistCredential,
+		"/hls/init.mp4?key=" + initCredential,
+		"/hls/blob.m4s?token=" + segmentCredential,
+	} {
+		found := false
+		for _, observed := range observedURIs {
+			if observed == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("runtime fetch URI %q was not requested exactly; observed %v", expected, observedURIs)
+		}
+	}
 	track := stopped.Tracks["main"]
 	if len(track.Segments) != 2 || track.Segments[0].Sequence != 10 || track.Segments[1].Sequence != 11 {
 		t.Fatalf("stored segments = %#v", track.Segments)
@@ -214,8 +241,34 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 	if previous.State != domain.StateStopped || previous.SegmentCount() != 2 {
 		t.Fatalf("reloaded recording %#v", previous)
 	}
+	metadataPath := filepath.Join(store.Root(), "recordings", recording.ID, "recording.json")
+	recordingMetadata, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []string{manifestCredential, playlistCredential, initCredential, segmentCredential} {
+		if !strings.Contains(string(recordingMetadata), credential) {
+			t.Fatalf("canonical recording metadata lost original URI credential %q", credential)
+		}
+	}
 	api := newIPv4TestServer(t, server.New(reloaded, nil, nil))
 	defer api.Close()
+	for _, endpoint := range []string{"/api/recordings", "/api/recordings/" + recording.ID} {
+		response, err := api.Client().Get(api.URL + endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if strings.Contains(string(body), source.URL) {
+			t.Fatalf("API %s exposed the source host/URI: %s", endpoint, body)
+		}
+		for _, credential := range []string{manifestCredential, playlistCredential, initCredential, segmentCredential} {
+			if strings.Contains(string(body), credential) {
+				t.Fatalf("API %s exposed source URI credential %q: %s", endpoint, credential, body)
+			}
+		}
+	}
 	response, err := api.Client().Get(api.URL + "/api/recordings/" + recording.ID + "/play/master.m3u8")
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +361,7 @@ func TestExternalAdapterSubprocessAcquireReloadAndVOD(t *testing.T) {
 		t.Fatal(err)
 	}
 	resource := &adapterproto.ResourceRef{Type: "arbitrary-kind", ID: "opaque/resource/id", Parent: &adapterproto.ResourceRef{Type: "outer", ID: "parent"}}
-	input, _ := json.Marshal(map[string]any{"manifest_url": source.URL + "/live.m3u8", "headers": map[string]string{headerName: headerValue}})
+	input, _ := json.Marshal(map[string]any{"manifest_url": source.URL + "/live.m3u8"})
 	descriptor, err := host.Descriptor("test-helper")
 	if err != nil {
 		t.Fatal(err)
