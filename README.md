@@ -22,6 +22,8 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
+Adapter header는 기본적으로 같은 origin에만 전달하며, 기본 file secret은 저장 시 암호화되지 않습니다.
+
 ## 현재 상태
 
 **Milestone 1과 external adapter protocol milestone 완료.**

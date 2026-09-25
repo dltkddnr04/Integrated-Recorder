@@ -22,6 +22,8 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
+Adapter headers default to same-origin forwarding, and file-backed secrets are not encrypted at rest.
+
 ## Current status
 
 **Milestone 1 and the external adapter protocol milestone are complete.**

@@ -6,6 +6,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -78,12 +79,75 @@ type ResolveParams struct {
 }
 
 type MediaSource struct {
-	Type        string            `json:"type"`
-	ManifestURL string            `json:"manifest_url"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	SessionRef  string            `json:"session_ref,omitempty"`
-	Refresh     json.RawMessage   `json:"refresh,omitempty"`
-	Metadata    json.RawMessage   `json:"metadata,omitempty"`
+	Type          string            `json:"type"`
+	ManifestURL   string            `json:"manifest_url"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	RequestPolicy *RequestPolicy    `json:"request_policy,omitempty"`
+	SessionRef    string            `json:"session_ref,omitempty"`
+	Refresh       json.RawMessage   `json:"refresh,omitempty"`
+	Metadata      json.RawMessage   `json:"metadata,omitempty"`
+}
+
+// RequestPolicy limits where Core may forward adapter-supplied media headers.
+// It authorizes header forwarding only; network and SSRF policy remains owned
+// by Core. An omitted policy or header_forwarding block is restrictive.
+type RequestPolicy struct {
+	HeaderForwarding *HeaderForwardingPolicy `json:"header_forwarding,omitempty"`
+}
+
+// HeaderForwardingPolicy currently applies one origin set to all adapter-
+// supplied headers. Keeping mode as a string leaves room for future protocol
+// extensions such as per-header rules without introducing a policy engine now.
+type HeaderForwardingPolicy struct {
+	Mode    string   `json:"mode,omitempty"`
+	Origins []string `json:"origins,omitempty"`
+}
+
+const (
+	HeaderForwardingSameOrigin = "same_origin"
+	HeaderForwardingAllowlist  = "allowlist"
+)
+
+type mediaOrigin struct {
+	scheme   string
+	hostname string
+	port     string
+}
+
+func (o mediaOrigin) equal(other mediaOrigin) bool {
+	return o.scheme == other.scheme && o.hostname == other.hostname && o.port == other.port
+}
+
+// AllowsHeadersFor reports whether the source's adapter-supplied headers may
+// be sent to target. Callers must still enforce their independent network
+// safety policy before making the request.
+func (m MediaSource) AllowsHeadersFor(target *url.URL) bool {
+	if target == nil {
+		return false
+	}
+	policy := m.RequestPolicy
+	if policy == nil || policy.HeaderForwarding == nil || policy.HeaderForwarding.Mode == "" || policy.HeaderForwarding.Mode == HeaderForwardingSameOrigin {
+		manifest, err := parseMediaOrigin(m.ManifestURL)
+		if err != nil {
+			return false
+		}
+		targetOrigin, err := originFromURL(target)
+		return err == nil && manifest.equal(targetOrigin)
+	}
+	if policy.HeaderForwarding.Mode != HeaderForwardingAllowlist {
+		return false
+	}
+	targetOrigin, err := originFromURL(target)
+	if err != nil {
+		return false
+	}
+	for _, raw := range policy.HeaderForwarding.Origins {
+		allowed, err := parseAllowedOrigin(raw)
+		if err == nil && allowed.equal(targetOrigin) {
+			return true
+		}
+	}
+	return false
 }
 
 type InteractionField struct {
@@ -378,7 +442,87 @@ func ValidateMediaSource(media MediaSource, supported []string) error {
 			return fmt.Errorf("invalid media header")
 		}
 	}
+	if err := validateRequestPolicy(media.RequestPolicy); err != nil {
+		return fmt.Errorf("invalid request policy: %w", err)
+	}
 	return nil
+}
+
+func validateRequestPolicy(policy *RequestPolicy) error {
+	if policy == nil || policy.HeaderForwarding == nil {
+		return nil
+	}
+	forwarding := policy.HeaderForwarding
+	mode := forwarding.Mode
+	if mode == "" {
+		mode = HeaderForwardingSameOrigin
+	}
+	switch mode {
+	case HeaderForwardingSameOrigin:
+		if len(forwarding.Origins) != 0 {
+			return fmt.Errorf("same_origin mode cannot declare extra origins")
+		}
+	case HeaderForwardingAllowlist:
+		if len(forwarding.Origins) == 0 {
+			return fmt.Errorf("allowlist mode requires at least one origin")
+		}
+		seen := map[mediaOrigin]bool{}
+		for _, raw := range forwarding.Origins {
+			origin, err := parseAllowedOrigin(raw)
+			if err != nil {
+				return fmt.Errorf("invalid allowed origin %q", raw)
+			}
+			if seen[origin] {
+				return fmt.Errorf("allowed origins must be unique")
+			}
+			seen[origin] = true
+		}
+	default:
+		return fmt.Errorf("unsupported header forwarding mode %q", forwarding.Mode)
+	}
+	return nil
+}
+
+func parseAllowedOrigin(raw string) (mediaOrigin, error) {
+	if raw == "" || strings.ContainsAny(raw, "\\\r\n\t #?") {
+		return mediaOrigin{}, fmt.Errorf("origin must be an HTTP(S) origin URL")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u == nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || strings.Contains(raw, "#") {
+		return mediaOrigin{}, fmt.Errorf("origin must not include path, query, or fragment")
+	}
+	return originFromURL(u)
+}
+
+func parseMediaOrigin(raw string) (mediaOrigin, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return mediaOrigin{}, fmt.Errorf("invalid media URL")
+	}
+	return originFromURL(u)
+}
+
+func originFromURL(u *url.URL) (mediaOrigin, error) {
+	if u == nil || u.Opaque != "" || u.User != nil || !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") || u.Host == "" || u.Hostname() == "" || strings.HasSuffix(u.Host, ":") {
+		return mediaOrigin{}, fmt.Errorf("URL does not have a valid HTTP(S) origin")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	hostname := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	} else {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 0 || portNumber > 65535 {
+			return mediaOrigin{}, fmt.Errorf("URL port is invalid")
+		}
+		port = strconv.Itoa(portNumber)
+	}
+	return mediaOrigin{scheme: scheme, hostname: hostname, port: port}, nil
 }
 
 func validHeaderValue(value string) bool {

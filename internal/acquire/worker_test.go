@@ -116,12 +116,12 @@ func TestMediaHeadersStayWithinSourceOrigin(t *testing.T) {
 	}))
 	defer source.Close()
 	client := &http.Client{}
-	response, err := doMediaRequest(client, mustRequest(t, source.URL+"/manifest"), map[string]string{headerName: headerValue}, source.URL+"/manifest")
+	response, err := doMediaRequest(client, mustRequest(t, source.URL+"/manifest"), map[string]string{headerName: headerValue}, source.URL+"/manifest", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	response, err = doMediaRequest(client, mustRequest(t, source.URL+"/redirect"), map[string]string{headerName: headerValue}, source.URL+"/redirect")
+	response, err = doMediaRequest(client, mustRequest(t, source.URL+"/redirect"), map[string]string{headerName: headerValue}, source.URL+"/redirect", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

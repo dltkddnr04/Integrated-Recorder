@@ -26,12 +26,13 @@ type Resolver interface {
 type SourceValidator func(context.Context, string) error
 
 type entry struct {
-	mu           sync.Mutex
-	recording    *domain.Recording
-	cancel       context.CancelFunc
-	done         chan struct{}
-	headers      map[string]string
-	headerOrigin string
+	mu            sync.Mutex
+	recording     *domain.Recording
+	cancel        context.CancelFunc
+	done          chan struct{}
+	headers       map[string]string
+	manifestURL   string
+	requestPolicy *adapterproto.RequestPolicy
 }
 
 type Manager struct {
@@ -119,7 +120,7 @@ func (m *Manager) Start(ctx context.Context, adapterID string, input json.RawMes
 		return nil, err
 	}
 	workerCtx, cancel := context.WithCancel(context.Background())
-	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), headers: cloneHeaders(media.Headers), headerOrigin: media.ManifestURL}
+	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), headers: cloneHeaders(media.Headers), manifestURL: media.ManifestURL, requestPolicy: media.RequestPolicy}
 	m.mu.Lock()
 	m.entries[id] = e
 	m.mu.Unlock()
@@ -211,7 +212,7 @@ func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSou
 			return
 		}
 		if first {
-			body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL)
+			body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -244,7 +245,7 @@ func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSou
 					m.fail(e, err)
 					return
 				}
-				body, err = fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL)
+				body, err = fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
 				if err != nil {
 					if ctx.Err() != nil {
 						return
@@ -300,7 +301,7 @@ func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSou
 			}
 			continue
 		}
-		body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL)
+		body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
 		if err != nil {
 			if ctx.Err() != nil {
 				return

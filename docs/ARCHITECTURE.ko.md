@@ -76,7 +76,7 @@ projection은 버려져도 다시 만들 수 있어야 합니다. application da
 
 각 adapter는 Core에 정적으로 연결된 Go package가 아니라 독립 실행 파일입니다. Core는 `ADAPTER_DIR`만 검색하며 `integrated-recorder-adapter-*` 이름의 executable regular file만 시작합니다. `PATH` 전체는 검색하지 않습니다. adapter 추가/교체는 Core를 다시 빌드하지 않고 이 directory에 binary를 배치하는 것으로 가능합니다.
 
-IPC는 stdin/stdout newline-delimited JSON이며 한 줄이 한 message입니다. 각 envelope는 protocol version, request ID, method를 포함하고 response는 같은 ID와 result 또는 `{code, message, details}` error를 돌려줍니다. frame 크기는 제한됩니다. 한 adapter process 내 request는 직렬화되고 timeout, malformed frame, version/ID 불일치 또는 process exit는 해당 adapter만 unavailable로 처리합니다. stdout은 protocol 전용이고 진단은 별도 stderr로 보냅니다. Core는 `describe` handshake에서 protocol version과 descriptor를 검증한 후 장기 실행 process를 유지하며 shutdown 때 graceful request 후 종료합니다.
+IPC는 stdin/stdout newline-delimited JSON이며 한 줄이 한 message입니다. 기존 v1 request/response envelope는 type 없는 wire format을 유지하고, response는 같은 request ID와 result 또는 `{code, message, details}` error를 돌려줍니다. 향후 비동기 확장을 위해 `{"protocol_version":1,"type":"notification","method":"...","params":{...}}` notification frame 형태를 예약했고 parser가 이를 request/response와 구분합니다. 현재 runtime은 notification을 전달하지 않으며 response를 기다리는 중 notification이 오면 protocol 오류로 안전하게 거부합니다. frame 크기는 제한됩니다. 한 adapter process 내 request는 직렬화되고 timeout, malformed frame, version/ID 불일치 또는 process exit는 해당 adapter만 unavailable로 처리합니다. stdout은 protocol 전용이고 진단은 별도 stderr로 보냅니다. Core는 `describe` handshake에서 protocol version과 descriptor를 검증한 후 장기 실행 process를 유지하며 shutdown 때 graceful request 후 종료합니다.
 
 v1의 사용 operation은 `describe`, `resolve`, `shutdown`입니다. `get_status`, `configure`, `interaction.begin`, `interaction.continue`, `metadata`, `events`, `refresh`는 generic operation 이름으로 예약되어 있으며 아직 실제 동작을 제공하지 않습니다. 알 수 없는 operation은 구조화된 `unsupported_method` error를 반환합니다.
 
@@ -88,7 +88,7 @@ Adapter 정의 schema는 UI가 adapter 전용 코드를 추가하지 않고 form
 
 Resource는 `{resource_type, resource_id, parent}`처럼 opaque 값과 재귀적 parent ref로 표현됩니다. adapter가 선언한 resource type과 parent-type 관계는 descriptor에 담기며 Core가 값을 비교하는 목적은 해당 adapter schema 범위를 찾고 해당 scope 문서를 구분하는 것뿐입니다. display name과 opaque attributes를 담는 일반 Resource 타입도 준비되어 있습니다. `account`, `channel`, `recording` 같은 Core enum이나 resource ID 기반 경로는 사용하지 않습니다.
 
-설정 scope는 plugin ID와 선택적인 전체 resource ref입니다. 일반 JSON config와 secret은 별도 interface/store로 유지합니다. 현재 local file backend는 SHA-256 scope key로 경로를 만들고 directory는 `0700`, 파일은 `0600`으로 저장합니다. **이 파일 backend는 암호화하지 않습니다.** 운영 시 data directory 접근을 제한해야 하며 향후 `SecretStore` 구현을 encrypted vault로 교체할 수 있습니다. API GET은 secret 원문을 반환하지 않고 key별 `configured` boolean만 돌려줍니다. Resolve 때만 해당 scope의 configuration/secrets를 adapter process stdin protocol로 전달하며 recording metadata에는 input/config/secret을 저장하지 않습니다.
+설정 scope는 plugin ID와 선택적인 전체 resource ref입니다. 일반 JSON config와 secret은 backend-neutral한 별도 `ConfigStore`/`SecretStore` interface로 유지합니다. 현재 local file backend는 SHA-256 scope key로 경로를 만들고 directory는 `0700`, 파일은 `0600`으로 저장합니다. Secret 파일은 일반 config와 분리되고 권한이 제한되지만 **저장 시 암호화되지 않아 plaintext-at-rest입니다.** Core는 secret 값을 log에 쓰지 않고 API GET/PUT 응답은 원문 대신 key별 `configured` 상태만 돌려줍니다. Resolve 때 해당 scope의 configuration/secrets가 adapter process stdin protocol로 전달되며 recording metadata에는 저장되지 않습니다. 이 interface는 향후 encrypted 또는 OS-backed backend로 교체할 수 있지만 현재 구현은 제공하지 않습니다.
 
 ## Generic interaction model
 
@@ -96,7 +96,7 @@ Protocol message는 `action`, `prompt`, `secret_prompt`, `navigate`, `display`, 
 
 ## Resolve와 공통 media acquisition
 
-Core는 recording 시작 시 `{adapter_id, input, resource?, title?}`를 받습니다. adapter-specific input은 JSON object로만 다루고 저장하지 않습니다. Adapter의 `resolve`는 media type, manifest URL, HTTP headers, optional session reference, opaque refresh/metadata를 반환합니다. Core는 manifest URL을 기존 SSRF validator로 검사하고 이후 dial도 safe HTTP client가 재검증합니다. Adapter가 제공한 header는 resolve된 manifest origin에만 전달하고 다른 origin URL/redirect로는 전달하지 않습니다.
+Core는 recording 시작 시 `{adapter_id, input, resource?, title?}`를 받습니다. adapter-specific input은 JSON object로만 다루고 저장하지 않습니다. Adapter의 `resolve`는 media type, manifest URL, HTTP headers, optional session reference, opaque refresh/metadata와 선택적인 `request_policy.header_forwarding`을 반환합니다. 기본은 `same_origin`이며, adapter가 `allowlist`와 origin URL 목록을 선언하면 그 origin에도 adapter 제공 header를 전달할 수 있습니다. 현재 하나의 origin 정책이 adapter 제공 전체 header에 적용됩니다. 비교는 scheme, 대소문자 무시 hostname, effective port를 사용하는 정확한 origin 비교입니다. 모든 새 media URL과 redirect마다 정책을 다시 평가하고, redirect 시 이전 adapter header를 모두 지운 뒤 새 URL이 허용될 때만 다시 붙입니다. 이 정책은 header 전달만 허가하며 private IP/SSRF 접근 권한을 주지 않습니다. Core의 기존 source validator와 safe HTTP client의 주소/dial 검증이 계속 적용됩니다.
 
 HLS master/media parsing, rendition selection, sequence 추적, gap detection, init/media segment 원본 byte 다운로드, SHA-256, recording persistence는 계속 Core의 `internal/hls`와 `internal/acquire` 책임입니다. Adapter는 플랫폼별 URL을 공통 media source로 resolve할 뿐 manifest parsing이나 segment 처리에 참여하지 않습니다.
 

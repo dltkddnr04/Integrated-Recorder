@@ -104,3 +104,69 @@ func TestPutValidatesPluginDefinedSchemaAndOpaqueKeys(t *testing.T) {
 }
 
 func floatPtr(v float64) *float64 { return &v }
+
+type memorySecretStore struct {
+	values map[string]map[string]string
+}
+
+var _ SecretStore = (*memorySecretStore)(nil)
+
+func (s *memorySecretStore) Load(scope Scope) (map[string]string, error) {
+	key, err := secretScopeKey(scope)
+	if err != nil {
+		return nil, err
+	}
+	values := map[string]string{}
+	for name, value := range s.values[key] {
+		values[name] = value
+	}
+	return values, nil
+}
+
+func (s *memorySecretStore) Save(scope Scope, values map[string]string) error {
+	key, err := secretScopeKey(scope)
+	if err != nil {
+		return err
+	}
+	copy := map[string]string{}
+	for name, value := range values {
+		copy[name] = value
+	}
+	if s.values == nil {
+		s.values = map[string]map[string]string{}
+	}
+	s.values[key] = copy
+	return nil
+}
+
+func secretScopeKey(scope Scope) (string, error) {
+	data, err := json.Marshal(scope)
+	return string(data), err
+}
+
+func TestSecretStoreInterfaceAcceptsNonFileBackendAndMasksValues(t *testing.T) {
+	configs, _, err := NewTypedFileStores(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(configs, &memorySecretStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := Scope{PluginID: "memory-backed-plugin"}
+	schema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "credential", Control: "secret", Label: "Opaque credential"}}}
+	if err = service.Put(scope, schema, nil, map[string]string{"credential": "never-return-this"}); err != nil {
+		t.Fatal(err)
+	}
+	values, configured, err := service.Masked(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "never-return-this") || !configured["credential"] {
+		t.Fatalf("non-file store projection leaked or lost secret state: values=%s configured=%#v", encoded, configured)
+	}
+}

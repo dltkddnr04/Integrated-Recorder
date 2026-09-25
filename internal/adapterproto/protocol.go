@@ -61,6 +61,39 @@ type Response struct {
 	Error           *Error          `json:"error,omitempty"`
 }
 
+type FrameType string
+
+const (
+	FrameTypeRequest      FrameType = "request"
+	FrameTypeResponse     FrameType = "response"
+	FrameTypeNotification FrameType = "notification"
+)
+
+// Frame classifies both the original untyped request/response envelopes and
+// the reserved typed notification envelope. Current adapter runtime supports
+// request/response only; parsing notifications does not deliver them.
+type Frame struct {
+	Kind         FrameType
+	Request      *Request
+	Response     *Response
+	Notification *Notification
+}
+
+// Notification is a reserved v1 extension frame. It deliberately has no ID,
+// so it cannot be confused with an ID-bearing response.
+type Notification struct {
+	ProtocolVersion int             `json:"protocol_version"`
+	Method          string          `json:"method"`
+	Params          json.RawMessage `json:"params,omitempty"`
+}
+
+type notificationEnvelope struct {
+	ProtocolVersion int             `json:"protocol_version"`
+	Type            FrameType       `json:"type"`
+	Method          string          `json:"method"`
+	Params          json.RawMessage `json:"params,omitempty"`
+}
+
 func Success(id string, result any) (Response, error) {
 	data, err := json.Marshal(result)
 	if err != nil {
@@ -80,17 +113,14 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	if err != nil {
 		return Request{}, err
 	}
-	var request Request
-	if err = json.Unmarshal(line, &request); err != nil {
-		return Request{}, fmt.Errorf("malformed request JSON: %w", err)
+	frame, err := ParseFrame(line)
+	if err != nil {
+		return Request{}, err
 	}
-	if request.ProtocolVersion != Version {
-		return request, fmt.Errorf("unsupported protocol version %d", request.ProtocolVersion)
+	if frame.Kind != FrameTypeRequest {
+		return Request{}, fmt.Errorf("expected request frame, received %s frame", frame.Kind)
 	}
-	if strings.TrimSpace(request.ID) == "" || strings.TrimSpace(request.Method) == "" {
-		return request, errors.New("request id and method are required")
-	}
-	return request, nil
+	return *frame.Request, nil
 }
 
 func ReadResponse(r *bufio.Reader) (Response, error) {
@@ -98,30 +128,144 @@ func ReadResponse(r *bufio.Reader) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
-	var response Response
-	if err = json.Unmarshal(line, &response); err != nil {
-		return Response{}, fmt.Errorf("malformed response JSON: %w", err)
+	frame, err := ParseFrame(line)
+	if err != nil {
+		return Response{}, err
 	}
-	if response.ProtocolVersion != Version {
-		return response, fmt.Errorf("unsupported protocol version %d", response.ProtocolVersion)
+	if frame.Kind != FrameTypeResponse {
+		return Response{}, fmt.Errorf("expected response frame, received %s frame", frame.Kind)
 	}
-	if strings.TrimSpace(response.ID) == "" {
-		return response, errors.New("response id is required")
-	}
-	if response.Error == nil && len(response.Result) == 0 {
-		return response, errors.New("response must contain result or error")
-	}
-	if response.Error != nil && len(response.Result) != 0 {
-		return response, errors.New("response cannot contain both result and error")
-	}
-	if response.Error != nil && response.Error.Code == "" {
-		return response, errors.New("structured error code is required")
-	}
-	return response, nil
+	return *frame.Response, nil
 }
 
 func WriteRequest(w io.Writer, request Request) error    { return writeFrame(w, request) }
 func WriteResponse(w io.Writer, response Response) error { return writeFrame(w, response) }
+
+func WriteNotification(w io.Writer, notification Notification) error {
+	if err := validateNotification(notification); err != nil {
+		return err
+	}
+	return writeFrame(w, notificationEnvelope{ProtocolVersion: notification.ProtocolVersion, Type: FrameTypeNotification, Method: notification.Method, Params: notification.Params})
+}
+
+// ParseFrame dispatches a complete JSON envelope. Request/response writers
+// keep their legacy wire format; the parser also accepts typed forms and the
+// reserved notification extension.
+func ParseFrame(data []byte) (Frame, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return Frame{}, fmt.Errorf("malformed protocol frame JSON: %w", err)
+	}
+	if fields == nil {
+		return Frame{}, errors.New("protocol frame must be a JSON object")
+	}
+	var version int
+	if raw, ok := fields["protocol_version"]; !ok || json.Unmarshal(raw, &version) != nil {
+		return Frame{}, errors.New("protocol version is required")
+	}
+	if version != Version {
+		return Frame{}, fmt.Errorf("unsupported protocol version %d", version)
+	}
+	if rawType, ok := fields["type"]; ok {
+		var frameType string
+		if err := json.Unmarshal(rawType, &frameType); err != nil || frameType == "" {
+			return Frame{}, errors.New("protocol frame type must be a nonempty string")
+		}
+		switch FrameType(frameType) {
+		case FrameTypeNotification:
+			if _, hasID := fields["id"]; hasID {
+				return Frame{}, errors.New("notification frame must not contain a request id")
+			}
+			if _, hasResult := fields["result"]; hasResult {
+				return Frame{}, errors.New("notification frame cannot contain a response result")
+			}
+			if _, hasError := fields["error"]; hasError {
+				return Frame{}, errors.New("notification frame cannot contain a response error")
+			}
+			var notification Notification
+			if err := json.Unmarshal(data, &notification); err != nil {
+				return Frame{}, fmt.Errorf("malformed notification frame: %w", err)
+			}
+			if err := validateNotification(notification); err != nil {
+				return Frame{}, err
+			}
+			return Frame{Kind: FrameTypeNotification, Notification: &notification}, nil
+		case FrameTypeRequest:
+			if _, hasResult := fields["result"]; hasResult {
+				return Frame{}, errors.New("request frame cannot contain a response result")
+			}
+			if _, hasError := fields["error"]; hasError {
+				return Frame{}, errors.New("request frame cannot contain a response error")
+			}
+			return parseRequestFrame(data)
+		case FrameTypeResponse:
+			if _, hasMethod := fields["method"]; hasMethod {
+				return Frame{}, errors.New("response frame cannot contain a method")
+			}
+			return parseResponseFrame(data)
+		default:
+			return Frame{}, fmt.Errorf("unknown protocol frame type %q", frameType)
+		}
+	}
+
+	if _, hasID := fields["id"]; !hasID {
+		return Frame{}, errors.New("protocol request/response frame id is required")
+	}
+	_, hasMethod := fields["method"]
+	_, hasResult := fields["result"]
+	_, hasError := fields["error"]
+	if hasMethod && !hasResult && !hasError {
+		return parseRequestFrame(data)
+	}
+	if !hasMethod && (hasResult || hasError) {
+		return parseResponseFrame(data)
+	}
+	return Frame{}, errors.New("unknown or malformed protocol frame shape")
+}
+
+func parseRequestFrame(data []byte) (Frame, error) {
+	var request Request
+	if err := json.Unmarshal(data, &request); err != nil {
+		return Frame{}, fmt.Errorf("malformed request frame: %w", err)
+	}
+	if strings.TrimSpace(request.ID) == "" || strings.TrimSpace(request.Method) == "" {
+		return Frame{}, errors.New("request id and method are required")
+	}
+	return Frame{Kind: FrameTypeRequest, Request: &request}, nil
+}
+
+func parseResponseFrame(data []byte) (Frame, error) {
+	var response Response
+	if err := json.Unmarshal(data, &response); err != nil {
+		return Frame{}, fmt.Errorf("malformed response frame: %w", err)
+	}
+	if strings.TrimSpace(response.ID) == "" {
+		return Frame{}, errors.New("response id is required")
+	}
+	if response.Error == nil && len(response.Result) == 0 {
+		return Frame{}, errors.New("response must contain result or error")
+	}
+	if response.Error != nil && len(response.Result) != 0 {
+		return Frame{}, errors.New("response cannot contain both result and error")
+	}
+	if response.Error != nil && response.Error.Code == "" {
+		return Frame{}, errors.New("structured error code is required")
+	}
+	return Frame{Kind: FrameTypeResponse, Response: &response}, nil
+}
+
+func validateNotification(notification Notification) error {
+	if notification.ProtocolVersion != Version {
+		return fmt.Errorf("unsupported protocol version %d", notification.ProtocolVersion)
+	}
+	if strings.TrimSpace(notification.Method) == "" {
+		return errors.New("notification method is required")
+	}
+	if len(notification.Params) != 0 && !json.Valid(notification.Params) {
+		return errors.New("notification params are invalid JSON")
+	}
+	return nil
+}
 
 func readFrame(r *bufio.Reader) ([]byte, error) {
 	var frame []byte

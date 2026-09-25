@@ -3,6 +3,8 @@ package adapterproto
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -59,6 +61,97 @@ func TestRejectsUnterminatedFrameAndResponseWithoutPayload(t *testing.T) {
 	}
 }
 
+func TestParseFramePreservesLegacyRequestAndResponseWireForms(t *testing.T) {
+	requestWire := []byte(`{"protocol_version":1,"id":"legacy-request","method":"resolve","params":{}}`)
+	requestFrame, err := ParseFrame(requestWire)
+	if err != nil || requestFrame.Kind != FrameTypeRequest || requestFrame.Request == nil || requestFrame.Request.ID != "legacy-request" {
+		t.Fatalf("legacy request frame = %#v, %v", requestFrame, err)
+	}
+	responseWire := []byte(`{"protocol_version":1,"id":"legacy-request","result":{"ok":true}}`)
+	responseFrame, err := ParseFrame(responseWire)
+	if err != nil || responseFrame.Kind != FrameTypeResponse || responseFrame.Response == nil || responseFrame.Response.ID != "legacy-request" {
+		t.Fatalf("legacy response frame = %#v, %v", responseFrame, err)
+	}
+	if bytes.Contains(requestWire, []byte(`"type"`)) || bytes.Contains(responseWire, []byte(`"type"`)) {
+		t.Fatal("legacy wire fixture unexpectedly requires a type property")
+	}
+}
+
+func TestParseFrameAcceptsTypedRequestAndResponseExtensions(t *testing.T) {
+	requestWire := `{"protocol_version":1,"type":"request","id":"typed-1","method":"resolve","params":{}}`
+	request, err := ParseFrame([]byte(requestWire))
+	if err != nil || request.Kind != FrameTypeRequest || request.Request == nil || request.Request.ID != "typed-1" {
+		t.Fatalf("typed request frame = %#v, %v", request, err)
+	}
+	if read, readErr := ReadRequest(bufio.NewReader(strings.NewReader(requestWire + "\n"))); readErr != nil || read.ID != "typed-1" {
+		t.Fatalf("typed request reader = %#v, %v", read, readErr)
+	}
+	responseWire := `{"protocol_version":1,"type":"response","id":"typed-1","result":{}}`
+	response, err := ParseFrame([]byte(responseWire))
+	if err != nil || response.Kind != FrameTypeResponse || response.Response == nil || response.Response.ID != "typed-1" {
+		t.Fatalf("typed response frame = %#v, %v", response, err)
+	}
+	if read, readErr := ReadResponse(bufio.NewReader(strings.NewReader(responseWire + "\n"))); readErr != nil || read.ID != "typed-1" {
+		t.Fatalf("typed response reader = %#v, %v", read, readErr)
+	}
+}
+
+func TestWriteRequestResponseKeepLegacyUntypedWireFormat(t *testing.T) {
+	var request bytes.Buffer
+	if err := WriteRequest(&request, Request{ProtocolVersion: Version, ID: "1", Method: "describe", Params: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := request.String(), "{\"protocol_version\":1,\"id\":\"1\",\"method\":\"describe\",\"params\":{}}\n"; got != want {
+		t.Fatalf("request wire = %s, want %s", got, want)
+	}
+	var response bytes.Buffer
+	if err := WriteResponse(&response, Response{ProtocolVersion: Version, ID: "1", Result: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := response.String(), "{\"protocol_version\":1,\"id\":\"1\",\"result\":{}}\n"; got != want {
+		t.Fatalf("response wire = %s, want %s", got, want)
+	}
+}
+
+func TestNotificationIsDistinctFrameWithoutResponseID(t *testing.T) {
+	var wire bytes.Buffer
+	notification := Notification{ProtocolVersion: Version, Method: "events.emit", Params: []byte(`{"kind":"state"}`)}
+	if err := WriteNotification(&wire, notification); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ParseFrame(bytes.TrimSuffix(wire.Bytes(), []byte("\n")))
+	if err != nil || frame.Kind != FrameTypeNotification || frame.Notification == nil || frame.Notification.Method != "events.emit" {
+		t.Fatalf("notification frame = %#v, %v", frame, err)
+	}
+	if frame.Notification.ProtocolVersion != Version || string(frame.Notification.Params) != `{"kind":"state"}` {
+		t.Fatalf("notification payload = %#v", frame.Notification)
+	}
+	if bytes.Contains(wire.Bytes(), []byte(`"id"`)) {
+		t.Fatalf("notification unexpectedly has a request ID: %s", wire.String())
+	}
+	if _, err = ReadResponse(bufio.NewReader(bytes.NewReader(wire.Bytes()))); err == nil || !strings.Contains(err.Error(), "expected response frame") {
+		t.Fatalf("ReadResponse notification error = %v", err)
+	}
+}
+
+func TestParseFrameRejectsUnknownAndMalformedFrameKinds(t *testing.T) {
+	for name, wire := range map[string]string{
+		"unknown typed kind":     `{"protocol_version":1,"type":"event","method":"events.emit"}`,
+		"nonstring type":         `{"protocol_version":1,"type":7,"method":"events.emit"}`,
+		"notification id":        `{"protocol_version":1,"type":"notification","id":"1","method":"events.emit"}`,
+		"missing method":         `{"protocol_version":1,"type":"notification","params":{}}`,
+		"mixed request response": `{"protocol_version":1,"id":"1","method":"resolve","result":{}}`,
+		"unknown legacy shape":   `{"protocol_version":1,"id":"1","other":true}`,
+		"malformed json":         `{"protocol_version":1,`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseFrame([]byte(wire)); err == nil {
+				t.Fatalf("accepted malformed frame %s", wire)
+			}
+		})
+	}
+}
+
 func TestDescriptorSchemaValidation(t *testing.T) {
 	d := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, InputSchema: Schema{Fields: []Field{{Key: "mode", Control: "select", Label: "Mode", Options: []Option{{Value: "one", Label: "One"}}}}}, ConfigurationSchema: Schema{Fields: []Field{}}, MediaTypes: []string{"hls"}}
 	if err := d.Validate(); err != nil {
@@ -100,5 +193,94 @@ func TestDescriptorValidatesOpaqueResourceDeclarations(t *testing.T) {
 	d.ResourceTypes[0].ParentTypes = []string{"opaque.parent", "opaque.parent"}
 	if err := d.Validate(); err == nil {
 		t.Fatal("duplicate parent declaration accepted")
+	}
+}
+
+func TestMediaRequestPolicyUsesExactOriginsAndRestrictiveDefaults(t *testing.T) {
+	manifest, err := url.Parse("https://Example.com/live/master.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := MediaSource{ManifestURL: manifest.String()}
+	for _, test := range []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "same origin", url: "https://example.com/segment.ts", want: true},
+		{name: "explicit default port", url: "https://example.com:443/segment.ts", want: true},
+		{name: "similar hostname prefix", url: "https://evil-example.com/segment.ts"},
+		{name: "different scheme", url: "http://example.com/segment.ts"},
+		{name: "different port", url: "https://example.com:444/segment.ts"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target, parseErr := url.Parse(test.url)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if got := defaults.AllowsHeadersFor(target); got != test.want {
+				t.Fatalf("AllowsHeadersFor(%q) = %t, want %t", test.url, got, test.want)
+			}
+		})
+	}
+
+	allowlist := MediaSource{ManifestURL: manifest.String(), RequestPolicy: &RequestPolicy{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://edge.example.net"}}}}
+	for _, test := range []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "listed cross origin", url: "https://EDGE.example.net:443/segment.ts", want: true},
+		{name: "unlisted similar prefix", url: "https://evil-edge.example.net/segment.ts"},
+		{name: "scheme is significant", url: "http://edge.example.net/segment.ts"},
+		{name: "nondefault port is significant", url: "https://edge.example.net:444/segment.ts"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target, parseErr := url.Parse(test.url)
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if got := allowlist.AllowsHeadersFor(target); got != test.want {
+				t.Fatalf("AllowsHeadersFor(%q) = %t, want %t", test.url, got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateMediaSourceRequestPolicy(t *testing.T) {
+	base := MediaSource{Type: "hls", ManifestURL: "https://stream.example/live.m3u8"}
+	valid := []RequestPolicy{
+		{},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingSameOrigin}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://stream.example", "https://cdn.example:443/"}}},
+	}
+	for _, policy := range valid {
+		media := base
+		media.RequestPolicy = &policy
+		if err := ValidateMediaSource(media, []string{"hls"}); err != nil {
+			t.Errorf("valid policy rejected: %v", err)
+		}
+	}
+	invalid := []RequestPolicy{
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingSameOrigin, Origins: []string{"https://cdn.example"}}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://cdn.example/path"}}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://cdn.example?token=x"}}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://cdn.example#fragment"}}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://user@cdn.example"}}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"file://cdn.example"}}},
+		{HeaderForwarding: &HeaderForwardingPolicy{Mode: "forward_everywhere"}},
+	}
+	for _, policy := range invalid {
+		media := base
+		media.RequestPolicy = &policy
+		if err := ValidateMediaSource(media, []string{"hls"}); err == nil {
+			t.Errorf("invalid policy accepted: %#v", policy)
+		}
+	}
+
+	wire, err := json.Marshal(MediaSource{Type: "hls", ManifestURL: base.ManifestURL, RequestPolicy: &RequestPolicy{HeaderForwarding: &HeaderForwardingPolicy{Mode: HeaderForwardingAllowlist, Origins: []string{"https://cdn.example"}}}})
+	if err != nil || !strings.Contains(string(wire), `"request_policy":{"header_forwarding"`) {
+		t.Fatalf("request policy wire field missing: %s, %v", wire, err)
 	}
 }
