@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 )
 
 func TestLoadAllMarksStaleRecordingInterrupted(t *testing.T) {

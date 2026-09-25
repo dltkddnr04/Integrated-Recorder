@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/acquire"
-	"github.com/example/integrated-recorder/internal/domain"
-	"github.com/example/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 type Server struct {

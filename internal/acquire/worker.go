@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/domain"
-	"github.com/example/integrated-recorder/internal/hls"
-	"github.com/example/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/hls"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 const (

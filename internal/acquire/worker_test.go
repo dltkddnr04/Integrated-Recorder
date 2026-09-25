@@ -5,10 +5,10 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/example/integrated-recorder/internal/domain"
-	"github.com/example/integrated-recorder/internal/hls"
-	"github.com/example/integrated-recorder/internal/platform/owncast"
-	"github.com/example/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/hls"
+	"github.com/dltkddnr04/integrated-recorder/internal/platform/owncast"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 func TestObservePlaylistRecordsWindowAndManifestGaps(t *testing.T) {

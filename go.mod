@@ -1,3 +1,3 @@
-module github.com/example/integrated-recorder
+module github.com/dltkddnr04/integrated-recorder
 
 go 1.23.0

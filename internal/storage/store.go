@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 )
 
 var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)

@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/domain"
-	"github.com/example/integrated-recorder/internal/network"
-	"github.com/example/integrated-recorder/internal/platform/owncast"
-	"github.com/example/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/network"
+	"github.com/dltkddnr04/integrated-recorder/internal/platform/owncast"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 type Resolver interface {

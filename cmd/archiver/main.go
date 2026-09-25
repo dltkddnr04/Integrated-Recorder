@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/acquire"
-	"github.com/example/integrated-recorder/internal/network"
-	"github.com/example/integrated-recorder/internal/server"
-	"github.com/example/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
+	"github.com/dltkddnr04/integrated-recorder/internal/network"
+	"github.com/dltkddnr04/integrated-recorder/internal/server"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 func main() {

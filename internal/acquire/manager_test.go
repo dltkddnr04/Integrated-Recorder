@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/example/integrated-recorder/internal/acquire"
-	"github.com/example/integrated-recorder/internal/domain"
-	"github.com/example/integrated-recorder/internal/platform/owncast"
-	"github.com/example/integrated-recorder/internal/server"
-	"github.com/example/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/platform/owncast"
+	"github.com/dltkddnr04/integrated-recorder/internal/server"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
