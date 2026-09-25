@@ -101,17 +101,17 @@ go build ./...
 
 ## Roadmap
 
-1. Broadcast metadata + chat timeline
-2. Finalized archive packaging + random-access index
-3. Full browser UI
-4. Additional platform adapters such as CHZZK, SOOP, and Twitch
-5. Hot/cold storage lifecycle, including HDD/NAS/LTO
-6. Optional export pipeline
+- [x] Original segment acquisition + restart-safe VOD playback
+- [ ] Broadcast metadata + chat timeline
+- [ ] Finalized archive packaging + random-access index
+- [ ] Full browser UI
+- [ ] Additional platform adapters such as CHZZK, SOOP, and Twitch
+- [ ] Hot/cold storage lifecycle, including HDD/NAS/LTO
+- [ ] Optional export pipeline
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
-- [아키텍처 (한국어)](docs/ARCHITECTURE.ko.md)
 
 ## License
 
