@@ -1,6 +1,6 @@
 # Integrated Recorder Architecture
 
-[README](../README.md) | [한국어](ARCHITECTURE.ko.md)
+[README](../README.en.md) | [한국어](ARCHITECTURE.ko.md)
 
 This document records the architectural direction behind Integrated Recorder. It intentionally contains detail that does not belong in the project landing page.
 
