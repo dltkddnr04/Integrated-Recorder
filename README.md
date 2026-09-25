@@ -1,5 +1,7 @@
 # Integrated Recorder
 
+**English** | [한국어](README.ko.md)
+
 **Integrated Recorder** is a headless, segment-native live-stream archival server written in Go.
 
 The project is built around a simple idea:
