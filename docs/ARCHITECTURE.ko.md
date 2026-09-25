@@ -1,6 +1,6 @@
 # Integrated Recorder 아키텍처
 
-[README](../README.ko.md) | [English](ARCHITECTURE.md)
+[README](../README.md) | [English](ARCHITECTURE.md)
 
 이 문서는 Integrated Recorder의 장기 아키텍처 방향을 기록합니다. 프로젝트 첫 화면에 넣기에는 너무 상세한 설계 내용을 README에서 분리해 두는 목적입니다.
 
