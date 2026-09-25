@@ -101,17 +101,17 @@ go build ./...
 
 ## Roadmap
 
-1. 방송 metadata + chat timeline
-2. Finalized archive packaging + random-access index
-3. 전체 browser UI
-4. CHZZK, SOOP, Twitch 등 추가 platform adapter
-5. HDD/NAS/LTO를 포함한 hot/cold storage lifecycle
-6. Optional export pipeline
+- [x] 원본 segment acquisition + restart-safe VOD playback
+- [ ] 방송 metadata + chat timeline
+- [ ] Finalized archive packaging + random-access index
+- [ ] 전체 browser UI
+- [ ] CHZZK, SOOP, Twitch 등 추가 platform adapter
+- [ ] HDD/NAS/LTO를 포함한 hot/cold storage lifecycle
+- [ ] Optional export pipeline
 
 ## 문서
 
 - [아키텍처](docs/ARCHITECTURE.ko.md)
-- [Architecture (English)](docs/ARCHITECTURE.md)
 
 ## 라이선스
 
