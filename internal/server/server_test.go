@@ -47,10 +47,10 @@ func runServerTestAdapter() int {
 		switch request.Method {
 		case adapterproto.MethodDescribe:
 			descriptor := adapterproto.Descriptor{
-				ID: "schema-test", Name: "Schema Test", Version: "1", ProtocolVersion: adapterproto.Version,
+				ID: "schema-test", Name: "Schema Test", Version: "1", ProtocolVersion: adapterproto.Version, Capabilities: []string{adapterproto.CapabilityResolve},
 				InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{}},
 				ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "legacy_secret", Control: "secret", Label: "Secret"}, {Key: "label", Control: "text", Label: "Label"}}},
-				MediaTypes:          []string{},
+				MediaTypes:          []string{"hls"},
 			}
 			response, _ = adapterproto.Success(request.ID, descriptor)
 		case adapterproto.MethodShutdown:
@@ -94,7 +94,10 @@ func runWorkflowTestAdapter() int {
 			var params adapterproto.ResolveContinueParams
 			_ = json.Unmarshal(request.Params, &params)
 			if len(params.Answers) == 0 && len(params.AnswerSecrets) == 0 {
-				challenge := &adapterproto.WorkflowChallenge{Persistable: true, Schema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "setting", Control: "text", Label: "Setting", Required: true, Inherit: true}, {Key: "credential", Control: "secret", Label: "Credential", Required: true}}}}
+				challenge := &adapterproto.WorkflowChallenge{Persistable: true, Schema: adapterproto.Schema{Fields: []adapterproto.Field{
+					{Key: "setting", Control: "text", Label: "Setting", Required: true, Inherit: true, Persistence: &adapterproto.FieldPersistence{Mode: adapterproto.PersistenceOptional, Target: adapterproto.PersistenceTarget{Scope: adapterproto.PersistenceCurrent}}},
+					{Key: "credential", Control: "secret", Label: "Credential", Required: true, Persistence: &adapterproto.FieldPersistence{Mode: adapterproto.PersistenceOptional, Target: adapterproto.PersistenceTarget{Scope: adapterproto.PersistenceCurrent}}},
+				}}}
 				response, _ = adapterproto.Success(request.ID, adapterproto.ResolveWorkflowResult{State: "configuration_required", WorkflowID: params.WorkflowID, Resource: params.Resource, Challenge: challenge})
 			} else {
 				if marker := os.Getenv("IR_WORKFLOW_RESUME_MARKER"); marker != "" {
@@ -139,8 +142,9 @@ func TestConfigAPIAlwaysMasksValuesDeclaredSecretByCurrentSchema(t *testing.T) {
 	const sentinel = "legacy-secret-sentinel"
 	configStore := &preservingConfigStore{values: map[string]map[string]json.RawMessage{
 		"schema-test": {
-			"legacy_secret": json.RawMessage(`"` + sentinel + `"`),
-			"label":         json.RawMessage(`"old-value"`),
+			"legacy_secret":  json.RawMessage(`"` + sentinel + `"`),
+			"retired_secret": json.RawMessage(`"` + sentinel + `"`),
+			"label":          json.RawMessage(`"old-value"`),
 		},
 	}}
 	configs, err := pluginconfig.NewService(configStore, &memorySecretStore{values: map[string]map[string]string{}})
@@ -325,7 +329,7 @@ func TestWorkflowContinuationCannotBeSubmittedTwice(t *testing.T) {
 	}()
 	select {
 	case <-done:
-		if second.Code != http.StatusBadRequest || !strings.Contains(second.Body.String(), "already continuing") {
+		if second.Code != http.StatusBadRequest || strings.Contains(second.Body.String(), "one-time-secret") {
 			t.Fatalf("duplicate continuation response=%d %s", second.Code, second.Body.String())
 		}
 	case <-time.After(500 * time.Millisecond):

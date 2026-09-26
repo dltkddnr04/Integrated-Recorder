@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -42,14 +43,18 @@ func TestRejectsUnsupportedVersionsMalformedAndOversizedFrames(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected frame rejection")
 			}
-			if name == "unsupported" && !strings.Contains(err.Error(), "unsupported protocol version") {
+			if name == "unsupported" && (!strings.Contains(err.Error(), "unsupported protocol version") || !errors.Is(err, ErrUnsupportedProtocolVersion)) {
 				t.Fatalf("error = %v", err)
 			}
 		})
 	}
 	_, err := ReadResponse(bufio.NewReader(strings.NewReader(`{"protocol_version":2,"id":"1","result":{}}` + "\n")))
-	if err == nil || !strings.Contains(err.Error(), "unsupported protocol version") {
+	if err == nil || !strings.Contains(err.Error(), "unsupported protocol version") || !errors.Is(err, ErrUnsupportedProtocolVersion) {
 		t.Fatalf("response error = %v", err)
+	}
+	_, err = ParseFrame([]byte(`{"protocol_version":2,"type":"notification","method":"events.emit"}`))
+	if !errors.Is(err, ErrUnsupportedProtocolVersion) {
+		t.Fatalf("notification version error = %v", err)
 	}
 }
 
@@ -153,8 +158,40 @@ func TestParseFrameRejectsUnknownAndMalformedFrameKinds(t *testing.T) {
 	}
 }
 
+func FuzzParseFrameBounded(f *testing.F) {
+	f.Add([]byte(`{"protocol_version":1,"id":"1","method":"describe","params":{}}`))
+	f.Add([]byte(`{"protocol_version":1,"type":"notification","method":"events.emit","params":{}}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > MaxFrameBytes {
+			return
+		}
+		_, _ = ParseFrame(data)
+	})
+}
+
+func FuzzSchemaAndResourceValidation(f *testing.F) {
+	f.Add([]byte(`{"fields":[{"key":"enabled","control":"boolean","label":"Enabled","default":false}]}`))
+	f.Add([]byte(`{"fields":[{"key":"dependent","control":"text","label":"Dependent","visible_when":{"field":"enabled","truthy":true}}]}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 1<<20 {
+			return
+		}
+		var schema Schema
+		if json.Unmarshal(data, &schema) == nil {
+			_ = schema.Validate()
+			_ = ValidateProvidedValues(schema, map[string]json.RawMessage{})
+		}
+		var ref ResourceRef
+		if json.Unmarshal(data, &ref) == nil {
+			_ = ValidateResourceRef(&ref)
+			descriptor := Descriptor{ID: "fuzz", Name: "Fuzz", Version: "1", ProtocolVersion: Version, Capabilities: []string{CapabilityResolve}, MediaTypes: []string{"hls"}}
+			_ = ValidateResourceRefForDescriptor(descriptor, &ref)
+		}
+	})
+}
+
 func TestDescriptorSchemaValidation(t *testing.T) {
-	d := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, InputSchema: Schema{Fields: []Field{{Key: "mode", Control: "select", Label: "Mode", Options: []Option{{Value: "one", Label: "One"}}}}}, ConfigurationSchema: Schema{Fields: []Field{}}, MediaTypes: []string{"hls"}}
+	d := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, Capabilities: []string{CapabilityResolve}, InputSchema: Schema{Fields: []Field{{Key: "mode", Control: "select", Label: "Mode", Options: []Option{{Value: "one", Label: "One"}}}}}, ConfigurationSchema: Schema{Fields: []Field{}}, MediaTypes: []string{"hls"}}
 	if err := d.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +202,7 @@ func TestDescriptorSchemaValidation(t *testing.T) {
 }
 
 func TestResourceReferencesAreOpaqueButBounded(t *testing.T) {
-	ref := &ResourceRef{Type: "unrecognized/type", ID: "id/with/slashes", Parent: &ResourceRef{Type: "parent", ID: "opaque id"}}
+	ref := &ResourceRef{Type: "unrecognized.type", ID: "id/with/slashes", Parent: &ResourceRef{Type: "parent", ID: "opaque id"}}
 	if err := ValidateResourceRef(ref); err != nil {
 		t.Fatalf("arbitrary resource reference rejected: %v", err)
 	}
@@ -187,13 +224,156 @@ func TestResourceReferencesAreOpaqueButBounded(t *testing.T) {
 }
 
 func TestDescriptorValidatesOpaqueResourceDeclarations(t *testing.T) {
-	d := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, InputSchema: Schema{Fields: []Field{}}, ConfigurationSchema: Schema{Fields: []Field{}}, ResourceTypes: []ResourceType{{Type: "opaque.resource", ParentTypes: []string{"opaque.parent"}, ConfigurationSchema: Schema{Fields: []Field{}}}}, MediaTypes: []string{"hls"}}
+	d := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, Capabilities: []string{CapabilityResolve}, InputSchema: Schema{Fields: []Field{}}, ConfigurationSchema: Schema{Fields: []Field{}}, ResourceTypes: []ResourceType{{Type: "opaque.resource", ParentTypes: []string{"opaque.parent"}, ConfigurationSchema: Schema{Fields: []Field{}}}, {Type: "opaque.parent", ConfigurationSchema: Schema{Fields: []Field{}}}}, MediaTypes: []string{"hls"}}
 	if err := d.Validate(); err != nil {
 		t.Fatalf("valid opaque resource declaration rejected: %v", err)
 	}
 	d.ResourceTypes[0].ParentTypes = []string{"opaque.parent", "opaque.parent"}
 	if err := d.Validate(); err == nil {
 		t.Fatal("duplicate parent declaration accepted")
+	}
+	d.ResourceTypes = []ResourceType{{Type: "alpha", ParentTypes: []string{"beta"}}, {Type: "beta", ParentTypes: []string{"alpha"}}}
+	if err := d.Validate(); err == nil {
+		t.Fatal("cyclic resource declarations accepted")
+	}
+}
+
+func TestDescriptorForwardCompatibleCapabilitiesAndResourceEdges(t *testing.T) {
+	d := Descriptor{ID: "adapter.v1", Name: "Adapter", Version: "1", ProtocolVersion: Version, Capabilities: []string{CapabilityResolve, "optional.ext"}, InputSchema: Schema{}, ConfigurationSchema: Schema{}, ResourceTypes: []ResourceType{{Type: "alpha"}, {Type: "beta", ParentTypes: []string{"alpha"}}}, MediaTypes: []string{"hls"}}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("optional capability rejected: %v", err)
+	}
+	if err := ValidateResourceRefForDescriptor(d, &ResourceRef{Type: "beta", ID: "b", Parent: &ResourceRef{Type: "alpha", ID: "a"}}); err != nil {
+		t.Fatalf("declared edge rejected: %v", err)
+	}
+	if err := ValidateResourceRefForDescriptor(d, &ResourceRef{Type: "beta", ID: "root"}); err != nil {
+		t.Fatalf("declared type with optional parent edge rejected as a root: %v", err)
+	}
+	for _, ref := range []*ResourceRef{
+		{Type: "gamma", ID: "g"},
+		{Type: "beta", ID: "b", Parent: &ResourceRef{Type: "gamma", ID: "g"}},
+	} {
+		if err := ValidateResourceRefForDescriptor(d, ref); err == nil {
+			t.Fatalf("undeclared chain accepted: %#v", ref)
+		}
+	}
+	d.Capabilities = append(d.Capabilities, "bad capability")
+	if err := d.Validate(); err == nil {
+		t.Fatal("malformed capability accepted")
+	}
+}
+
+func TestNumericOptionsUseJSONSemanticEqualityAndRejectDuplicates(t *testing.T) {
+	var schema Schema
+	if err := json.Unmarshal([]byte(`{"fields":[{"key":"one","control":"select","label":"One","options":[{"value":1,"label":"One"},{"value":2,"label":"Two"}]},{"key":"many","control":"multi-select","label":"Many","constraints":{"min_items":2},"options":[{"value":1,"label":"One"},{"value":2,"label":"Two"}]}]}`), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateValues(schema, map[string]json.RawMessage{"one": json.RawMessage(`1.0`), "many": json.RawMessage(`[1.0,2e0]`)}); err != nil {
+		t.Fatalf("equivalent numeric option representations rejected: %v", err)
+	}
+	if err := ValidateValues(schema, map[string]json.RawMessage{"many": json.RawMessage(`[1,1.0]`)}); err == nil {
+		t.Fatal("duplicate multi-select values satisfied min_items")
+	}
+	var duplicate Schema
+	if err := json.Unmarshal([]byte(`{"fields":[{"key":"one","control":"select","label":"One","options":[{"value":1,"label":"One"},{"value":1.0,"label":"Duplicate"}]}]}`), &duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if err := duplicate.Validate(); err == nil {
+		t.Fatal("semantically duplicate numeric options were accepted")
+	}
+}
+
+func TestNumericCanonicalizationDoesNotExpandLargeExponent(t *testing.T) {
+	var schema Schema
+	if err := json.Unmarshal([]byte(`{"fields":[{"key":"value","control":"select","label":"Value","options":[{"value":2e1000000000,"label":"Large"}]}]}`), &schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateValues(schema, map[string]json.RawMessage{"value": json.RawMessage(`20e999999999`)}); err != nil {
+		t.Fatalf("equivalent large decimal exponent rejected: %v", err)
+	}
+	var duplicates Schema
+	if err := json.Unmarshal([]byte(`{"fields":[{"key":"value","control":"select","label":"Value","options":[{"value":2e1000000000,"label":"Large"},{"value":20e999999999,"label":"Equivalent"}]}]}`), &duplicates); err != nil {
+		t.Fatal(err)
+	}
+	if err := duplicates.Validate(); err == nil {
+		t.Fatal("equivalent large exponents were not identified as duplicate options")
+	}
+}
+
+func TestResolveDescriptorRequiresDeclaredMediaType(t *testing.T) {
+	d := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, Capabilities: []string{CapabilityResolve}, InputSchema: Schema{}, ConfigurationSchema: Schema{}}
+	if err := d.Validate(); err == nil {
+		t.Fatal("resolve descriptor without media types was accepted")
+	}
+	d.MediaTypes = []string{"hls"}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("valid resolve descriptor rejected: %v", err)
+	}
+}
+
+func TestSchemaDefaultsConstraintsOptionsAndVisibility(t *testing.T) {
+	schema := Schema{Fields: []Field{
+		{Key: "mode", Control: "select", Label: "Mode", Required: true, Default: json.RawMessage(`"basic"`), Options: []Option{{Value: "basic", Label: "Basic"}, {Value: "advanced", Label: "Advanced"}}},
+		{Key: "count", Control: "number", Label: "Count", Default: json.RawMessage(`2`), Constraints: &Constraints{Min: floatPtr(1), Max: floatPtr(4)}},
+		{Key: "advanced_value", Control: "text", Label: "Advanced value", Required: true, VisibleWhen: json.RawMessage(`{"field":"mode","equals":"advanced"}`)},
+	}}
+	if err := schema.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	defaults := ApplyDefaults(schema, map[string]json.RawMessage{})
+	if string(defaults["mode"]) != `"basic"` || string(defaults["count"]) != "2" {
+		t.Fatalf("defaults = %#v", defaults)
+	}
+	if err := ValidateValues(schema, map[string]json.RawMessage{}); err != nil {
+		t.Fatalf("hidden required field blocked omission: %v", err)
+	}
+	if err := ValidateValues(schema, map[string]json.RawMessage{"mode": json.RawMessage(`"advanced"`)}); err == nil {
+		t.Fatal("visible required field accepted missing value")
+	}
+	if err := ValidateProvidedValues(schema, map[string]json.RawMessage{"advanced_value": json.RawMessage(`"stale"`)}); err == nil {
+		t.Fatal("value for hidden field accepted")
+	}
+	visible, err := IsVisible(schema, "advanced_value", map[string]json.RawMessage{"mode": json.RawMessage(`"advanced"`)})
+	if err != nil || !visible {
+		t.Fatalf("visible condition result=%v, err=%v", visible, err)
+	}
+	for name, invalid := range map[string]Schema{
+		"invalid number default":       {Fields: []Field{{Key: "count", Control: "number", Label: "Count", Default: json.RawMessage(`8`), Constraints: &Constraints{Max: floatPtr(4)}}}},
+		"duplicate options":            {Fields: []Field{{Key: "mode", Control: "select", Label: "Mode", Options: []Option{{Value: map[string]any{"a": 1, "b": 2}, Label: "One"}, {Value: map[string]any{"b": 2, "a": 1}, Label: "Duplicate"}}}}},
+		"bad item range":               {Fields: []Field{{Key: "items", Control: "multi-select", Label: "Items", Options: []Option{{Value: "x", Label: "X"}}, Constraints: &Constraints{MinItems: intPtr(3), MaxItems: intPtr(2)}}}},
+		"visibility cycle":             {Fields: []Field{{Key: "a", Control: "boolean", Label: "A", VisibleWhen: json.RawMessage(`{"field":"b","truthy":true}`)}, {Key: "b", Control: "boolean", Label: "B", VisibleWhen: json.RawMessage(`{"field":"a","truthy":true}`)}}},
+		"self visibility":              {Fields: []Field{{Key: "a", Control: "text", Label: "A", VisibleWhen: json.RawMessage(`{"field":"a","truthy":true}`)}}},
+		"truthy requires boolean":      {Fields: []Field{{Key: "a", Control: "text", Label: "A"}, {Key: "b", Control: "text", Label: "B", VisibleWhen: json.RawMessage(`{"field":"a","truthy":true}`)}}},
+		"secret visibility dependency": {Fields: []Field{{Key: "secret", Control: "secret", Label: "Secret"}, {Key: "conditional", Control: "text", Label: "Conditional", VisibleWhen: json.RawMessage(`{"field":"secret","truthy":true}`)}}},
+		"secret default":               {Fields: []Field{{Key: "secret", Control: "secret", Label: "Secret", Default: json.RawMessage(`"do-not-default-secrets"`)}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := invalid.Validate(); err == nil {
+				t.Fatal("invalid schema accepted")
+			}
+		})
+	}
+}
+
+func TestMediaHeadersUseTokenValidationAndRejectUnsafeDuplicates(t *testing.T) {
+	base := MediaSource{Type: "hls", ManifestURL: "https://stream.example/live.m3u8"}
+	for name, headers := range map[string]map[string]string{
+		"invalid token":       {"Bad Header": "x"},
+		"canonical duplicate": {"authorization": "a", "Authorization": "b"},
+		"transport header":    {"Host": "evil.example"},
+		"hop header":          {"Connection": "keep-alive"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			media := base
+			media.Headers = headers
+			if err := ValidateMediaSource(media, []string{"hls"}); err == nil {
+				t.Fatal("unsafe header accepted")
+			}
+		})
+	}
+	base.Headers = map[string]string{"Authorization": "Bearer x", "Cookie": "a=b", "Referer": "https://example/", "Origin": "https://example/", "User-Agent": "test"}
+	if err := ValidateMediaSource(base, []string{"hls"}); err != nil {
+		t.Fatalf("normal media headers rejected: %v", err)
 	}
 }
 

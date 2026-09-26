@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,7 +23,13 @@ import (
 )
 
 const binaryPrefix = "integrated-recorder-adapter-"
-const maxWorkflowTransitions = 16
+const maxWorkflowTransitions = 32
+const maxActiveWorkflows = 128
+const workflowTTL = 30 * time.Minute
+
+var (
+	errAdapterDescriptorInvalid = errors.New("invalid adapter descriptor")
+)
 
 type Status struct {
 	ID              string `json:"id"`
@@ -54,8 +61,14 @@ type entry struct {
 
 type workflowSession struct {
 	adapterID      string
+	workflowID     string
 	resource       *adapterproto.ResourceRef
 	progress       WorkflowProgress
+	cancel         context.CancelFunc
+	generation     uint64
+	createdAt      time.Time
+	updatedAt      time.Time
+	transitions    int
 	continuing     bool
 	continuationID uint64
 }
@@ -71,17 +84,23 @@ type WorkflowProgress struct {
 }
 
 type Host struct {
-	mu           sync.RWMutex
-	entries      map[string]*entry
-	configs      *pluginconfig.Service
-	interactions *interaction.Tracker
-	workflows    map[string]workflowSession
-	workflowCall uint64
-	closed       bool
+	mu             sync.RWMutex
+	entries        map[string]*entry
+	configs        *pluginconfig.Service
+	state          *pluginconfig.StateService
+	interactions   *interaction.Tracker
+	workflows      map[string]workflowSession
+	workflowCall   uint64
+	workflowStarts int
+	closed         bool
 }
 
 func Discover(ctx context.Context, dir string, configs *pluginconfig.Service) (*Host, error) {
-	h := &Host{entries: map[string]*entry{}, configs: configs, interactions: interaction.NewTracker(), workflows: map[string]workflowSession{}}
+	return DiscoverWithState(ctx, dir, configs, nil)
+}
+
+func DiscoverWithState(ctx context.Context, dir string, configs *pluginconfig.Service, state *pluginconfig.StateService) (*Host, error) {
+	h := &Host{entries: map[string]*entry{}, configs: configs, state: state, interactions: interaction.NewTracker(), workflows: map[string]workflowSession{}}
 	if strings.TrimSpace(dir) == "" {
 		return h, nil
 	}
@@ -137,6 +156,50 @@ func Discover(ctx context.Context, dir string, configs *pluginconfig.Service) (*
 	return h, nil
 }
 
+// DiscoverDirs scans only the explicit directories supplied by the caller.
+// Directory and binary ordering are deterministic, and duplicate descriptor
+// identities are rejected across the entire configured set.
+func DiscoverDirs(ctx context.Context, dirs []string, configs *pluginconfig.Service, states ...*pluginconfig.StateService) (*Host, error) {
+	var state *pluginconfig.StateService
+	if len(states) > 0 {
+		state = states[0]
+	}
+	ordered := append([]string(nil), dirs...)
+	sort.Strings(ordered)
+	h := &Host{entries: map[string]*entry{}, configs: configs, state: state, interactions: interaction.NewTracker(), workflows: map[string]workflowSession{}}
+	for _, dir := range ordered {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		child, err := DiscoverWithState(ctx, dir, configs, state)
+		if err != nil {
+			h.Close()
+			return nil, err
+		}
+		for key, candidate := range child.entries {
+			if existing, duplicate := h.entries[key]; duplicate && !strings.HasPrefix(key, "candidate:") {
+				if existing.process != nil {
+					existing.process.kill()
+				}
+				if candidate.process != nil {
+					candidate.process.kill()
+				}
+				existing.process = nil
+				existing.descriptor = nil
+				existing.status = Status{ID: key, State: "rejected", Error: "duplicate adapter id"}
+				continue
+			}
+			if _, exists := h.entries[key]; exists {
+				key = "candidate:" + filepath.Clean(candidate.path)
+			}
+			h.entries[key] = candidate
+		}
+		child.entries = map[string]*entry{}
+		child.Close()
+	}
+	return h, nil
+}
+
 func describeProcess(ctx context.Context, p *process) (adapterproto.Descriptor, error) {
 	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -146,16 +209,27 @@ func describeProcess(ctx context.Context, p *process) (adapterproto.Descriptor, 
 	}
 	var d adapterproto.Descriptor
 	if json.Unmarshal(result, &d) != nil {
-		return adapterproto.Descriptor{}, fmt.Errorf("invalid adapter descriptor")
+		return adapterproto.Descriptor{}, errAdapterDescriptorInvalid
+	}
+	if d.ProtocolVersion != adapterproto.Version {
+		return adapterproto.Descriptor{}, fmt.Errorf("%w: descriptor declares unsupported version", adapterproto.ErrUnsupportedProtocolVersion)
 	}
 	if err := d.Validate(); err != nil {
-		return adapterproto.Descriptor{}, fmt.Errorf("invalid adapter descriptor: %w", err)
+		return adapterproto.Descriptor{}, fmt.Errorf("%w: %v", errAdapterDescriptorInvalid, err)
 	}
 	return d, nil
 }
 
 func descriptorFingerprint(d adapterproto.Descriptor) string {
 	data, _ := json.Marshal(d)
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.UseNumber()
+	if decoder.Decode(&value) == nil {
+		if canonical, err := json.Marshal(value); err == nil {
+			data = canonical
+		}
+	}
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
 }
@@ -233,7 +307,23 @@ func (h *Host) Schema(id string, resource *adapterproto.ResourceRef) (adapterpro
 	return mergeSchemas(chain), nil
 }
 
+// ValidateResource checks a structurally opaque resource chain against the
+// adapter's declared resource graph.
+func (h *Host) ValidateResource(id string, ref *adapterproto.ResourceRef) error {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return err
+	}
+	if err := adapterproto.ValidateResourceRefForDescriptor(d, ref); err != nil {
+		return fmt.Errorf("invalid resource reference")
+	}
+	return nil
+}
+
 func (h *Host) schemaChain(id string, resource *adapterproto.ResourceRef) ([]pluginconfig.ScopeSchema, error) {
+	if err := h.ValidateResource(id, resource); err != nil {
+		return nil, err
+	}
 	scopes, err := pluginconfig.ResourceScopes(id, resource)
 	if err != nil {
 		return nil, err
@@ -374,25 +464,46 @@ func (h *Host) ensureProcess(ctx context.Context, e *entry) (*process, error) {
 	}
 	if e.process != nil && !e.process.isUnusable() {
 		p := e.process
+		if e.status.RestartAttempts > 0 && time.Since(p.startedAt) >= processStableUptime {
+			e.status.RestartAttempts = 0
+		}
 		e.stateMu.Unlock()
 		return p, nil
 	}
 	if e.process != nil {
+		p := e.process
 		e.process = nil
+		e.status.State = "unavailable"
+		e.status.Error = "adapter process needs restart"
+		if e.status.RestartAttempts == 0 {
+			// Preserve immediate recovery for the first observed death. Once a
+			// replacement has been attempted, subsequent short-lived generations
+			// use the bounded exponential backoff.
+			e.nextRestart = time.Now()
+		} else {
+			scheduleRestartLocked(e, p, time.Now())
+		}
 	}
-	if !e.nextRestart.IsZero() && time.Now().Before(e.nextRestart) {
+	now := time.Now()
+	if !e.nextRestart.IsZero() && now.Before(e.nextRestart) {
 		e.stateMu.Unlock()
 		return nil, fmt.Errorf("adapter restart is backing off")
 	}
+	// The previous deadline has been served. Clear it before attempting the
+	// replacement so a failed spawn/handshake can schedule the next backoff.
+	e.nextRestart = time.Time{}
 	e.status.RestartAttempts++
-	attempt := e.status.RestartAttempts
 	e.stateMu.Unlock()
 	p, err := startProcess(e.path)
+	descriptorMismatch := false
 	if err == nil {
 		var d adapterproto.Descriptor
 		d, err = describeProcess(ctx, p)
-		if err == nil && (d.ID != e.descriptor.ID || d.ProtocolVersion != e.descriptor.ProtocolVersion || d.Version != e.descriptor.Version) {
-			err = fmt.Errorf("adapter descriptor identity changed")
+		if err == nil && (d.ID != e.descriptor.ID || d.Version != e.descriptor.Version || d.ProtocolVersion != e.descriptor.ProtocolVersion || descriptorFingerprint(d) != e.baseFingerprint) {
+			descriptorMismatch = true
+			err = fmt.Errorf("adapter descriptor fingerprint changed")
+		} else if errors.Is(err, adapterproto.ErrUnsupportedProtocolVersion) || errors.Is(err, errAdapterDescriptorInvalid) {
+			descriptorMismatch = true
 		}
 	}
 	if err != nil {
@@ -400,15 +511,11 @@ func (h *Host) ensureProcess(ctx context.Context, e *entry) (*process, error) {
 			p.kill()
 		}
 		e.stateMu.Lock()
-		if strings.Contains(err.Error(), "descriptor identity changed") || strings.Contains(err.Error(), "unsupported protocol version") {
+		if descriptorMismatch {
 			e.restartRejected = true
 		}
 		if !e.restartRejected {
-			delay := 100 * time.Millisecond << min(attempt-1, 8)
-			if delay > 30*time.Second {
-				delay = 30 * time.Second
-			}
-			e.nextRestart = time.Now().Add(delay)
+			scheduleRestartLocked(e, nil, time.Now())
 		}
 		e.status.State = "unavailable"
 		e.status.Error = "adapter restart failed validation"
@@ -430,35 +537,78 @@ func (h *Host) ensureProcess(ctx context.Context, e *entry) (*process, error) {
 	e.status.State = "ready"
 	e.status.Error = ""
 	e.status.Generation++
-	e.status.RestartAttempts = 0
 	e.stateMu.Unlock()
 	h.mu.RUnlock()
 	return p, nil
 }
 
 func (h *Host) call(ctx context.Context, id, method string, params any) (json.RawMessage, error) {
+	result, _, err := h.callGeneration(ctx, id, method, params, 0)
+	return result, err
+}
+
+var errAdapterGenerationChanged = fmt.Errorf("workflow expired because adapter process restarted")
+
+func (h *Host) callAtGeneration(ctx context.Context, id, method string, params any, expected uint64) (json.RawMessage, error) {
+	result, _, err := h.callGeneration(ctx, id, method, params, expected)
+	return result, err
+}
+
+func (h *Host) callGeneration(ctx context.Context, id, method string, params any, expected uint64) (json.RawMessage, uint64, error) {
 	e, err := h.entryFor(id)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	p, err := h.ensureProcess(ctx, e)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	e.stateMu.Lock()
+	generation := e.status.Generation
+	e.stateMu.Unlock()
+	if expected != 0 && generation != expected {
+		return nil, generation, errAdapterGenerationChanged
 	}
 	result, err := p.call(ctx, method, params)
 	if p.isUnusable() {
 		e.stateMu.Lock()
 		defer e.stateMu.Unlock()
-		e.process = nil
-		e.status.State = "unavailable"
-		e.status.Error = "adapter process needs restart"
-		if e.nextRestart.IsZero() {
-			e.nextRestart = time.Now().Add(100 * time.Millisecond)
+		if e.process == p {
+			e.process = nil
+			e.status.State = "unavailable"
+			e.status.Error = "adapter process needs restart"
+			scheduleRestartLocked(e, p, time.Now())
 		}
 	}
-	return result, err
+	return result, generation, err
+}
+
+const processStableUptime = 30 * time.Second
+
+func restartBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := 100 * time.Millisecond << min(attempt-1, 8)
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+// scheduleRestartLocked bounds replacement attempts across successive
+// short-lived process generations. Attempts are cleared only after an
+// adapter has remained usable for a stable interval.
+func scheduleRestartLocked(e *entry, p *process, now time.Time) {
+	if !e.nextRestart.IsZero() {
+		return
+	}
+	if p != nil && !p.startedAt.IsZero() && now.Sub(p.startedAt) >= processStableUptime {
+		e.status.RestartAttempts = 0
+	}
+	e.nextRestart = now.Add(restartBackoff(e.status.RestartAttempts + 1))
 }
 
 func newWorkflowID() (string, error) {
@@ -467,302 +617,4 @@ func newWorkflowID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
-}
-
-func provenance(d adapterproto.Descriptor) adapterproto.AdapterProvenance {
-	return adapterproto.AdapterProvenance{ID: d.ID, Version: d.Version, ProtocolVersion: d.ProtocolVersion, Fingerprint: descriptorFingerprint(d)}
-}
-
-func (h *Host) BeginResolution(ctx context.Context, id string, input json.RawMessage, resource *adapterproto.ResourceRef) (WorkflowProgress, error) {
-	d, err := h.Descriptor(id)
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	if err = adapterproto.ValidateObjectAgainstSchema(d.InputSchema, input); err != nil {
-		return WorkflowProgress{}, err
-	}
-	if err = adapterproto.ValidateResourceRef(resource); err != nil {
-		return WorkflowProgress{}, fmt.Errorf("invalid resource reference")
-	}
-	wfID, err := newWorkflowID()
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	if !hasCapability(d, adapterproto.CapabilityResolveWorkflow) {
-		media, resolveErr := h.ResolveLegacy(ctx, id, input, resource)
-		if resolveErr != nil {
-			return WorkflowProgress{}, resolveErr
-		}
-		return WorkflowProgress{WorkflowID: wfID, AdapterID: id, State: "resolved", Resource: resource, Media: &media, Provenance: provenance(d)}, nil
-	}
-	eff, err := h.effective(id, resource)
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	params := adapterproto.ResolveBeginParams{WorkflowID: wfID, Input: input, Resource: resource, Configuration: eff.EffectiveValues, Secrets: eff.EffectiveSecrets}
-	raw, err := h.call(ctx, id, adapterproto.MethodResolveBegin, params)
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	var result adapterproto.ResolveWorkflowResult
-	if json.Unmarshal(raw, &result) != nil {
-		return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
-	}
-	if err = adapterproto.ValidateWorkflowResult(result, wfID, d.MediaTypes); err != nil {
-		return WorkflowProgress{}, err
-	}
-	return h.advanceWorkflow(ctx, d, result, 0, resource)
-}
-
-// ResolveLegacy is the non-workflow adapter path. Input validation is shared
-// with workflow adapters and configuration is still resolved by resource chain.
-func (h *Host) ResolveLegacy(ctx context.Context, id string, input json.RawMessage, resource *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
-	d, err := h.Descriptor(id)
-	if err != nil {
-		return adapterproto.MediaSource{}, err
-	}
-	if err = adapterproto.ValidateObjectAgainstSchema(d.InputSchema, input); err != nil {
-		return adapterproto.MediaSource{}, err
-	}
-	if err = adapterproto.ValidateResourceRef(resource); err != nil {
-		return adapterproto.MediaSource{}, fmt.Errorf("invalid resource reference")
-	}
-	eff, err := h.effective(id, resource)
-	if err != nil {
-		return adapterproto.MediaSource{}, fmt.Errorf("adapter configuration unavailable")
-	}
-	schema, err := h.Schema(id, resource)
-	if err != nil {
-		return adapterproto.MediaSource{}, fmt.Errorf("adapter configuration schema unavailable")
-	}
-	if err = validateEffectiveConfiguration(schema, eff); err != nil {
-		return adapterproto.MediaSource{}, fmt.Errorf("effective adapter configuration is invalid: %w", err)
-	}
-	params := adapterproto.ResolveParams{Input: input, Resource: resource, Configuration: eff.EffectiveValues, Secrets: eff.EffectiveSecrets}
-	raw, err := h.call(ctx, id, adapterproto.MethodResolve, params)
-	if err != nil {
-		return adapterproto.MediaSource{}, err
-	}
-	var media adapterproto.MediaSource
-	if json.Unmarshal(raw, &media) != nil {
-		return adapterproto.MediaSource{}, fmt.Errorf("adapter returned invalid media source")
-	}
-	if err = adapterproto.ValidateMediaSource(media, d.MediaTypes); err != nil {
-		return adapterproto.MediaSource{}, err
-	}
-	return media, nil
-}
-
-func validateEffectiveConfiguration(schema adapterproto.Schema, effective pluginconfig.EffectiveDocument) error {
-	values := make(map[string]json.RawMessage, len(effective.EffectiveValues)+len(effective.EffectiveSecrets))
-	for key, value := range effective.EffectiveValues {
-		values[key] = append(json.RawMessage(nil), value...)
-	}
-	for key, value := range effective.EffectiveSecrets {
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return fmt.Errorf("invalid effective secret configuration")
-		}
-		values[key] = encoded
-	}
-	return adapterproto.ValidateValues(schema, values)
-}
-
-func (h *Host) advanceWorkflow(ctx context.Context, d adapterproto.Descriptor, result adapterproto.ResolveWorkflowResult, hops int, resource *adapterproto.ResourceRef) (WorkflowProgress, error) {
-	if result.Resource == nil {
-		result.Resource = resource
-	}
-	for transitions := 0; result.State == "resource_discovered"; transitions++ {
-		if hops+transitions >= maxWorkflowTransitions {
-			return WorkflowProgress{}, fmt.Errorf("adapter workflow exceeded transition limit")
-		}
-		resource = result.Resource
-		eff, err := h.effective(d.ID, resource)
-		if err != nil {
-			return WorkflowProgress{}, err
-		}
-		params := adapterproto.ResolveContinueParams{WorkflowID: result.WorkflowID, Resource: resource, Configuration: eff.EffectiveValues, Secrets: eff.EffectiveSecrets}
-		raw, err := h.call(ctx, d.ID, adapterproto.MethodResolveContinue, params)
-		if err != nil {
-			return WorkflowProgress{}, err
-		}
-		if json.Unmarshal(raw, &result) != nil {
-			return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
-		}
-		if err = adapterproto.ValidateWorkflowResult(result, params.WorkflowID, d.MediaTypes); err != nil {
-			return WorkflowProgress{}, err
-		}
-		if result.Resource == nil {
-			result.Resource = resource
-		}
-	}
-	progress := WorkflowProgress{WorkflowID: result.WorkflowID, AdapterID: d.ID, State: result.State, Resource: result.Resource, Challenge: result.Challenge, Media: result.Media, Provenance: provenance(d)}
-	if result.Challenge != nil && result.Challenge.Prompt != nil {
-		if _, err := h.interactions.Apply(*result.Challenge.Prompt); err != nil {
-			return WorkflowProgress{}, fmt.Errorf("adapter prompt is invalid")
-		}
-	}
-	if result.State == "configuration_required" || result.State == "interaction_required" {
-		h.mu.Lock()
-		continuing := false
-		var continuationID uint64
-		if current, exists := h.workflows[result.WorkflowID]; exists {
-			continuing = current.continuing
-			continuationID = current.continuationID
-		}
-		h.workflows[result.WorkflowID] = workflowSession{adapterID: d.ID, resource: result.Resource, progress: progress, continuing: continuing, continuationID: continuationID}
-		h.mu.Unlock()
-	} else {
-		h.mu.Lock()
-		delete(h.workflows, result.WorkflowID)
-		h.mu.Unlock()
-	}
-	return progress, nil
-}
-
-func (h *Host) Workflow(id string) (WorkflowProgress, error) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	session, ok := h.workflows[id]
-	if !ok {
-		return WorkflowProgress{}, fmt.Errorf("workflow not found")
-	}
-	return session.progress, nil
-}
-
-func (h *Host) ContinueResolution(ctx context.Context, id string, values map[string]json.RawMessage, secrets map[string]string, persist bool) (WorkflowProgress, error) {
-	h.mu.Lock()
-	session, ok := h.workflows[id]
-	if !ok {
-		h.mu.Unlock()
-		return WorkflowProgress{}, fmt.Errorf("workflow not found")
-	}
-	if session.continuing {
-		h.mu.Unlock()
-		return WorkflowProgress{}, fmt.Errorf("workflow is already continuing")
-	}
-	h.workflowCall++
-	continuationID := h.workflowCall
-	session.continuing = true
-	session.continuationID = continuationID
-	h.workflows[id] = session
-	h.mu.Unlock()
-	defer func() {
-		h.mu.Lock()
-		if current, exists := h.workflows[id]; exists && current.continuing && current.continuationID == continuationID {
-			current.continuing = false
-			current.continuationID = 0
-			h.workflows[id] = current
-		}
-		h.mu.Unlock()
-	}()
-	challenge := session.progress.Challenge
-	if challenge == nil {
-		return WorkflowProgress{}, fmt.Errorf("workflow has no active challenge")
-	}
-	if persist && !challenge.Persistable {
-		return WorkflowProgress{}, fmt.Errorf("workflow challenge does not allow persistence")
-	}
-	provided := map[string]json.RawMessage{}
-	for key, value := range values {
-		provided[key] = value
-	}
-	for key, value := range secrets {
-		encoded, _ := json.Marshal(value)
-		provided[key] = encoded
-	}
-	if err := adapterproto.ValidateValues(challenge.Schema, provided); err != nil {
-		return WorkflowProgress{}, err
-	}
-	ordinary := map[string]json.RawMessage{}
-	secretAnswers := map[string]string{}
-	for _, field := range challenge.Schema.Fields {
-		if field.Control == "action" || field.Control == "status" {
-			continue
-		}
-		if field.Control == "secret" {
-			if value, exists := secrets[field.Key]; exists {
-				secretAnswers[field.Key] = value
-			}
-			continue
-		}
-		if value, exists := values[field.Key]; exists {
-			ordinary[field.Key] = value
-		}
-	}
-	if len(values) != len(ordinary) || len(secrets) != len(secretAnswers) {
-		return WorkflowProgress{}, fmt.Errorf("challenge answers contain unknown or mismatched fields")
-	}
-	if persist && h.configs == nil {
-		return WorkflowProgress{}, fmt.Errorf("persistent configuration is unavailable")
-	}
-	if persist && h.configs != nil {
-		schema, err := h.Schema(session.adapterID, session.resource)
-		if err != nil {
-			return WorkflowProgress{}, err
-		}
-		for _, field := range challenge.Schema.Fields {
-			if !containsField(schema, field.Key) {
-				schema.Fields = append(schema.Fields, field)
-			}
-		}
-		if err = h.configs.PutPartial(pluginconfig.Scope{PluginID: session.adapterID, Resource: session.resource}, schema, ordinary, secretAnswers, nil); err != nil {
-			return WorkflowProgress{}, err
-		}
-	}
-	eff, err := h.effective(session.adapterID, session.resource)
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	params := adapterproto.ResolveContinueParams{WorkflowID: id, Resource: session.resource, Configuration: eff.EffectiveValues, Secrets: eff.EffectiveSecrets, Answers: ordinary, AnswerSecrets: secretAnswers}
-	d, err := h.Descriptor(session.adapterID)
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	raw, err := h.call(ctx, session.adapterID, adapterproto.MethodResolveContinue, params)
-	if err != nil {
-		return WorkflowProgress{}, err
-	}
-	var result adapterproto.ResolveWorkflowResult
-	if json.Unmarshal(raw, &result) != nil {
-		return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
-	}
-	if err = adapterproto.ValidateWorkflowResult(result, id, d.MediaTypes); err != nil {
-		return WorkflowProgress{}, err
-	}
-	return h.advanceWorkflow(ctx, d, result, 1, session.resource)
-}
-
-func containsField(schema adapterproto.Schema, key string) bool {
-	for _, field := range schema.Fields {
-		if field.Key == key {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *Host) Close() {
-	h.mu.Lock()
-	if h.closed {
-		h.mu.Unlock()
-		return
-	}
-	h.closed = true
-	list := []*entry{}
-	for _, e := range h.entries {
-		list = append(list, e)
-	}
-	h.mu.Unlock()
-	for _, e := range list {
-		e.opMu.Lock()
-		e.stateMu.Lock()
-		p := e.process
-		e.process = nil
-		e.stateMu.Unlock()
-		if p != nil {
-			p.shutdown()
-		}
-		e.opMu.Unlock()
-	}
 }

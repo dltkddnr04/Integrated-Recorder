@@ -149,7 +149,7 @@ func TestRequestPolicyDoesNotBypassCoreSSRFValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = manager.Start(context.Background(), "fixture", json.RawMessage(`{"source":"opaque"}`), nil, "private source")
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "private") {
-		t.Fatalf("loopback manifest was not rejected by Core validation: %v", err)
+	if err == nil || strings.Contains(err.Error(), "127.0.0.1") {
+		t.Fatalf("loopback manifest was not safely rejected by Core validation: %v", err)
 	}
 }

@@ -1,0 +1,33 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 2rem auto;
+  max-width: 960px;
+  padding: 0 1rem;
+}
+
+form,
+section {
+  margin-block: 1.5rem;
+}
+
+label,
+input,
+select,
+textarea,
+button {
+  margin: 0.25rem;
+}
+
+.schema-field {
+  border-bottom: 1px solid #ddd;
+  padding: 0.6rem 0;
+}
+
+.schema-field small {
+  display: block;
+  color: #555;
+}
+
+#player {
+  width: min(100%, 800px);
+}

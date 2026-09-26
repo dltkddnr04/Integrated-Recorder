@@ -9,7 +9,7 @@ RUN apk add --no-cache ca-certificates && adduser -D -H -u 10001 archiver && mkd
 COPY --from=build /out/integrated-recorder /usr/local/bin/integrated-recorder
 COPY --from=build /out/adapters/ /adapters/
 USER 10001:10001
-ENV ADDR=:8080 DATA_DIR=/data ADAPTER_DIR=/adapters
+ENV ADDR=:8080 DATA_DIR=/data ADAPTER_DIR=/adapters:/external-adapters
 EXPOSE 8080
 VOLUME ["/data"]
 ENTRYPOINT ["/usr/local/bin/integrated-recorder"]

@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -29,22 +31,23 @@ func main() {
 func run() error {
 	addr := strings.TrimSpace(os.Getenv("ADDR"))
 	if addr == "" {
-		addr = ":8080"
+		addr = "127.0.0.1:8080"
 	}
 	dataDir := strings.TrimSpace(os.Getenv("DATA_DIR"))
 	if dataDir == "" {
 		dataDir = "./data"
 	}
-	adapterDir := strings.TrimSpace(os.Getenv("ADAPTER_DIR"))
-	if adapterDir == "" {
-		adapterDir = "./adapters"
+	adapterDirsValue := strings.TrimSpace(os.Getenv("ADAPTER_DIR"))
+	if adapterDirsValue == "" {
+		adapterDirsValue = "./adapters"
 	}
+	adapterDirs := filepath.SplitList(adapterDirsValue)
 
 	store, err := storage.New(dataDir)
 	if err != nil {
 		return fmt.Errorf("initialize storage: %w", err)
 	}
-	configStore, secretStore, err := pluginconfig.NewTypedFileStores(dataDir)
+	configStore, secretStore, stateStore, err := pluginconfig.NewTypedFileStoresAndState(dataDir)
 	if err != nil {
 		return fmt.Errorf("initialize plugin settings: %w", err)
 	}
@@ -52,29 +55,52 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize plugin settings: %w", err)
 	}
-	adapters, err := adapterhost.Discover(context.Background(), adapterDir, configs)
+	adapters, err := adapterhost.DiscoverDirs(context.Background(), adapterDirs, configs, stateStore)
 	if err != nil {
 		return fmt.Errorf("discover adapters: %w", err)
 	}
-	defer adapters.Close()
 	manager, err := acquire.NewManager(store, network.NewPublicHTTPClient(25*time.Second), adapters, nil)
 	if err != nil {
+		adapters.Close()
 		return fmt.Errorf("load recordings: %w", err)
+	}
+	for _, issue := range store.RecoveryIssues() {
+		log.Printf("storage recovery: recording=%s code=%s: %s", issue.ID, issue.Code, issue.Message)
 	}
 
 	httpServer := &http.Server{Addr: addr, Handler: server.New(manager, adapters, configs), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-shutdownCtx.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = httpServer.Shutdown(ctx)
-	}()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.ListenAndServe() }()
 
 	log.Printf("archiver listening on %s (data directory %s)", addr, dataDir)
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("HTTP server: %w", err)
+	var runErr error
+	select {
+	case err = <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			runErr = fmt.Errorf("HTTP server: %w", err)
+		}
+	case <-shutdownCtx.Done():
+	}
+
+	// Stop new HTTP work before stopping recording workers, then close adapter
+	// processes only after workers have finished any in-flight adapter call.
+	shutdownHTTP, cancelHTTP := context.WithTimeout(context.Background(), 10*time.Second)
+	if err = httpServer.Shutdown(shutdownHTTP); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("HTTP shutdown: %w", err))
+		_ = httpServer.Close()
+	}
+	cancelHTTP()
+
+	shutdownWorkers, cancelWorkers := context.WithTimeout(context.Background(), 15*time.Second)
+	if err = manager.Close(shutdownWorkers); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("recording shutdown: %w", err))
+	}
+	cancelWorkers()
+	adapters.Close()
+	if runErr != nil {
+		return runErr
 	}
 	return nil
 }

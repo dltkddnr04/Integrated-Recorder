@@ -2,230 +2,87 @@
 
 [English README](../README.en.md) | [한국어 README](../README.md)
 
-This document records the architectural direction behind Integrated Recorder. It intentionally contains detail that does not belong in the project landing page.
+This document describes the current implementation. Reserved protocol shapes and future ideas are called out as such; they are not claims of implemented features.
 
-## Design goal
+## Core invariant
 
-Integrated Recorder is not primarily a "video file downloader." It is a live-stream archival system whose canonical data is the source stream itself: original media objects plus enough metadata to reconstruct the recording later.
+The canonical archive is the source media received from the broadcaster plus metadata needed to reconstruct its timeline. Acquisition does not decode, encode, transcode, or remux media. Core has no platform domain model: resource types, field keys, adapter state, and interaction data remain opaque strings or JSON values. Platform-specific discovery stays in an external adapter process.
 
-The central invariant is:
-
-> Preserve source data first. Treat playback, indexes, exports, and UI views as rebuildable projections.
-
-The recorder therefore does not decode, encode, transcode, or remux media during acquisition. FFmpeg and Streamlink are not dependencies of the recording path.
-
-## Canonical data and projections
-
-Long-term canonical data:
+## Runtime and package boundaries
 
 ```text
-Recording
-├── original media objects
-├── source/timing metadata
-├── manifest history
-├── broadcast metadata
-└── chat/events
+Browser ── HTTP API / generated VOD ── Core
+                                          ├─ adapterhost ── framed JSON/stdin/stdout ── adapter binary
+                                          ├─ shared HLS parser and acquisition
+                                          ├─ network safety policy
+                                          └─ self-describing recording directories
 ```
 
-Derived projections may include:
+- `internal/adapterproto` defines language-neutral Protocol v1 envelopes, descriptor/schema validation, resources, workflows, media sources, refresh policy, and adapter-owned state messages.
+- `internal/adapterhost` discovers only explicitly configured adapter directories, supervises long-lived processes, validates descriptors/resources, resolves settings, and manages workflow sessions.
+- `internal/pluginconfig` stores user configuration/secrets separately from adapter-owned opaque state/state secrets. Interfaces are backend-neutral; the current implementation uses files.
+- `internal/interaction` bounds and expires generic interaction progress messages.
+- `cmd/adapters/owncast` and `internal/adapters/owncast` build the first standalone adapter. Core does not import the Owncast package.
+- `internal/hls` parses the supported HLS subset. `internal/acquire` owns polling, refresh, retries, segment acquisition, sequence epochs, and recording lifecycle.
+- `internal/network` validates public destinations and pins each connection to a freshly validated address.
+- `internal/domain` holds archive-owned types independent of adapter wire types. `internal/storage` writes durable payloads and self-describing metadata. `internal/server` exposes the API and static management page.
 
-```text
-browser HLS VOD
-database/search indexes
-thumbnails
-chat replay
-MP4/MKV exports
-other presentation formats
-```
+## Adapter process and protocol
 
-A derived projection should be disposable. An intact archive should remain understandable even if an application database or index is lost.
+Adapters are standalone executables. Core scans only directories in `ADAPTER_DIR`, looking for executable regular files named `integrated-recorder-adapter-*`; it never scans `PATH`. Adding a binary does not require rebuilding Core, but discovery occurs at startup, so Core must restart. Installed adapters are trusted local code: they run as the Core OS user and are not sandboxed.
 
-## Current architecture
+IPC is bounded newline-delimited JSON. V1 keeps its original untyped request/response wire form; request IDs, protocol version, method, result, and structured errors are validated. The parser also distinguishes typed frames and the reserved `notification` shape, but asynchronous notifications are not delivered by the runtime. A notification received where a response is expected is a protocol error.
 
-```text
- Browser ─── HTTP API / VOD ─── Core
-                                  │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-              adapterhost                 HLS acquisition
-                    │                           │
-            framed JSON over stdio              │
-                    │                           ▼
-          external adapter binary ── resolve  source manifests
-                                                │
-                              Original segments + snapshots
-                                                │
-                                          Working storage
-```
+The host serializes calls to each process. Timeout, cancellation after a request is written, malformed/oversized output, unexpected EOF, request-ID mismatch, protocol mismatch, or process exit makes that process unusable. The next operation may restart it lazily after bounded backoff. Every restart performs `describe`; adapter ID, version, protocol version, and the canonical descriptor fingerprint must match the original discovery descriptor. There is no background restart loop. Shutdown sends the generic shutdown request and then terminates the child within a bounded period.
 
-Current package boundaries:
+V1 implements `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, and `shutdown` where the descriptor advertises the relevant generic capability. Other operation names remain reserved or return a structured unsupported error. Unknown optional capability strings with valid syntax are retained and ignored by older Core versions; protocol-version mismatch remains fatal.
 
-- `internal/adapterproto` — newline-delimited JSON Protocol v1 envelopes, schemas, resources, media sources, and interaction types.
-- `internal/adapterhost` — scans the configured adapter directory and manages standalone process startup, handshake, requests, and shutdown.
-- `internal/pluginconfig` — opaque configuration and a separate secret store; file paths are hashed and files use restrictive permissions.
-- `internal/interaction` — minimal generic interaction progress state machine.
-- `internal/adapters/owncast` + `cmd/adapters/owncast` — standalone adapter implementation only; Core never imports this package.
-- `internal/hls` — shared HLS parsing and rendition selection.
-- `internal/acquire` — recording lifecycle, polling, retries, deduplication, acquisition, and gap detection.
-- `internal/storage` — recording directories, sidecars, manifest snapshots, and payload access.
-- `internal/network` — bounded HTTP client and source-address validation.
-- `internal/server` — control API, minimal browser page, VOD playlist generation, and segment serving.
-- `cmd/archiver` — adapter discovery, service wiring, and HTTP lifecycle.
+## Resources, configuration, and workflows
 
-## External adapter Protocol v1
+An adapter descriptor declares opaque resource types and allowed parent-type edges. Core validates each resource reference and every edge against that declaration for API hints, config scopes, workflow discoveries, and persistence targets. Core does not interpret the type names. The active chain is bounded in depth and cannot contain a cycle.
 
-An adapter is a standalone executable, not a Go package statically linked into Core. Core scans only `ADAPTER_DIR` for executable regular files named `integrated-recorder-adapter-*`; it never scans all of `PATH`. Adding or replacing an adapter binary does not require rebuilding Core.
+Configuration has distinct stored and effective views. Effective values are composed from plugin scope, parent-most resource, each child, and the current resource; more-specific values override less-specific ones. A field's `inherit` flag controls whether ancestor values or secrets flow downward. It defaults to `false` for every control. `clear_values` removes an override and returns that key to inherited/default behavior; `clear_secrets` explicitly removes a secret. Empty ordinary values are values, while a blank secret submission leaves the stored secret unchanged.
 
-IPC uses newline-delimited JSON on stdin/stdout, with one message per line. Existing v1 request/response envelopes retain their untyped wire format: requests carry a protocol version, request ID, and method; responses echo the ID and contain either a result or structured `{code, message, details}` error. For future asynchronous extensions, the protocol reserves `{"protocol_version":1,"type":"notification","method":"...","params":{...}}`; the parser classifies it separately from ID-bearing responses. The current runtime does not deliver notifications and safely treats one received while awaiting a response as a protocol error. Frame size is bounded. Requests to a process are serialized. A timeout, malformed frame, protocol version/ID mismatch, or process exit discards that process. On the next operation Core lazily restarts it with bounded backoff, runs `describe` again, and accepts it only if its adapter ID, version, and compatible protocol identity still match. There is no background restart loop. Stdout is reserved for protocol messages; diagnostics go to stderr. Core validates `describe` first, keeps the process alive, and requests graceful shutdown before terminating it.
+`resolve.begin` accepts adapter-defined input before a stable resource is known. The adapter may return a resource, after which Core validates its chain and loads matching effective configuration, secrets, and adapter state before continuing. Challenges use the same validated schema vocabulary and generic workflow state. Each challenge field can declare persistence as `forbidden`, `optional`, or `required`, plus a `plugin`, `current_resource`, or explicit `resource` target. Explicit resource targets must be members of the validated chain. Persistent challenge fields must also be declared in the target scope's descriptor schema with the same control; runtime-only fields are ephemeral. This prevents a saved value from becoming invisible to later resolutions.
 
-The implemented v1 operations are `describe`, `resolve`, `resolve.begin`, `resolve.continue`, and `shutdown`. Adapters that declare the generic `resolve_workflow` capability can receive opaque input before a stable resource is known, discover a resource, and return a challenge or media source. Adapters without that capability keep using `resolve`. `get_status`, `configure`, `interaction.begin`, `interaction.continue`, `metadata`, `events`, and `refresh` remain reserved without active runtime implementations. Unknown operations return a structured `unsupported_method` error.
+Workflow sessions are process-local and bound to the adapter process generation that created them. A process restart expires a stale workflow deterministically instead of forwarding its ID to a fresh process. Sessions have a 30-minute idle TTL, a 128-session bound, and a 32-transition cumulative limit. `DELETE /api/resolve-workflows/{id}` cancels a session. Expiration/cancellation removes its title and interaction progress. Workflow sessions do not survive a Core restart.
 
-A descriptor carries adapter ID/name/version, protocol version, opaque capability strings, input and configuration schemas, adapter-declared opaque resource types, and supported media types. Core does not interpret capability values or platform meanings embedded in resource type names. For acquisition, Core currently dispatches only the generic `hls` media type.
+The browser uses one schema renderer for recording input, settings, and challenges. It handles the declared `visible_when` grammar (`field` with `equals`, `not_equals`, or boolean `truthy`, recursively combined by `all`/`any`), defaults, select/multi-select values, inherited sources, and explicit clear operations. Secrets are never read back as plaintext. Prompt/display/status data is rendered as text; navigation accepts only HTTP(S) URLs and opens with `noopener noreferrer`. Adapter HTML and scripts are never executed.
 
-## Schemas, resources, configuration, and secrets
+## Adapter-owned state and refresh
 
-Adapter-defined schemas let a generic UI render fields without adapter-specific form code. A field can declare its key, control, label, description, required/default state, constraints, options, inheritance, and opaque `visible_when` value. Controls are `text`, `secret`, `number`, `boolean`, `select`, `multi-select`, `textarea`, `action`, and `status`. Choice controls require options. Core validates input, configuration, and challenge values against the declared schema before forwarding them. Action and status fields are display-only. The same small renderer is used for recording input, plugin/resource configuration, and workflow challenges.
+Adapter-owned opaque state is separate from user configuration. State values and state secrets are stored under adapter and optional resource scopes; Core does not interpret their keys. Mutations are accepted only for scopes in the current validated chain. State is supplied to later resolve/refresh calls and persists across adapter process restarts. It is not included in recording metadata or public API responses.
 
-Resources use opaque values such as `{resource_type, resource_id, parent}`, with recursive parent references. The descriptor can declare resource types and parent-type relationships. Core compares a type only to select that adapter's schema scope and keeps references intact. A generic Resource type also carries a display name and opaque attributes. There are no Core enums for `account`, `channel`, or `recording`, and resource IDs are never used as filesystem paths.
+The default file state-secret backend is separate from ordinary state and uses restricted permissions, but provides **no at-rest encryption**. The user secret backend has the same plaintext-at-rest limitation. Both are backend-neutral so a later encrypted or OS-backed implementation can replace them. Neither should be described as an encrypted vault.
 
-Configuration scopes form a generic chain: plugin scope, then each parent resource through the current resource. Core uses the supplied opaque parent links only to identify those scopes; unrelated resource chains do not mix. Effective configuration is composed parent-first. Each field's schema `inherit` flag decides whether a value/secret from an ancestor can flow to descendants; it defaults to false for every control, including secrets. A value stored at the current scope always applies there. API views distinguish values stored at the current scope from effective values and identify the opaque source scope for inherited values. Configuration writes are partial; required effective values may come from an ancestor or a workflow challenge.
+An adapter with the refresh capability may declare an expiry time, refresh lead time, and HTTP status codes that should trigger refresh. Core does not infer token expiry from status codes. It performs proactive refresh and adapter-declared status refresh; adapter code supplies the replacement media source. Core validates its media/request policy and public manifest URL before committing staged adapter-state changes and swapping the active URL, headers, forwarding policy, and refresh policy. A failed validation/refresh does not replace the active source. Refresh errors exposed outside Core are generic and omit signed URLs and adapter secrets.
 
-Ordinary JSON values and secrets use separate, backend-neutral `ConfigStore` and `SecretStore` interfaces. The local file backend hashes scope identifiers, creates directories with mode `0700`, and writes files with mode `0600`. Secret files are separate from ordinary configuration and have restricted permissions, but **they are plaintext at rest; the current backend does not encrypt them**. Core does not log secret values, and API GET responses expose only per-key `configured` state. Blank secret submissions leave existing values unchanged; explicit `clear_secrets` removes a secret. Resolve sends effective settings/secrets to the adapter process only when needed; recording metadata does not persist input, configuration, or secrets. The interface permits a future encrypted or OS-backed implementation, but none is provided now.
+## Media acquisition and HLS support
 
-## Generic interaction model
+The adapter resolves input into a generic media source. Core owns playlist parsing, rendition selection, request/header policy, retries, exact segment-byte storage, SHA-256, gap detection, and VOD generation. Adapter-supplied headers default to same-origin forwarding. An adapter may declare an exact origin allowlist; Core reapplies that decision on each request/redirect and independently enforces SSRF/public-address validation.
 
-Protocol messages can use `action`, `prompt`, `secret_prompt`, `navigate`, `display`, `status`, `complete`, and `error` types with opaque fields/data. Core's tracker accumulates active progress messages per interaction ID and treats `complete` or `error` as terminal. A workflow may report resource discovery, a configuration/interaction challenge, or a resolved media source. Challenges return an opaque workflow ID and schema to the caller; `POST /api/resolve-workflows/{id}/continue` submits answers. Submitted values may be ephemeral or persisted at the discovered resource (or plugin) scope when the challenge permits persistence. Suspended workflows are held in process memory only and are lost when Core restarts. Authentication providers, browser handoff, CAPTCHA, and OTP implementations remain adapter-owned and are outside this milestone.
+The current HLS subset handles a single self-contained rendition, MPEG-TS or fMP4 media objects, init maps, byte ranges with explicit safe range arithmetic, discontinuities, program date/time, and completed `EXTINF` segments. It can ignore LL-HLS partial tags when the same playlist contains complete segments. It explicitly rejects encrypted HLS, external audio/video/subtitle renditions, I-frame-only playlists, URI variable substitution (`EXT-X-DEFINE`), delta (`EXT-X-SKIP`) playlists, and partial-only LL-HLS. DASH, subtitles as separate renditions, and DRM/key acquisition are not implemented. Rejections are deterministic; source media bytes are not rewritten.
 
-## Resolve and shared media acquisition
+Media sequence numbers are source identifiers, not archive identity. Core tracks source epochs and a monotonically increasing archive ordinal so resets do not suppress later media with reused sequence numbers. VOD ordering uses archive ordinals and inserts discontinuities at epoch boundaries or detected gaps.
 
-Recording creation accepts `{adapter_id, input, resource?, title?}`. Core treats adapter input as a JSON object, validates it against the adapter's `input_schema`, and does not store it. For workflow-capable adapters, resource discovery happens after this input is sent; Core then loads configuration for the opaque resource chain and resumes the adapter. An adapter's resolved media source carries a media type, manifest URL, HTTP headers, optional session reference, opaque refresh/metadata values, and optional `request_policy.header_forwarding`. The default is restrictive `same_origin`. An adapter may declare `allowlist` origin URLs for forwarding its supplied headers; the current single origin policy applies to all adapter-supplied headers. Comparisons use exact scheme, case-insensitive hostname, and effective port. Core reevaluates the policy for each media URL and redirect, deleting all adapter-supplied header names at each redirect and reapplying them only when the new URL is allowed. This policy authorizes header forwarding only; it does not grant private-address or SSRF access. Core's existing source validator and safe client's address/dial checks remain independent and in force.
+## Storage, privacy, and recovery
 
-HLS master/media parsing, rendition selection, sequence tracking, gap detection, exact init/media segment downloads, SHA-256, and recording persistence remain in Core's `internal/hls` and `internal/acquire`. An adapter resolves platform-specific input into a common media source and does not parse manifests or handle segments.
+Each recording is a self-describing directory containing `recording.json`, raw manifest snapshots, payloads, and segment sidecars. The directory is the canonical source; there is no required database. A new directory is first written under a hidden incomplete name with initial metadata and then atomically published. Files are synced before rename and parent directories are synced where supported.
 
-Platform-specific behavior should remain above the recorder core. Adding CHZZK, SOOP, Twitch, or another source should not require the HLS acquisition engine to understand that platform's API semantics.
+Segment and manifest payloads are written before their sidecars, and the sidecars before the root recording document is updated. On startup, valid sidecars can restore a segment or manifest snapshot omitted from the root document after a crash. Payload without a sidecar is preserved and reported as an orphan; corrupt or conflicting sidecars are reported without silently attaching data. An incomplete/corrupt recording is preserved and reported while other valid recordings remain loadable. Active recordings from an unclean process death become `interrupted`; pending segments become explicit gaps.
 
-## Recording lifecycle
+New archive types in `internal/domain` are separate from protocol types. Existing JSON field names are retained; epoch, ordinal, provenance, and URI classification are optional additions, so recordings without them remain readable. Adapter ID/version/protocol version/fingerprint are provenance only. Credentials, headers, and adapter state are never copied into recording metadata. Source URLs and raw manifest snapshots are preserved as canonical source data and may contain signed credentials; they are therefore treated as sensitive, stored under restricted recording-directory permissions, and removed from public list/detail projections.
 
-During acquisition, the project currently uses a self-describing working directory rather than a database-backed opaque format.
+Recording directories are mode `0700`; metadata, payload, and sidecar files use mode `0600`. The file backends are not encrypted at rest. The unauthenticated management API is a trusted control plane and has no user/role system. Local runs bind to loopback by default and Compose publishes only on `127.0.0.1`. Do not expose it directly to untrusted networks; use a trusted private network or an authenticated reverse proxy. The page uses local pinned hls.js 1.5.17 (Apache-2.0) and a restrictive CSP/security headers.
 
-```text
-data/
-└── recordings/
-    └── <recording-id>/
-        ├── recording.json
-        ├── manifests/
-        │   └── ...
-        └── tracks/
-            └── main/
-                ├── <source payload>
-                ├── <source payload>.json
-                └── ...
-```
+## Server lifecycle and Docker
 
-For each captured media object the model can retain:
+On SIGINT/SIGTERM, Core stops accepting HTTP work, cancels all recording workers before waiting for any worker, durably records their terminal states, then shuts down adapter processes. Shutdown is bounded. Compose allows 45 seconds for graceful termination, longer than the configured HTTP and recording-worker shutdown deadlines. A real crash still causes active recordings to reload as interrupted.
 
-- track identity;
-- source sequence;
-- source URI;
-- duration;
-- program date/time when available;
-- init-segment reference;
-- byte range;
-- discontinuity state;
-- storage path;
-- payload size;
-- SHA-256.
+The container runs as UID 10001. Compose uses a named `/data` volume and publishes the control port on host loopback. The image contains the Owncast adapter in `/adapters`; mount additional executable adapters read-only at `./adapter-binaries` (container path `/external-adapters`). Set their executable bit before starting Compose. Core must restart to discover additions; there is no hot reload. `ADDR` should remain private because API authentication is not implemented.
 
-Manifest snapshots are also stored with source URI, fetch time, size, and SHA-256.
+## Playback and intentionally unimplemented work
 
-New recordings retain adapter ID, adapter version, protocol version, and a descriptor fingerprint as provenance; older recordings without this optional field remain readable. The adapter may classify source URIs as `sensitive` or `public` (default `sensitive`). Runtime fetch URLs and raw manifest snapshots remain unchanged canonical recording data, including any credentials embedded in URLs. Recording directories use mode `0700` and metadata files use `0600`. Recording list/detail API projections omit raw source URLs and manifest URIs while retaining the classification and adapter provenance.
+For a stopped, completed, or interrupted recording, Core creates a finite seekable HLS VOD manifest over stored source segments. Segment endpoints return stored bytes directly; playback does not concatenate or remux files. Browser codec support remains necessary.
 
-Installed adapter binaries are trusted local code: they run as the Core OS user and are not sandboxed. Core scans the adapter directory at startup, so discovering a newly installed binary requires restarting Core; there is no hot-load.
-
-On restart, the server reloads these files. A stale `recording` state becomes `interrupted` while the captured media remains intact.
-
-## Playback projection
-
-A stopped/completed/interrupted recording is not concatenated into a new media file. The server builds a finite HLS VOD playlist from the stored timeline.
-
-```text
-recording metadata
-      +
-stored source segments
-      ↓
-generated HLS VOD
-      ↓
-browser requests segment
-      ↓
-server returns preserved source bytes
-```
-
-This allows seekable browser playback while keeping storage segment-native.
-
-Browser codec support still applies. The recorder does not transcode source media merely to make an otherwise unsupported codec playable.
-
-## Metadata and chat timeline
-
-A future recording should preserve non-media events on the same time axis as video/audio.
-
-Examples:
-
-- title changes;
-- category changes;
-- broadcast state changes;
-- chat messages;
-- moderation/system events;
-- platform-specific raw events.
-
-Normalized fields should make common playback/search operations possible, while raw platform payloads should be retained where useful so future parsers can recover information that was not normalized originally.
-
-## Finalized archive direction
-
-Working storage and cold-storage representation are intentionally separate.
-
-Expected lifecycle:
-
-```text
-live acquisition
-      ↓
-working recording directory
-      ↓
-finalize
-      ↓
-archive package + random-access index
-      ↓
-SSD / HDD / NAS / LTO
-```
-
-TAR is a strong candidate for finalized packaging because it is simple, widely recoverable, and naturally suited to sequential media such as LTO. Media segments are already compressed, so whole-archive compression is generally not the primary goal.
-
-A sidecar index can map logical segment IDs to byte offsets on seekable storage.
-
-The intended rule is:
-
-> The archive is canonical. The index is an acceleration structure and should be rebuildable.
-
-The finalized archive format is not implemented yet.
-
-## Network security
-
-The current HTTP client rejects localhost, private, loopback, link-local, multicast, and unspecified source addresses and validates resolved dial targets.
-
-This is a secure default, not a permanent prohibition on trusted private-network sources. A future configuration may explicitly permit local/self-hosted sources without weakening the default behavior.
-
-The current control API has no authentication or authorization and should not be exposed directly to untrusted networks.
-
-## Milestone 1 validation
-
-Milestone 1 was validated against the public Owncast TV example stream:
-
-- 90 media segments;
-- about 270 seconds of reconstructed VOD;
-- zero detected gaps;
-- stored payload size and SHA-256 matched re-fetched source objects;
-- restart/reload succeeded;
-- browser playback succeeded;
-- seeks at 0:00, 2:15, and 4:27 succeeded;
-- no FFmpeg or Streamlink was used.
-
-The live run also exposed a real compatibility issue: Owncast emitted `PROGRAM-DATE-TIME` timezone offsets in `+0000` form. The parser was updated and a regression test was added.
+Not implemented: chat/metadata timeline, notifications, real platform authentication flows, additional platform adapters, workflow persistence across Core restart, encrypted HLS, external rendition synchronization, DASH, archive finalization/TAR, LTO, export/transcoding, database, authentication/authorization, adapter sandboxing, and adapter hot reload.

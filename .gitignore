@@ -3,3 +3,5 @@
 /.env
 # Locally built external adapter executables
 /adapters/
+/adapter-binaries/*
+!/adapter-binaries/.gitkeep

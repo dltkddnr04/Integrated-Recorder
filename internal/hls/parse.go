@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -16,10 +17,16 @@ import (
 
 const MaxManifestBytes = 4 << 20
 
+// MaxTargetDurationSeconds bounds arithmetic derived from an untrusted
+// manifest. Real live HLS target durations are far below one day.
+const MaxTargetDurationSeconds = 24 * 60 * 60
+
 type Variant struct {
-	URI        string
-	Bandwidth  int64
-	AudioGroup string
+	URI           string
+	Bandwidth     int64
+	AudioGroup    string
+	SubtitleGroup string
+	VideoGroup    string
 }
 
 type Master struct {
@@ -32,21 +39,39 @@ type Map struct {
 }
 
 type MediaSegment struct {
-	Sequence      uint64
-	URI           string
-	Duration      float64
-	ProgramTime   *time.Time
-	Init          *Map
-	ByteRange     *domain.ByteRange
-	Discontinuity bool
-	Gap           bool
+	Sequence              uint64
+	DiscontinuitySequence uint64
+	URI                   string
+	Duration              float64
+	ProgramTime           *time.Time
+	Init                  *Map
+	ByteRange             *domain.ByteRange
+	Discontinuity         bool
+	Gap                   bool
 }
 
 type MediaPlaylist struct {
-	TargetDuration int
-	MediaSequence  uint64
-	Segments       []MediaSegment
-	EndList        bool
+	TargetDuration        int
+	MediaSequence         uint64
+	DiscontinuitySequence uint64
+	Segments              []MediaSegment
+	EndList               bool
+}
+
+// IsMasterPlaylist classifies a playlist using complete tag lines. It is
+// intentionally only a classifier; callers must still parse the playlist
+// with ParseMaster or ParseMedia and handle the resulting validation error.
+func IsMasterPlaylist(data []byte) bool {
+	lines, err := playlistLines(data)
+	if err != nil {
+		return false
+	}
+	for _, line := range lines[1:] {
+		if strings.HasPrefix(line, "#EXT-X-STREAM-INF:") || strings.HasPrefix(line, "#EXT-X-I-FRAME-STREAM-INF:") {
+			return true
+		}
+	}
+	return false
 }
 
 func ParseMaster(data []byte, baseURL string) (Master, error) {
@@ -58,6 +83,10 @@ func ParseMaster(data []byte, baseURL string) (Master, error) {
 	var pending *Variant
 	for _, line := range lines {
 		switch {
+		case strings.HasPrefix(line, "#EXT-X-I-FRAME-STREAM-INF:"):
+			return Master{}, fmt.Errorf("I-frame-only HLS playlists are unsupported")
+		case strings.HasPrefix(line, "#EXT-X-DEFINE:"):
+			return Master{}, fmt.Errorf("HLS variable substitution is unsupported (EXT-X-DEFINE)")
 		case strings.HasPrefix(line, "#EXT-X-MEDIA:"):
 			if _, err := parseAttrs(strings.TrimPrefix(line, "#EXT-X-MEDIA:")); err != nil {
 				return Master{}, err
@@ -76,7 +105,7 @@ func ParseMaster(data []byte, baseURL string) (Master, error) {
 			if err != nil || bw <= 0 {
 				return Master{}, fmt.Errorf("invalid EXT-X-STREAM-INF BANDWIDTH")
 			}
-			pending = &Variant{Bandwidth: bw, AudioGroup: attrs["AUDIO"]}
+			pending = &Variant{Bandwidth: bw, AudioGroup: attrs["AUDIO"], SubtitleGroup: attrs["SUBTITLES"], VideoGroup: attrs["VIDEO"]}
 		case strings.HasPrefix(line, "#") || line == "":
 			continue
 		default:
@@ -101,12 +130,12 @@ func ParseMaster(data []byte, baseURL string) (Master, error) {
 	// Any AUDIO reference indicates that the rendition is not self-contained.
 	compatible := result.Variants[:0]
 	for _, v := range result.Variants {
-		if v.AudioGroup == "" {
+		if v.AudioGroup == "" && v.SubtitleGroup == "" && v.VideoGroup == "" {
 			compatible = append(compatible, v)
 		}
 	}
 	if len(compatible) == 0 {
-		return Master{}, fmt.Errorf("master playlist requires an external audio rendition, which is unsupported")
+		return Master{}, fmt.Errorf("master playlist requires external audio, video, or subtitle renditions, which are unsupported")
 	}
 	result.Variants = compatible
 	return result, nil
@@ -142,10 +171,21 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 	var rangeImplicit bool
 	var segmentGap bool
 	var sequence uint64
+	var sequenceExhausted bool
+	var sawLLHLS bool
+	var haveTargetDuration bool
+	var haveSequenceTag bool
+	var haveDiscontinuitySequence bool
+	var seenDiscontinuity bool
+	discontinuitySequence := uint64(0)
 	for _, line := range lines {
 		switch {
+		case strings.HasPrefix(line, "#EXT-X-DEFINE:"):
+			return MediaPlaylist{}, fmt.Errorf("HLS variable substitution is unsupported (EXT-X-DEFINE)")
+		case strings.HasPrefix(line, "#EXT-X-I-FRAME-STREAM-INF:"):
+			return MediaPlaylist{}, fmt.Errorf("I-frame-only HLS playlists are unsupported")
 		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
-			if len(result.Segments) > 0 {
+			if len(result.Segments) > 0 || haveSequenceTag {
 				return MediaPlaylist{}, fmt.Errorf("MEDIA-SEQUENCE appears after media entries")
 			}
 			value := strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")
@@ -153,17 +193,38 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 			if err != nil {
 				return MediaPlaylist{}, fmt.Errorf("invalid MEDIA-SEQUENCE")
 			}
-			result.MediaSequence, sequence, haveMediaSequence = parsed, parsed, true
+			result.MediaSequence, sequence, haveMediaSequence, haveSequenceTag = parsed, parsed, true, true
+		case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"):
+			if len(result.Segments) > 0 || haveDiscontinuitySequence || seenDiscontinuity {
+				return MediaPlaylist{}, fmt.Errorf("DISCONTINUITY-SEQUENCE appears after a discontinuity or media entry, or is duplicated")
+			}
+			parsed, err := strconv.ParseUint(strings.TrimPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"), 10, 64)
+			if err != nil {
+				return MediaPlaylist{}, fmt.Errorf("invalid DISCONTINUITY-SEQUENCE")
+			}
+			discontinuitySequence = parsed
+			result.DiscontinuitySequence = parsed
+			haveDiscontinuitySequence = true
 		case strings.HasPrefix(line, "#EXT-X-TARGETDURATION:"):
-			parsed, err := strconv.Atoi(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:"))
-			if err != nil || parsed <= 0 {
+			if haveTargetDuration {
+				return MediaPlaylist{}, fmt.Errorf("duplicate TARGETDURATION")
+			}
+			parsed, err := strconv.ParseUint(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:"), 10, 32)
+			if err != nil || parsed == 0 || parsed > MaxTargetDurationSeconds {
 				return MediaPlaylist{}, fmt.Errorf("invalid TARGETDURATION")
 			}
-			result.TargetDuration = parsed
+			result.TargetDuration = int(parsed)
+			haveTargetDuration = true
 		case strings.HasPrefix(line, "#EXTINF:"):
-			value := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
-			parsed, err := strconv.ParseFloat(value, 64)
-			if err != nil || parsed < 0 {
+			if nextDuration != nil {
+				return MediaPlaylist{}, fmt.Errorf("EXTINF appears before the previous segment URI")
+			}
+			value := strings.TrimPrefix(line, "#EXTINF:")
+			if comma := strings.IndexByte(value, ','); comma >= 0 {
+				value = value[:comma]
+			}
+			parsed, err := parseDecimalFloat(value)
+			if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed < 0 || parsed > MaxTargetDurationSeconds {
 				return MediaPlaylist{}, fmt.Errorf("invalid EXTINF duration")
 			}
 			nextDuration = &parsed
@@ -183,8 +244,11 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 				return MediaPlaylist{}, fmt.Errorf("invalid EXT-X-MAP URI: %w", err)
 			}
 			m := &Map{URI: uri}
-			if attrs["BYTERANGE"] != "" {
-				br, err := parseRange(attrs["BYTERANGE"], 0)
+			if rawRange, exists := attrs["BYTERANGE"]; exists {
+				if !strings.Contains(rawRange, "@") {
+					return MediaPlaylist{}, fmt.Errorf("EXT-X-MAP BYTERANGE requires an explicit offset")
+				}
+				br, err := parseRange(rawRange, 0)
 				if err != nil {
 					return MediaPlaylist{}, err
 				}
@@ -192,6 +256,9 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 			}
 			currentMap = m
 		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
+			if currentRange != nil {
+				return MediaPlaylist{}, fmt.Errorf("duplicate BYTERANGE before media URI")
+			}
 			value := strings.TrimPrefix(line, "#EXT-X-BYTERANGE:")
 			offset := uint64(0)
 			rangeImplicit = !strings.Contains(value, "@")
@@ -207,13 +274,21 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 			}
 			currentRange = &br
 		case line == "#EXT-X-DISCONTINUITY":
+			seenDiscontinuity = true
+			if discontinuitySequence == ^uint64(0) {
+				return MediaPlaylist{}, fmt.Errorf("discontinuity sequence overflows uint64")
+			}
+			discontinuitySequence++
 			discontinuity = true
 		case line == "#EXT-X-GAP":
 			segmentGap = true
 		case line == "#EXT-X-ENDLIST":
 			result.EndList = true
 		case strings.HasPrefix(line, "#EXT-X-PART:") || strings.HasPrefix(line, "#EXT-X-PART-INF:") || strings.HasPrefix(line, "#EXT-X-PRELOAD-HINT:") || strings.HasPrefix(line, "#EXT-X-SERVER-CONTROL:") || strings.HasPrefix(line, "#EXT-X-RENDITION-REPORT:"):
-			return MediaPlaylist{}, fmt.Errorf("low-latency HLS is unsupported (%s)", strings.SplitN(line, ":", 2)[0])
+			// Low-latency tags may coexist with completed EXTINF segments. Keep
+			// archiving those complete segments and reject partial-only playlists
+			// after the full playlist has been parsed.
+			sawLLHLS = true
 		case strings.HasPrefix(line, "#EXT-X-SKIP:"):
 			return MediaPlaylist{}, fmt.Errorf("HLS delta updates are unsupported (EXT-X-SKIP)")
 		case strings.HasPrefix(line, "#EXT-X-KEY:"):
@@ -226,11 +301,16 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 			}
 		case strings.HasPrefix(line, "#EXT-X-SESSION-KEY:"):
 			return MediaPlaylist{}, fmt.Errorf("encrypted HLS is unsupported (EXT-X-SESSION-KEY)")
+		case line == "#EXT-X-I-FRAMES-ONLY":
+			return MediaPlaylist{}, fmt.Errorf("I-frame-only HLS playlists are unsupported")
 		case strings.HasPrefix(line, "#") || line == "":
 			continue
 		default:
 			if nextDuration == nil {
 				return MediaPlaylist{}, fmt.Errorf("media URI without preceding EXTINF")
+			}
+			if sequenceExhausted {
+				return MediaPlaylist{}, fmt.Errorf("media sequence number overflows uint64")
 			}
 			if !haveMediaSequence {
 				haveMediaSequence = true
@@ -244,7 +324,7 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 			if rangeImplicit && uri != previousRangeURI {
 				return MediaPlaylist{}, fmt.Errorf("implicit BYTERANGE offset requires the same resource URI")
 			}
-			segment := MediaSegment{Sequence: sequence, URI: uri, Duration: *nextDuration, ProgramTime: nextPDT, Init: cloneMap(currentMap), ByteRange: cloneRange(currentRange), Discontinuity: discontinuity, Gap: segmentGap}
+			segment := MediaSegment{Sequence: sequence, DiscontinuitySequence: discontinuitySequence, URI: uri, Duration: *nextDuration, ProgramTime: nextPDT, Init: cloneMap(currentMap), ByteRange: cloneRange(currentRange), Discontinuity: discontinuity, Gap: segmentGap}
 			result.Segments = append(result.Segments, segment)
 			if currentRange != nil {
 				previousRangeURI = uri
@@ -255,7 +335,11 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 				previousRangeURI = ""
 				previousRangeEnd = 0
 			}
-			sequence++
+			if sequence == ^uint64(0) {
+				sequenceExhausted = true
+			} else {
+				sequence++
+			}
 			nextDuration, nextPDT, currentRange, discontinuity, rangeImplicit, segmentGap = nil, nil, nil, false, false, false
 		}
 	}
@@ -264,6 +348,9 @@ func ParseMedia(data []byte, playlistURL string) (MediaPlaylist, error) {
 	}
 	if result.TargetDuration == 0 {
 		return MediaPlaylist{}, fmt.Errorf("media playlist is missing TARGETDURATION")
+	}
+	if sawLLHLS && len(result.Segments) == 0 {
+		return MediaPlaylist{}, fmt.Errorf("low-latency HLS playlist has no completed EXTINF segments")
 	}
 	return result, nil
 }
@@ -276,6 +363,33 @@ func parseProgramDateTime(value string) (time.Time, error) {
 	// Some HLS sources emit valid UTC offsets without the RFC3339 colon. Accept
 	// that common compact offset form as well.
 	return time.Parse("2006-01-02T15:04:05.999999999-0700", value)
+}
+
+func parseDecimalFloat(value string) (float64, error) {
+	if value == "" {
+		return 0, fmt.Errorf("empty decimal")
+	}
+	seenDot := false
+	digitsBeforeDot := 0
+	digitsAfterDot := 0
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+			if seenDot {
+				digitsAfterDot++
+			} else {
+				digitsBeforeDot++
+			}
+		case r == '.' && !seenDot:
+			seenDot = true
+		default:
+			return 0, fmt.Errorf("invalid decimal")
+		}
+	}
+	if digitsBeforeDot == 0 || (seenDot && digitsAfterDot == 0) {
+		return 0, fmt.Errorf("invalid decimal")
+	}
+	return strconv.ParseFloat(value, 64)
 }
 
 func playlistLines(data []byte) ([]string, error) {
@@ -307,6 +421,9 @@ func playlistLines(data []byte) ([]string, error) {
 
 func parseAttrs(raw string) (map[string]string, error) {
 	attrs := map[string]string{}
+	if raw == "" {
+		return nil, fmt.Errorf("empty HLS attribute list")
+	}
 	for i := 0; i < len(raw); {
 		start := i
 		for i < len(raw) && raw[i] != '=' && raw[i] != ',' {
@@ -316,6 +433,9 @@ func parseAttrs(raw string) (map[string]string, error) {
 			return nil, fmt.Errorf("malformed HLS attribute list")
 		}
 		key := strings.TrimSpace(raw[start:i])
+		if key == "" {
+			return nil, fmt.Errorf("empty HLS attribute name")
+		}
 		i++
 		var value string
 		if i < len(raw) && raw[i] == '"' {
@@ -351,6 +471,9 @@ func parseAttrs(raw string) (map[string]string, error) {
 				return nil, fmt.Errorf("malformed HLS attribute separator")
 			}
 			i++
+			if i == len(raw) {
+				return nil, fmt.Errorf("trailing HLS attribute separator")
+			}
 		}
 	}
 	return attrs, nil
@@ -359,15 +482,18 @@ func parseAttrs(raw string) (map[string]string, error) {
 func resolveURI(base, ref string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(ref))
 	if err != nil || u.String() == "" {
-		return "", fmt.Errorf("invalid URI %q", ref)
+		return "", fmt.Errorf("invalid media URI")
 	}
 	b, err := url.Parse(base)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("invalid playlist base URI")
 	}
 	out := b.ResolveReference(u)
 	if (out.Scheme != "http" && out.Scheme != "https") || out.Host == "" {
 		return "", fmt.Errorf("URI must resolve to http or https")
+	}
+	if out.User != nil {
+		return "", fmt.Errorf("URI user information is unsupported")
 	}
 	return out.String(), nil
 }
@@ -386,6 +512,9 @@ func parseRange(s string, defaultOffset uint64) (domain.ByteRange, error) {
 		if err != nil {
 			return domain.ByteRange{}, fmt.Errorf("invalid byte range offset")
 		}
+	}
+	if offset > ^uint64(0)-length {
+		return domain.ByteRange{}, fmt.Errorf("byte range end overflows uint64")
 	}
 	return domain.ByteRange{Length: length, Offset: offset}, nil
 }

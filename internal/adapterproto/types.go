@@ -3,11 +3,14 @@ package adapterproto
 import (
 	"encoding/json"
 	"fmt"
-	"net/textproto"
+	"math"
+	"math/big"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Descriptor struct {
@@ -34,12 +37,35 @@ type Field struct {
 	Required    bool   `json:"required,omitempty"`
 	// Inherit declares whether a value stored at this scope may flow into
 	// descendant resource scopes. Omitted is deliberately restrictive.
-	Inherit     bool            `json:"inherit,omitempty"`
-	Default     json.RawMessage `json:"default,omitempty"`
-	Constraints *Constraints    `json:"constraints,omitempty"`
-	Options     []Option        `json:"options,omitempty"`
-	VisibleWhen json.RawMessage `json:"visible_when,omitempty"`
+	Inherit     bool              `json:"inherit,omitempty"`
+	Default     json.RawMessage   `json:"default,omitempty"`
+	Constraints *Constraints      `json:"constraints,omitempty"`
+	Options     []Option          `json:"options,omitempty"`
+	VisibleWhen json.RawMessage   `json:"visible_when,omitempty"`
+	Persistence *FieldPersistence `json:"persistence,omitempty"`
 }
+
+// FieldPersistence describes whether an interaction answer may be stored and
+// where. Resource references remain opaque to Core and are validated against
+// the active, adapter-declared resource chain.
+type FieldPersistence struct {
+	Mode   string            `json:"mode"`
+	Target PersistenceTarget `json:"target"`
+}
+
+type PersistenceTarget struct {
+	Scope    string       `json:"scope"`
+	Resource *ResourceRef `json:"resource,omitempty"`
+}
+
+const (
+	PersistenceForbidden = "forbidden"
+	PersistenceOptional  = "optional"
+	PersistenceRequired  = "required"
+	PersistencePlugin    = "plugin"
+	PersistenceCurrent   = "current_resource"
+	PersistenceResource  = "resource"
+)
 
 type Constraints struct {
 	Min       *float64 `json:"min,omitempty"`
@@ -54,6 +80,29 @@ type Constraints struct {
 type Option struct {
 	Value any    `json:"value"`
 	Label string `json:"label"`
+}
+
+// UnmarshalJSON preserves option numbers exactly instead of routing them
+// through float64, which could lose integer precision before validation.
+func (o *Option) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Value json.RawMessage `json:"value"`
+		Label string          `json:"label"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if len(wire.Value) == 0 {
+		return fmt.Errorf("option value is required")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(wire.Value)))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	o.Value, o.Label = value, wire.Label
+	return nil
 }
 
 type ResourceType struct {
@@ -79,6 +128,15 @@ type ResolveParams struct {
 	Resource      *ResourceRef               `json:"resource,omitempty"`
 	Configuration map[string]json.RawMessage `json:"configuration,omitempty"`
 	Secrets       map[string]string          `json:"secrets,omitempty"`
+	State         []StateDocument            `json:"state,omitempty"`
+}
+
+// ResolveResult is the extensible result form for adapters that need to return
+// adapter-owned state mutations alongside a media source. Existing v1 adapters
+// may continue returning MediaSource directly.
+type ResolveResult struct {
+	Media MediaSource     `json:"media"`
+	State []StateMutation `json:"state,omitempty"`
 }
 
 // ResolveBeginParams starts a stateful generic resolution workflow. WorkflowID
@@ -89,6 +147,7 @@ type ResolveBeginParams struct {
 	Resource      *ResourceRef               `json:"resource,omitempty"`
 	Configuration map[string]json.RawMessage `json:"configuration,omitempty"`
 	Secrets       map[string]string          `json:"secrets,omitempty"`
+	State         []StateDocument            `json:"state,omitempty"`
 }
 
 // ResolveContinueParams resumes a workflow after resource/configuration
@@ -101,6 +160,7 @@ type ResolveContinueParams struct {
 	Secrets       map[string]string          `json:"secrets,omitempty"`
 	Answers       map[string]json.RawMessage `json:"answers,omitempty"`
 	AnswerSecrets map[string]string          `json:"answer_secrets,omitempty"`
+	State         []StateDocument            `json:"state,omitempty"`
 }
 
 type WorkflowChallenge struct {
@@ -109,12 +169,32 @@ type WorkflowChallenge struct {
 	Persistable bool                `json:"persistable,omitempty"`
 }
 
+// StateDocument is adapter-owned, opaque state for one Core-managed scope.
+// The plugin scope has Resource=nil. Secret state is never exposed by Core
+// APIs and is stored separately from ordinary adapter state.
+type StateDocument struct {
+	Resource *ResourceRef               `json:"resource,omitempty"`
+	Values   map[string]json.RawMessage `json:"values,omitempty"`
+	Secrets  map[string]string          `json:"secrets,omitempty"`
+}
+
+// StateMutation merges keys into an adapter-owned state scope. Clear lists
+// are explicit so empty values never have deletion semantics.
+type StateMutation struct {
+	Resource     *ResourceRef               `json:"resource,omitempty"`
+	Values       map[string]json.RawMessage `json:"values,omitempty"`
+	Secrets      map[string]string          `json:"secrets,omitempty"`
+	ClearValues  []string                   `json:"clear_values,omitempty"`
+	ClearSecrets []string                   `json:"clear_secrets,omitempty"`
+}
+
 type ResolveWorkflowResult struct {
-	State      string             `json:"state"`
-	WorkflowID string             `json:"workflow_id"`
-	Resource   *ResourceRef       `json:"resource,omitempty"`
-	Challenge  *WorkflowChallenge `json:"challenge,omitempty"`
-	Media      *MediaSource       `json:"media,omitempty"`
+	State          string             `json:"state"`
+	WorkflowID     string             `json:"workflow_id"`
+	Resource       *ResourceRef       `json:"resource,omitempty"`
+	Challenge      *WorkflowChallenge `json:"challenge,omitempty"`
+	Media          *MediaSource       `json:"media,omitempty"`
+	StateMutations []StateMutation    `json:"state_mutations,omitempty"`
 }
 
 type AdapterProvenance struct {
@@ -133,6 +213,27 @@ type MediaSource struct {
 	Refresh       json.RawMessage   `json:"refresh,omitempty"`
 	Metadata      json.RawMessage   `json:"metadata,omitempty"`
 	ArchivePolicy *ArchivePolicy    `json:"archive_policy,omitempty"`
+	RefreshPolicy *RefreshPolicy    `json:"refresh_policy,omitempty"`
+}
+
+// RefreshPolicy declares adapter-owned refresh triggers. Core does not infer
+// expiry from particular HTTP statuses; only listed statuses may trigger a
+// refresh attempt.
+type RefreshPolicy struct {
+	ExpiresAt            *time.Time `json:"expires_at,omitempty"`
+	RefreshBeforeSeconds int        `json:"refresh_before_seconds,omitempty"`
+	OnHTTPStatus         []int      `json:"on_http_status,omitempty"`
+}
+
+type RefreshParams struct {
+	Resource *ResourceRef    `json:"resource,omitempty"`
+	Current  MediaSource     `json:"current"`
+	State    []StateDocument `json:"state,omitempty"`
+}
+
+type RefreshResult struct {
+	Media MediaSource     `json:"media"`
+	State []StateMutation `json:"state,omitempty"`
 }
 
 // ArchivePolicy classifies canonical source URI provenance. Fetch URLs and
@@ -173,6 +274,21 @@ type mediaOrigin struct {
 	hostname string
 	port     string
 }
+
+var (
+	identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	mediaTypePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$`)
+)
+
+const (
+	maxSchemaFields            = 512
+	maxSchemaOptions           = 2048
+	maxVisibilityDepth         = 32
+	maxVisibilityNodes         = 2048
+	maxDescriptorResourceTypes = 256
+)
+
+func IsValidIdentifier(value string) bool { return identifierPattern.MatchString(value) }
 
 func (o mediaOrigin) equal(other mediaOrigin) bool {
 	return o.scheme == other.scheme && o.hostname == other.hostname && o.port == other.port
@@ -229,7 +345,7 @@ type InteractionMessage struct {
 }
 
 func (m InteractionMessage) Validate() error {
-	if strings.TrimSpace(m.InteractionID) == "" {
+	if strings.TrimSpace(m.InteractionID) == "" || len(m.InteractionID) > 256 {
 		return fmt.Errorf("interaction id is required")
 	}
 	switch m.Type {
@@ -238,8 +354,9 @@ func (m InteractionMessage) Validate() error {
 		return fmt.Errorf("unsupported interaction message type")
 	}
 	seen := map[string]bool{}
+	fields := Schema{Fields: make([]Field, 0, len(m.Fields))}
 	for _, field := range m.Fields {
-		if field.Key == "" || field.Label == "" || seen[field.Key] {
+		if !identifierPattern.MatchString(field.Key) || strings.TrimSpace(field.Label) == "" || seen[field.Key] {
 			return fmt.Errorf("interaction field keys and labels must be nonempty and unique")
 		}
 		seen[field.Key] = true
@@ -249,15 +366,22 @@ func (m InteractionMessage) Validate() error {
 		if (field.Control == "select" || field.Control == "multi-select") && len(field.Options) == 0 {
 			return fmt.Errorf("interaction select field requires options")
 		}
+		fields.Fields = append(fields.Fields, Field{Key: field.Key, Control: field.Control, Label: field.Label, Description: field.Description, Required: field.Required, Options: field.Options})
 	}
 	if len(m.Data) > 0 && !json.Valid(m.Data) {
 		return fmt.Errorf("interaction data is invalid JSON")
+	}
+	if len(m.Data) > 64<<10 || len(m.Message) > 4096 || len(m.Title) > 512 {
+		return fmt.Errorf("interaction message exceeds size limit")
+	}
+	if err := fields.Validate(); err != nil {
+		return fmt.Errorf("interaction fields are invalid")
 	}
 	return nil
 }
 
 func (d Descriptor) Validate() error {
-	if strings.TrimSpace(d.ID) == "" || strings.ContainsAny(d.ID, "/\\") {
+	if !identifierPattern.MatchString(d.ID) {
 		return fmt.Errorf("adapter id is invalid")
 	}
 	if strings.TrimSpace(d.Name) == "" || strings.TrimSpace(d.Version) == "" {
@@ -272,24 +396,35 @@ func (d Descriptor) Validate() error {
 	if err := d.ConfigurationSchema.Validate(); err != nil {
 		return fmt.Errorf("configuration schema: %w", err)
 	}
-	validCapabilities := map[string]bool{CapabilityResolve: true, CapabilityResolveWorkflow: true, CapabilityStatus: true, CapabilityConfigure: true, CapabilityInteraction: true, CapabilityMetadata: true, CapabilityEvents: true, CapabilityRefresh: true}
 	seenCapabilities := map[string]bool{}
 	for _, capability := range d.Capabilities {
-		if !validCapabilities[capability] || seenCapabilities[capability] {
-			return fmt.Errorf("capability is unsupported or duplicated")
+		if !identifierPattern.MatchString(capability) {
+			return fmt.Errorf("capability is malformed")
+		}
+		if seenCapabilities[capability] {
+			return fmt.Errorf("capability is duplicated")
 		}
 		seenCapabilities[capability] = true
 	}
+	if !seenCapabilities[CapabilityResolve] && !seenCapabilities[CapabilityResolveWorkflow] {
+		return fmt.Errorf("adapter must declare resolve capability")
+	}
+	if len(d.MediaTypes) == 0 {
+		return fmt.Errorf("adapter must declare at least one media type")
+	}
+	if len(d.ResourceTypes) > maxDescriptorResourceTypes {
+		return fmt.Errorf("descriptor exceeds resource type limit")
+	}
 	seen := map[string]bool{}
 	for _, rt := range d.ResourceTypes {
-		if strings.TrimSpace(rt.Type) == "" || seen[rt.Type] {
-			return fmt.Errorf("resource type is empty or duplicated")
+		if !identifierPattern.MatchString(rt.Type) || seen[rt.Type] {
+			return fmt.Errorf("resource type is malformed or duplicated")
 		}
 		seen[rt.Type] = true
 		parents := map[string]bool{}
 		for _, parent := range rt.ParentTypes {
-			if strings.TrimSpace(parent) == "" || parents[parent] {
-				return fmt.Errorf("resource parent type is empty or duplicated")
+			if !identifierPattern.MatchString(parent) || parents[parent] {
+				return fmt.Errorf("resource parent type is malformed or duplicated")
 			}
 			parents[parent] = true
 		}
@@ -297,10 +432,48 @@ func (d Descriptor) Validate() error {
 			return fmt.Errorf("resource schema: %w", err)
 		}
 	}
-	for _, mt := range d.MediaTypes {
-		if mt == "" {
-			return fmt.Errorf("media type is empty")
+	for _, rt := range d.ResourceTypes {
+		for _, parent := range rt.ParentTypes {
+			if !seen[parent] {
+				return fmt.Errorf("resource parent type is not declared")
+			}
 		}
+	}
+	resourceParents := make(map[string][]string, len(d.ResourceTypes))
+	for _, rt := range d.ResourceTypes {
+		resourceParents[rt.Type] = append([]string(nil), rt.ParentTypes...)
+	}
+	visitingResources := map[string]bool{}
+	visitedResources := map[string]bool{}
+	var visitResource func(string) bool
+	visitResource = func(resourceType string) bool {
+		if visitingResources[resourceType] {
+			return false
+		}
+		if visitedResources[resourceType] {
+			return true
+		}
+		visitingResources[resourceType] = true
+		for _, parentType := range resourceParents[resourceType] {
+			if !visitResource(parentType) {
+				return false
+			}
+		}
+		delete(visitingResources, resourceType)
+		visitedResources[resourceType] = true
+		return true
+	}
+	for resourceType := range resourceParents {
+		if !visitResource(resourceType) {
+			return fmt.Errorf("resource parent declarations contain a cycle")
+		}
+	}
+	seenMedia := map[string]bool{}
+	for _, mt := range d.MediaTypes {
+		if !mediaTypePattern.MatchString(mt) || seenMedia[mt] {
+			return fmt.Errorf("media type is malformed or duplicated")
+		}
+		seenMedia[mt] = true
 	}
 	return nil
 }
@@ -317,20 +490,64 @@ func ValidateResourceRef(ref *ResourceRef) error {
 			return fmt.Errorf("resource hierarchy contains a cycle")
 		}
 		seen[current] = true
-		if strings.TrimSpace(current.Type) == "" || strings.TrimSpace(current.ID) == "" {
+		if !identifierPattern.MatchString(current.Type) || strings.TrimSpace(current.ID) == "" || len(current.ID) > 4096 {
 			return fmt.Errorf("resource type and id are required")
 		}
 	}
 	return nil
 }
 
+// ValidateResourceRefForDescriptor verifies that every resource type and edge
+// in a chain was declared by the adapter descriptor. Type names remain opaque.
+func ValidateResourceRefForDescriptor(d Descriptor, ref *ResourceRef) error {
+	if err := ValidateResourceRef(ref); err != nil {
+		return err
+	}
+	if ref == nil {
+		return nil
+	}
+	declared := make(map[string]ResourceType, len(d.ResourceTypes))
+	for _, item := range d.ResourceTypes {
+		declared[item.Type] = item
+	}
+	for current := ref; current != nil; current = current.Parent {
+		child, ok := declared[current.Type]
+		if !ok {
+			return fmt.Errorf("resource type is not declared")
+		}
+		if current.Parent == nil {
+			// ParentTypes declares permitted edges, not a requirement that a
+			// resource of this type must have a parent. Parentless roots are
+			// valid; every supplied edge is still checked below.
+			continue
+		}
+		allowed := false
+		for _, parentType := range child.ParentTypes {
+			if current.Parent.Type == parentType {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("resource parent relationship is invalid")
+		}
+	}
+	return nil
+}
+
 func (s Schema) Validate() error {
-	seen := map[string]bool{}
+	if len(s.Fields) > maxSchemaFields {
+		return fmt.Errorf("schema exceeds field limit")
+	}
+	seen := map[string]Field{}
 	for _, f := range s.Fields {
-		if strings.TrimSpace(f.Key) == "" || seen[f.Key] {
+		if !identifierPattern.MatchString(f.Key) {
+			return fmt.Errorf("field key is malformed")
+		}
+		if _, duplicate := seen[f.Key]; duplicate {
 			return fmt.Errorf("field keys must be nonempty and unique")
 		}
-		seen[f.Key] = true
+		seen[f.Key] = f
 		if strings.TrimSpace(f.Label) == "" {
 			return fmt.Errorf("field %q label is required", f.Key)
 		}
@@ -342,11 +559,39 @@ func (s Schema) Validate() error {
 		if (f.Control == "select" || f.Control == "multi-select") && len(f.Options) == 0 {
 			return fmt.Errorf("field %q requires options", f.Key)
 		}
+		if len(f.Options) > maxSchemaOptions {
+			return fmt.Errorf("field %q exceeds option limit", f.Key)
+		}
 		if f.Control == "secret" && len(f.Default) > 0 {
 			return fmt.Errorf("field %q cannot declare a secret default", f.Key)
 		}
+		if f.Control != "select" && f.Control != "multi-select" && len(f.Options) != 0 {
+			return fmt.Errorf("field %q has options for a control that does not use them", f.Key)
+		}
+		if f.Control == "action" || f.Control == "status" {
+			if f.Required || len(f.Default) != 0 || f.Constraints != nil || f.Persistence != nil {
+				return fmt.Errorf("field %q has editable properties on a display-only control", f.Key)
+			}
+		}
+		if f.Persistence != nil {
+			if err := validateFieldPersistence(*f.Persistence); err != nil {
+				return fmt.Errorf("field %q has invalid persistence policy", f.Key)
+			}
+		}
 		if f.Constraints != nil {
 			c := f.Constraints
+			if (c.Min != nil || c.Max != nil) && f.Control != "number" {
+				return fmt.Errorf("field %q has numeric constraints for a non-number control", f.Key)
+			}
+			if (c.MinLength != nil || c.MaxLength != nil || c.Pattern != "") && f.Control != "text" && f.Control != "secret" && f.Control != "textarea" {
+				return fmt.Errorf("field %q has string constraints for a non-string control", f.Key)
+			}
+			if (c.MinItems != nil || c.MaxItems != nil) && f.Control != "multi-select" {
+				return fmt.Errorf("field %q has item constraints for a non-multi-select control", f.Key)
+			}
+			if c.Min != nil && (math.IsNaN(*c.Min) || math.IsInf(*c.Min, 0)) || c.Max != nil && (math.IsNaN(*c.Max) || math.IsInf(*c.Max, 0)) {
+				return fmt.Errorf("field %q has non-finite numeric constraints", f.Key)
+			}
 			if c.Min != nil && c.Max != nil && *c.Min > *c.Max {
 				return fmt.Errorf("field %q has inverted numeric bounds", f.Key)
 			}
@@ -358,12 +603,226 @@ func (s Schema) Validate() error {
 					return fmt.Errorf("field %q has invalid pattern", f.Key)
 				}
 			}
+			if c.MinItems != nil && *c.MinItems < 0 || c.MaxItems != nil && *c.MaxItems < 0 || c.MinItems != nil && c.MaxItems != nil && *c.MinItems > *c.MaxItems {
+				return fmt.Errorf("field %q has invalid item constraints", f.Key)
+			}
 		}
-		if len(f.VisibleWhen) > 0 && !json.Valid(f.VisibleWhen) {
-			return fmt.Errorf("field %q has invalid visibility condition", f.Key)
+		if f.Control == "secret" && len(f.Default) > 0 {
+			return fmt.Errorf("field %q cannot define a secret default", f.Key)
 		}
 		if len(f.Default) > 0 && !json.Valid(f.Default) {
 			return fmt.Errorf("field %q has invalid default", f.Key)
+		}
+		if len(f.Default) > 0 {
+			if err := validateValue(f, f.Default); err != nil {
+				return fmt.Errorf("field %q has an invalid default", f.Key)
+			}
+		}
+		if (f.Control == "select" || f.Control == "multi-select") && duplicateOptions(f.Options) {
+			return fmt.Errorf("field %q has duplicate options", f.Key)
+		}
+		for _, option := range f.Options {
+			if strings.TrimSpace(option.Label) == "" {
+				return fmt.Errorf("field %q has an invalid option label", f.Key)
+			}
+		}
+	}
+	graph := map[string][]string{}
+	for _, f := range s.Fields {
+		if len(f.VisibleWhen) == 0 {
+			continue
+		}
+		refs, err := conditionReferences(f.VisibleWhen)
+		if err != nil {
+			return fmt.Errorf("field %q has invalid visibility condition", f.Key)
+		}
+		if err := validateConditionLiterals(f.VisibleWhen, seen); err != nil {
+			return fmt.Errorf("field %q has invalid visibility comparison", f.Key)
+		}
+		for _, ref := range refs {
+			dep, exists := seen[ref]
+			if !exists || dep.Control == "action" || dep.Control == "status" || dep.Control == "secret" || ref == f.Key {
+				return fmt.Errorf("field %q visibility condition references an invalid field", f.Key)
+			}
+			graph[f.Key] = append(graph[f.Key], ref)
+		}
+	}
+	visiting := map[string]bool{}
+	visited := map[string]bool{}
+	var visit func(string) bool
+	visit = func(key string) bool {
+		if visiting[key] {
+			return false
+		}
+		if visited[key] {
+			return true
+		}
+		visiting[key] = true
+		for _, dep := range graph[key] {
+			if !visit(dep) {
+				return false
+			}
+		}
+		delete(visiting, key)
+		visited[key] = true
+		return true
+	}
+	for key := range graph {
+		if !visit(key) {
+			return fmt.Errorf("visibility conditions contain a cycle")
+		}
+	}
+	return nil
+}
+
+func validateFieldPersistence(p FieldPersistence) error {
+	switch p.Mode {
+	case PersistenceForbidden, PersistenceOptional, PersistenceRequired:
+	default:
+		return fmt.Errorf("unknown persistence mode")
+	}
+	switch p.Target.Scope {
+	case PersistencePlugin, PersistenceCurrent:
+		if p.Target.Resource != nil {
+			return fmt.Errorf("scope does not accept a resource reference")
+		}
+	case PersistenceResource:
+		if p.Target.Resource == nil || ValidateResourceRef(p.Target.Resource) != nil {
+			return fmt.Errorf("resource scope requires a valid reference")
+		}
+	default:
+		return fmt.Errorf("unknown persistence scope")
+	}
+	return nil
+}
+
+func duplicateOptions(options []Option) bool {
+	seen := map[string]bool{}
+	for _, option := range options {
+		key, err := canonicalJSON(option.Value)
+		if err != nil || seen[key] {
+			return true
+		}
+		seen[key] = true
+	}
+	return false
+}
+
+func conditionReferences(raw json.RawMessage) ([]string, error) {
+	nodes := 0
+	return conditionReferencesAt(raw, 0, &nodes)
+}
+
+func conditionReferencesAt(raw json.RawMessage, depth int, nodes *int) ([]string, error) {
+	if depth > maxVisibilityDepth {
+		return nil, fmt.Errorf("visibility condition is too deep")
+	}
+	*nodes = *nodes + 1
+	if *nodes > maxVisibilityNodes {
+		return nil, fmt.Errorf("visibility condition is too large")
+	}
+	var node map[string]json.RawMessage
+	if json.Unmarshal(raw, &node) != nil || node == nil {
+		return nil, fmt.Errorf("condition must be an object")
+	}
+	if value, ok := node["all"]; ok {
+		if len(node) != 1 {
+			return nil, fmt.Errorf("all must be the only condition operator")
+		}
+		var children []json.RawMessage
+		if json.Unmarshal(value, &children) != nil || len(children) == 0 {
+			return nil, fmt.Errorf("all requires conditions")
+		}
+		return conditionChildReferences(children, depth, nodes)
+	}
+	if value, ok := node["any"]; ok {
+		if len(node) != 1 {
+			return nil, fmt.Errorf("any must be the only condition operator")
+		}
+		var children []json.RawMessage
+		if json.Unmarshal(value, &children) != nil || len(children) == 0 {
+			return nil, fmt.Errorf("any requires conditions")
+		}
+		return conditionChildReferences(children, depth, nodes)
+	}
+	fieldRaw, hasField := node["field"]
+	if !hasField || len(node) != 2 {
+		return nil, fmt.Errorf("predicate requires field and one operator")
+	}
+	var field string
+	if json.Unmarshal(fieldRaw, &field) != nil || !identifierPattern.MatchString(field) {
+		return nil, fmt.Errorf("predicate field is invalid")
+	}
+	if value, ok := node["equals"]; ok {
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("equals value is invalid")
+		}
+		return []string{field}, nil
+	}
+	if value, ok := node["not_equals"]; ok {
+		if !json.Valid(value) {
+			return nil, fmt.Errorf("not_equals value is invalid")
+		}
+		return []string{field}, nil
+	}
+	if value, ok := node["truthy"]; ok {
+		var truth bool
+		if json.Unmarshal(value, &truth) != nil {
+			return nil, fmt.Errorf("truthy must be boolean")
+		}
+		return []string{field}, nil
+	}
+	return nil, fmt.Errorf("unknown predicate")
+}
+
+func conditionChildReferences(children []json.RawMessage, depth int, nodes *int) ([]string, error) {
+	var refs []string
+	for _, child := range children {
+		childRefs, err := conditionReferencesAt(child, depth+1, nodes)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, childRefs...)
+	}
+	return refs, nil
+}
+
+func validateConditionLiterals(raw json.RawMessage, fields map[string]Field) error {
+	var node map[string]json.RawMessage
+	if json.Unmarshal(raw, &node) != nil || node == nil {
+		return fmt.Errorf("condition must be an object")
+	}
+	for _, operator := range []string{"all", "any"} {
+		if childRaw, ok := node[operator]; ok {
+			var children []json.RawMessage
+			if json.Unmarshal(childRaw, &children) != nil {
+				return fmt.Errorf("invalid condition list")
+			}
+			for _, child := range children {
+				if err := validateConditionLiterals(child, fields); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	var key string
+	if json.Unmarshal(node["field"], &key) != nil {
+		return fmt.Errorf("invalid condition field")
+	}
+	field, exists := fields[key]
+	if !exists {
+		return fmt.Errorf("unknown condition field")
+	}
+	if _, ok := node["truthy"]; ok && field.Control != "boolean" {
+		return fmt.Errorf("truthy requires a boolean field")
+	}
+	for _, operator := range []string{"equals", "not_equals"} {
+		if value, ok := node[operator]; ok {
+			if err := validateValue(field, value); err != nil {
+				return err
+			}
+			return nil
 		}
 	}
 	return nil
@@ -404,6 +863,9 @@ func ValidateValues(schema Schema, values map[string]json.RawMessage) error {
 }
 
 func validateValues(schema Schema, values map[string]json.RawMessage, checkRequired bool) error {
+	if err := schema.Validate(); err != nil {
+		return fmt.Errorf("invalid schema")
+	}
 	fields := map[string]Field{}
 	for _, f := range schema.Fields {
 		if f.Control != "action" && f.Control != "status" {
@@ -419,14 +881,304 @@ func validateValues(schema Schema, values map[string]json.RawMessage, checkRequi
 			return fmt.Errorf("invalid configuration value for %q", key)
 		}
 	}
+	withDefaults := ApplyDefaults(schema, values)
+	for key := range values {
+		visible, err := IsVisible(schema, key, withDefaults)
+		if err != nil {
+			return fmt.Errorf("invalid field visibility")
+		}
+		if !visible {
+			return fmt.Errorf("value supplied for hidden field %q", key)
+		}
+	}
 	for key, field := range fields {
-		if checkRequired && field.Required {
+		visible, err := IsVisible(schema, key, withDefaults)
+		if err != nil {
+			return fmt.Errorf("invalid field visibility")
+		}
+		if checkRequired && visible && field.Required {
 			if _, ok := values[key]; !ok && len(field.Default) == 0 {
 				return fmt.Errorf("required configuration key %q is missing", key)
 			}
 		}
 	}
 	return nil
+}
+
+// ApplyDefaults returns a copy of values with visible field defaults filled in.
+// Defaults are evaluated in dependency order so conditionals work regardless
+// of field declaration order. The supplied map is never mutated.
+func ApplyDefaults(schema Schema, values map[string]json.RawMessage) map[string]json.RawMessage {
+	out := make(map[string]json.RawMessage, len(values)+len(schema.Fields))
+	for key, raw := range values {
+		out[key] = append(json.RawMessage(nil), raw...)
+	}
+	byKey := map[string]Field{}
+	for _, field := range schema.Fields {
+		byKey[field.Key] = field
+	}
+	visited := map[string]bool{}
+	var ordered []Field
+	var add func(Field)
+	add = func(field Field) {
+		if visited[field.Key] {
+			return
+		}
+		visited[field.Key] = true
+		refs, _ := conditionReferences(field.VisibleWhen)
+		for _, ref := range refs {
+			if dep, ok := byKey[ref]; ok {
+				add(dep)
+			}
+		}
+		ordered = append(ordered, field)
+	}
+	for _, field := range schema.Fields {
+		add(field)
+	}
+	for _, field := range ordered {
+		if len(field.Default) == 0 {
+			continue
+		}
+		if _, exists := out[field.Key]; exists {
+			continue
+		}
+		visible, err := IsVisible(schema, field.Key, out)
+		if err == nil && visible {
+			out[field.Key] = append(json.RawMessage(nil), field.Default...)
+		}
+	}
+	return out
+}
+
+// IsVisible evaluates a field's validated declarative visibility condition.
+// An absent condition makes the field visible.
+func IsVisible(schema Schema, fieldKey string, values map[string]json.RawMessage) (bool, error) {
+	if err := schema.Validate(); err != nil {
+		return false, err
+	}
+	for _, field := range schema.Fields {
+		if field.Key != fieldKey {
+			continue
+		}
+		if len(field.VisibleWhen) == 0 {
+			return true, nil
+		}
+		return evaluateCondition(field.VisibleWhen, values)
+	}
+	return false, fmt.Errorf("unknown schema field")
+}
+
+func evaluateCondition(raw json.RawMessage, values map[string]json.RawMessage) (bool, error) {
+	var node map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &node); err != nil || node == nil {
+		return false, fmt.Errorf("invalid condition")
+	}
+	if childrenRaw, ok := node["all"]; ok {
+		var children []json.RawMessage
+		if err := json.Unmarshal(childrenRaw, &children); err != nil {
+			return false, fmt.Errorf("invalid all condition")
+		}
+		for _, child := range children {
+			ok, err := evaluateCondition(child, values)
+			if err != nil || !ok {
+				return ok, err
+			}
+		}
+		return true, nil
+	}
+	if childrenRaw, ok := node["any"]; ok {
+		var children []json.RawMessage
+		if err := json.Unmarshal(childrenRaw, &children); err != nil {
+			return false, fmt.Errorf("invalid any condition")
+		}
+		for _, child := range children {
+			ok, err := evaluateCondition(child, values)
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	var field string
+	if err := json.Unmarshal(node["field"], &field); err != nil {
+		return false, fmt.Errorf("invalid condition field")
+	}
+	value, present := values[field]
+	if expected, ok := node["equals"]; ok {
+		if !present {
+			return false, nil
+		}
+		left, err := canonicalJSONRaw(value)
+		if err != nil {
+			return false, err
+		}
+		right, err := canonicalJSONRaw(expected)
+		if err != nil {
+			return false, err
+		}
+		return left == right, nil
+	}
+	if expected, ok := node["not_equals"]; ok {
+		if !present {
+			return true, nil
+		}
+		left, err := canonicalJSONRaw(value)
+		if err != nil {
+			return false, err
+		}
+		right, err := canonicalJSONRaw(expected)
+		if err != nil {
+			return false, err
+		}
+		return left != right, nil
+	}
+	var wanted bool
+	if err := json.Unmarshal(node["truthy"], &wanted); err != nil {
+		return false, fmt.Errorf("invalid truthy condition")
+	}
+	truth := false
+	if present {
+		truth = jsonTruthy(value)
+	}
+	return truth == wanted, nil
+}
+
+func jsonTruthy(raw json.RawMessage) bool {
+	var value any
+	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d.UseNumber()
+	if d.Decode(&value) != nil {
+		return false
+	}
+	switch v := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return v
+	case string:
+		return v != ""
+	case json.Number:
+		n, err := v.Float64()
+		return err == nil && n != 0 && !math.IsNaN(n)
+	default:
+		return true
+	}
+}
+
+func canonicalJSON(value any) (string, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return canonicalJSONRaw(raw)
+}
+
+func canonicalJSONRaw(raw json.RawMessage) (string, error) {
+	var value any
+	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d.UseNumber()
+	if err := d.Decode(&value); err != nil {
+		return "", err
+	}
+	return canonicalJSONValue(value)
+}
+
+func canonicalJSONValue(value any) (string, error) {
+	switch v := value.(type) {
+	case nil:
+		return "null", nil
+	case bool:
+		if v {
+			return "true", nil
+		}
+		return "false", nil
+	case string:
+		encoded, err := json.Marshal(v)
+		return string(encoded), err
+	case json.Number:
+		return canonicalJSONNumber(string(v))
+	case float64:
+		return canonicalJSONValue(json.Number(strconv.FormatFloat(v, 'g', -1, 64)))
+	case []any:
+		parts := make([]string, len(v))
+		for i, item := range v {
+			part, err := canonicalJSONValue(item)
+			if err != nil {
+				return "", err
+			}
+			parts[i] = part
+		}
+		return "[" + strings.Join(parts, ",") + "]", nil
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			encodedKey, err := json.Marshal(key)
+			if err != nil {
+				return "", err
+			}
+			encodedValue, err := canonicalJSONValue(v[key])
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, string(encodedKey)+":"+encodedValue)
+		}
+		return "{" + strings.Join(parts, ",") + "}", nil
+	default:
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		return canonicalJSONRaw(raw)
+	}
+}
+
+// canonicalJSONNumber normalizes a decimal number without expanding powers of
+// ten. Exponents can be very large even in short JSON values, so converting
+// 1e1000000000 to a rational would allocate storage proportional to the value
+// rather than to the input. The coefficient/exponent pair remains exact and
+// comparable while requiring memory proportional only to the JSON token.
+func canonicalJSONNumber(raw string) (string, error) {
+	if !json.Valid([]byte(raw)) {
+		return "", fmt.Errorf("invalid JSON number")
+	}
+	sign := ""
+	if strings.HasPrefix(raw, "-") {
+		sign = "-"
+		raw = raw[1:]
+	}
+	mantissa, exponentText, hasExponent := raw, "", false
+	if index := strings.IndexAny(raw, "eE"); index >= 0 {
+		mantissa, exponentText, hasExponent = raw[:index], raw[index+1:], true
+	}
+	exponent := new(big.Int)
+	if hasExponent {
+		if _, ok := exponent.SetString(exponentText, 10); !ok {
+			return "", fmt.Errorf("invalid JSON number exponent")
+		}
+	}
+	fractionDigits := int64(0)
+	if dot := strings.IndexByte(mantissa, '.'); dot >= 0 {
+		fractionDigits = int64(len(mantissa) - dot - 1)
+		mantissa = mantissa[:dot] + mantissa[dot+1:]
+	}
+	digits := strings.TrimLeft(mantissa, "0")
+	if digits == "" {
+		return "number:0", nil
+	}
+	trimmed := strings.TrimRight(digits, "0")
+	removedZeros := len(digits) - len(trimmed)
+	exponent.Sub(exponent, big.NewInt(fractionDigits))
+	exponent.Add(exponent, big.NewInt(int64(removedZeros)))
+	return "number:" + sign + trimmed + "e" + exponent.String(), nil
 }
 
 func validateValue(f Field, raw json.RawMessage) error {
@@ -482,20 +1234,26 @@ func validateValue(f Field, raw json.RawMessage) error {
 		if f.Constraints != nil && (f.Constraints.MinItems != nil && len(arr) < *f.Constraints.MinItems || f.Constraints.MaxItems != nil && len(arr) > *f.Constraints.MaxItems) {
 			return fmt.Errorf("item count constraint")
 		}
+		seen := make(map[string]bool, len(arr))
 		for _, item := range arr {
 			if !optionContains(f.Options, item) {
 				return fmt.Errorf("invalid option")
 			}
+			identity, err := canonicalJSON(item)
+			if err != nil || seen[identity] {
+				return fmt.Errorf("duplicate option")
+			}
+			seen[identity] = true
 		}
 	}
 	return nil
 }
 
 func optionContains(options []Option, candidate any) bool {
-	a, _ := json.Marshal(candidate)
+	a, _ := canonicalJSON(candidate)
 	for _, option := range options {
-		b, _ := json.Marshal(option.Value)
-		if string(a) == string(b) {
+		b, _ := canonicalJSON(option.Value)
+		if a == b {
 			return true
 		}
 	}
@@ -520,10 +1278,13 @@ func ValidateMediaSource(media MediaSource, supported []string) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 		return fmt.Errorf("invalid media manifest URL")
 	}
+	seenHeaders := map[string]bool{}
 	for key, value := range media.Headers {
-		if textproto.CanonicalMIMEHeaderKey(key) == "" || !validHeaderValue(value) {
+		canonical, ok := canonicalHeaderName(key)
+		if !ok || seenHeaders[canonical] || unsafeTransportHeader(canonical) || !validHeaderValue(value) {
 			return fmt.Errorf("invalid media header")
 		}
+		seenHeaders[canonical] = true
 	}
 	if err := validateRequestPolicy(media.RequestPolicy); err != nil {
 		return fmt.Errorf("invalid request policy: %w", err)
@@ -531,7 +1292,41 @@ func ValidateMediaSource(media MediaSource, supported []string) error {
 	if classification := media.SourceURIClassification(); classification != "sensitive" && classification != "public" {
 		return fmt.Errorf("invalid source URI archive classification")
 	}
+	if media.RefreshPolicy != nil {
+		if media.RefreshPolicy.RefreshBeforeSeconds < 0 || media.RefreshPolicy.RefreshBeforeSeconds > 31536000 {
+			return fmt.Errorf("invalid media refresh policy")
+		}
+		seenStatus := map[int]bool{}
+		for _, status := range media.RefreshPolicy.OnHTTPStatus {
+			if status < 100 || status > 599 || seenStatus[status] {
+				return fmt.Errorf("invalid media refresh status policy")
+			}
+			seenStatus[status] = true
+		}
+	}
 	return nil
+}
+
+func canonicalHeaderName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))) {
+			return "", false
+		}
+	}
+	return strings.ToLower(name), true
+}
+
+func unsafeTransportHeader(canonicalLower string) bool {
+	switch canonicalLower {
+	case "host", "content-length", "transfer-encoding", "connection", "proxy-connection", "keep-alive", "te", "trailer", "upgrade":
+		return true
+	default:
+		return strings.HasPrefix(canonicalLower, "proxy-")
+	}
 }
 
 func ValidateWorkflowResult(result ResolveWorkflowResult, expectedWorkflowID string, supportedMedia []string) error {

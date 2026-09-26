@@ -3,4 +3,5 @@
 .env.*
 data
 adapters
+adapter-binaries
 *.log

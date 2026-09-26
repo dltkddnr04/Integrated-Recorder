@@ -2,6 +2,7 @@ package pluginconfig
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +22,7 @@ func TestConfigAndSecretStorageAreSeparateMaskedAndResourceScoped(t *testing.T) 
 		t.Fatal(err)
 	}
 	schema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "mode", Control: "select", Label: "Mode", Required: true, Options: []adapterproto.Option{{Value: "fast", Label: "Fast"}}}, {Key: "opaque_value", Control: "text", Label: "Value"}, {Key: "opaque_secret", Control: "secret", Label: "Secret"}}}
-	resource := &adapterproto.ResourceRef{Type: "arbitrary/type", ID: "id/with/slashes", Parent: &adapterproto.ResourceRef{Type: "parent.kind", ID: "parent id"}}
+	resource := &adapterproto.ResourceRef{Type: "arbitrary.type", ID: "id/with/slashes", Parent: &adapterproto.ResourceRef{Type: "parent.kind", ID: "parent id"}}
 	scope := Scope{PluginID: "plugin.example", Resource: resource}
 	values := map[string]json.RawMessage{"mode": json.RawMessage(`"fast"`), "opaque_value": json.RawMessage(`"visible"`)}
 	if err = service.Put(scope, schema, values, map[string]string{"opaque_secret": "sensitive-value"}); err != nil {
@@ -44,7 +45,7 @@ func TestConfigAndSecretStorageAreSeparateMaskedAndResourceScoped(t *testing.T) 
 	if strings.Contains(string(encoded), "sensitive-value") {
 		t.Fatal("masked projection exposed secret plaintext")
 	}
-	other := Scope{PluginID: scope.PluginID, Resource: &adapterproto.ResourceRef{Type: "arbitrary/type", ID: "another"}}
+	other := Scope{PluginID: scope.PluginID, Resource: &adapterproto.ResourceRef{Type: "arbitrary.type", ID: "another"}}
 	otherDoc, err := service.Get(other)
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +104,40 @@ func TestPutValidatesPluginDefinedSchemaAndOpaqueKeys(t *testing.T) {
 	}
 }
 
+func TestClearingReclassifiedSecretAlsoScrubsLegacyOrdinaryValue(t *testing.T) {
+	configs, secrets, err := NewTypedFileStores(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(configs, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := Scope{PluginID: "opaque-plugin"}
+	legacySchema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "opaque_value", Control: "text", Label: "Value"}}}
+	if err := service.Put(scope, legacySchema, map[string]json.RawMessage{"opaque_value": json.RawMessage(`"sensitive-old-value"`)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	secretSchema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "opaque_value", Control: "secret", Label: "Value", Persistence: &adapterproto.FieldPersistence{Mode: adapterproto.PersistenceOptional, Target: adapterproto.PersistenceTarget{Scope: adapterproto.PersistencePlugin}}}}}
+	if err := service.PutPartialWithClears(scope, secretSchema, nil, nil, nil, []string{"opaque_value"}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := service.Get(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := stored.Values["opaque_value"]; exists {
+		t.Fatal("legacy plaintext remained in ordinary configuration after explicit secret clear")
+	}
+	effective, err := service.Effective([]ScopeSchema{{Scope: scope, Schema: secretSchema}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if effective.EffectiveSecretConfigured["opaque_value"] || effective.StoredSecretConfigured["opaque_value"] {
+		t.Fatalf("cleared legacy secret is still configured: %#v", effective.Snapshot())
+	}
+}
+
 func floatPtr(v float64) *float64 { return &v }
 
 type memorySecretStore struct {
@@ -137,6 +172,24 @@ func (s *memorySecretStore) Save(scope Scope, values map[string]string) error {
 	}
 	s.values[key] = copy
 	return nil
+}
+
+type failNthSecretSave struct {
+	inner  *memorySecretStore
+	writes int
+	failAt int
+}
+
+func (s *failNthSecretSave) Load(scope Scope) (map[string]string, error) {
+	return s.inner.Load(scope)
+}
+
+func (s *failNthSecretSave) Save(scope Scope, values map[string]string) error {
+	s.writes++
+	if s.writes == s.failAt {
+		return errors.New("injected secret backend failure")
+	}
+	return s.inner.Save(scope, values)
 }
 
 func secretScopeKey(scope Scope) (string, error) {
@@ -277,6 +330,59 @@ func TestEffectiveHierarchyHonorsOpaqueScopesAndFieldInheritance(t *testing.T) {
 	}
 	if len(chain) != 3 || chain[1].Resource.Type != "alpha" || chain[2].Resource.Type != "beta" {
 		t.Fatalf("scope order = %#v", chain)
+	}
+	if err = service.PutPartialWithClears(chain[2], betaSchema, nil, map[string]string{"private": ""}, []string{"shared"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := service.Effective([]ScopeSchema{{Scope: chain[0], Schema: pluginSchema}, {Scope: chain[1], Schema: alphaSchema}, {Scope: chain[2], Schema: betaSchema}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(cleared.EffectiveValues["shared"]); got != `"alpha"` {
+		t.Fatalf("cleared override did not reveal parent: %s", got)
+	}
+	if cleared.EffectiveSecrets["private"] != "beta-secret" {
+		t.Fatal("empty secret update cleared an existing secret")
+	}
+}
+
+func TestPutBatchRollsBackEarlierScopeWhenLaterSecretWriteFails(t *testing.T) {
+	configs, _, err := NewTypedFileStores(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets := &failNthSecretSave{inner: &memorySecretStore{}, failAt: 2}
+	service, err := NewService(configs, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pluginScope := Scope{PluginID: "opaque"}
+	resourceScope := Scope{PluginID: "opaque", Resource: &adapterproto.ResourceRef{Type: "beta", ID: "child"}}
+	pluginSchema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "ordinary", Control: "text", Label: "Ordinary"}}}
+	resourceSchema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "secret", Control: "secret", Label: "Secret"}}}
+	if err = service.Put(pluginScope, pluginSchema, map[string]json.RawMessage{"ordinary": json.RawMessage(`"before"`)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	secrets.failAt = 0
+	if err = service.Put(resourceScope, resourceSchema, nil, map[string]string{"secret": "before-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	secrets.writes = 0
+	secrets.failAt = 2
+	err = service.PutBatch([]ScopeUpdate{
+		{Scope: pluginScope, Schema: pluginSchema, Values: map[string]json.RawMessage{"ordinary": json.RawMessage(`"after"`)}},
+		{Scope: resourceScope, Schema: resourceSchema, Secrets: map[string]string{"secret": "after-secret"}},
+	})
+	if err == nil {
+		t.Fatal("failing batch unexpectedly succeeded")
+	}
+	plugin, err := service.Get(pluginScope)
+	if err != nil || string(plugin.Values["ordinary"]) != `"before"` {
+		t.Fatalf("plugin scope was not rolled back: %#v, %v", plugin, err)
+	}
+	resource, err := service.Get(resourceScope)
+	if err != nil || resource.Secrets["secret"] != "before-secret" {
+		t.Fatalf("resource scope was not restored: %#v, %v", resource, err)
 	}
 }
 

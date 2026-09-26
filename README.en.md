@@ -22,7 +22,7 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
-Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. Core must restart to discover newly installed adapter binaries. The default file secret store uses restricted permissions but does not encrypt values at rest.
+Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. Core must restart to discover newly installed adapter binaries. Installed adapters run as trusted local code. The default file secret stores use restricted permissions but do not encrypt values at rest.
 
 ## Current status
 
@@ -34,7 +34,8 @@ Currently supported:
 - schema-rendered input and settings forms with generic resource discovery and configuration challenge/resume;
 - hierarchical settings with separate stored and effective projections;
 - lazy adapter-process restart with bounded backoff and a fresh describe handshake;
-- ordinary HLS master/media playlists;
+- adapter-declared refresh for expiring media sources;
+- a bounded single-rendition HLS subset, including complete segments in LL-HLS playlists;
 - direct acquisition of MPEG-TS/fMP4-style source objects;
 - SHA-256 and size metadata for captured payloads;
 - manifest snapshots;
@@ -52,7 +53,7 @@ Not supported yet:
 - HDD/NAS/LTO storage lifecycle;
 - additional platform adapters;
 - external audio rendition synchronization;
-- LL-HLS/delta playlists;
+- encrypted HLS and partial-only/delta LL-HLS;
 - DRM workflows;
 - authentication/authorization;
 - export/transcoding.
@@ -64,7 +65,7 @@ Requires Go 1.23+.
 ```sh
 mkdir -p adapters
 go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
-DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=:8080 go run ./cmd/archiver
+DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 ```
 
 Then open `http://localhost:8080/`.
@@ -75,7 +76,7 @@ Docker configuration is included:
 docker compose up --build
 ```
 
-The container uses `/data` for persistent recording storage. The Docker image/runtime path has not yet been validated on a live Docker daemon.
+The container uses a named `/data` volume and publishes the control API on host loopback. The image includes Owncast under `/adapters`; place extra executable adapters in `./adapter-binaries`, mounted read-only at `/external-adapters`, then restart Core to discover them. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
 
 ## API
 
@@ -88,6 +89,7 @@ The container uses `/data` for persistent recording storage. The Docker image/ru
 | `POST` | `/api/recordings` | Start recording |
 | `GET` | `/api/resolve-workflows/{id}` | Inspect a suspended resource/configuration workflow |
 | `POST` | `/api/resolve-workflows/{id}/continue` | Submit answers and resume a workflow |
+| `DELETE` | `/api/resolve-workflows/{id}` | Cancel a suspended workflow |
 | `GET` | `/api/recordings` | List recordings |
 | `GET` | `/api/recordings/{id}` | Recording details |
 | `POST` | `/api/recordings/{id}/stop` | Stop recording |

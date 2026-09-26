@@ -22,7 +22,7 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
-Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. 새 adapter binary를 발견하려면 Core를 재시작해야 합니다. 기본 file secret은 권한이 제한되지만 저장 시 암호화되지 않습니다.
+Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. 새 adapter binary를 발견하려면 Core를 재시작해야 하며 설치된 adapter는 신뢰된 로컬 코드로 실행됩니다. 기본 file secret store는 권한이 제한되지만 저장 시 암호화되지 않습니다.
 
 ## 현재 상태
 
@@ -34,7 +34,8 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 - Adapter schema로 입력 및 설정 form을 생성하고, resource discovery와 설정 challenge를 generic workflow로 이어가는 기반.
 - plugin 및 parent resource 설정을 합성하고, 현재 scope의 저장값과 effective 값을 구분해 노출.
 - timeout/crash 후 다음 요청에서 backoff와 describe 재검증을 거쳐 adapter process를 lazy restart.
-- 일반적인 HLS master/media playlist
+- adapter가 선언한 만료 media source refresh
+- 완료 segment가 포함된 LL-HLS playlist를 포함하는 제한된 single-rendition HLS subset
 - MPEG-TS/fMP4 형태 source object 직접 수집
 - 저장 payload의 SHA-256 및 size 기록
 - manifest snapshot
@@ -52,7 +53,7 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 - HDD/NAS/LTO storage lifecycle
 - 추가 platform adapter
 - external audio rendition synchronization
-- LL-HLS/delta playlist
+- 암호화 HLS 및 partial-only/delta LL-HLS
 - DRM workflow
 - authentication/authorization
 - export/transcoding
@@ -64,7 +65,7 @@ Go 1.23 이상이 필요합니다.
 ```sh
 mkdir -p adapters
 go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
-DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=:8080 go run ./cmd/archiver
+DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 ```
 
 실행 후 `http://localhost:8080/`을 엽니다.
@@ -75,7 +76,7 @@ Docker 설정도 포함되어 있습니다.
 docker compose up --build
 ```
 
-컨테이너에서는 `/data`를 persistent recording storage로 사용합니다. 실제 Docker daemon에서 image build/runtime 검증은 아직 완료하지 않았습니다.
+컨테이너는 named `/data` volume을 사용하며 control API port는 host loopback에 공개합니다. Image에는 `/adapters`의 Owncast binary가 포함됩니다. 추가 executable adapter를 `./adapter-binaries`에 넣으면 `/external-adapters`에 read-only mount되며 Core를 재시작한 뒤 발견됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
 
 ## API
 
@@ -88,6 +89,7 @@ docker compose up --build
 | `POST` | `/api/recordings` | 녹화 시작 |
 | `GET` | `/api/resolve-workflows/{id}` | 일시 중단된 resource/configuration workflow 조회 |
 | `POST` | `/api/resolve-workflows/{id}/continue` | 답변 제출 및 workflow 재개 |
+| `DELETE` | `/api/resolve-workflows/{id}` | 대기 workflow 취소 |
 | `GET` | `/api/recordings` | 녹화 목록 |
 | `GET` | `/api/recordings/{id}` | 녹화 상세 |
 | `POST` | `/api/recordings/{id}/stop` | 녹화 중지 |

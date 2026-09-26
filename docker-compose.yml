@@ -2,11 +2,16 @@ services:
   archiver:
     build: .
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       ADDR: ":8080"
       DATA_DIR: /data
-      ADAPTER_DIR: /adapters
+      ADAPTER_DIR: /adapters:/external-adapters
     volumes:
-      - ./data:/data
+      - recording-data:/data
+      - ./adapter-binaries:/external-adapters:ro
     restart: unless-stopped
+    stop_grace_period: 45s
+
+volumes:
+  recording-data:

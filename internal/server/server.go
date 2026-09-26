@@ -2,10 +2,13 @@
 package server
 
 import (
+	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"net/http"
 	"path/filepath"
@@ -29,15 +32,31 @@ type Server struct {
 	configs        *pluginconfig.Service
 	mux            *http.ServeMux
 	mu             sync.Mutex
-	workflowTitles map[string]string
+	workflowTitles map[string]workflowTitle
 }
 
+type workflowTitle struct {
+	title     string
+	updatedAt time.Time
+}
+
+const (
+	workflowTitleTTL  = 30 * time.Minute
+	maxWorkflowTitles = 128
+)
+
+//go:embed static/*
+var staticFiles embed.FS
+
 func New(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginconfig.Service) http.Handler {
-	s := &Server{manager: manager, adapters: adapters, configs: configs, mux: http.NewServeMux(), workflowTitles: map[string]string{}}
+	s := &Server{manager: manager, adapters: adapters, configs: configs, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
+	static, _ := fs.Sub(staticFiles, "static")
+	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
 	s.mux.HandleFunc("POST /api/recordings", s.create)
 	s.mux.HandleFunc("GET /api/resolve-workflows/{id}", s.workflowGet)
+	s.mux.HandleFunc("DELETE /api/resolve-workflows/{id}", s.workflowCancel)
 	s.mux.HandleFunc("POST /api/resolve-workflows/{id}/continue", s.workflowContinue)
 	s.mux.HandleFunc("GET /api/adapters", s.adapterList)
 	s.mux.HandleFunc("GET /api/adapters/{id}", s.adapterGet)
@@ -50,7 +69,7 @@ func New(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginco
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/segments/{segmentID}", s.segment)
-	return s.mux
+	return securityHeaders(s.mux)
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -62,7 +81,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, indexHTML)
+	_, _ = io.WriteString(w, safeIndexHTML)
 }
 
 type createRequest struct {
@@ -73,12 +92,9 @@ type createRequest struct {
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
 	var request createRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSONBody(w, r, 64<<10, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if strings.TrimSpace(request.AdapterID) == "" || len(request.Input) == 0 {
@@ -91,19 +107,21 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	progress, err := s.adapters.BeginResolution(r.Context(), request.AdapterID, request.Input, request.Resource)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "adapter could not resolve the input")
 		return
 	}
 	if progress.State != "resolved" || progress.Media == nil {
-		s.mu.Lock()
-		s.workflowTitles[progress.WorkflowID] = strings.TrimSpace(request.Title)
-		s.mu.Unlock()
+		if !s.storeWorkflowTitle(progress.WorkflowID, strings.TrimSpace(request.Title)) {
+			_ = s.adapters.CancelWorkflow(progress.WorkflowID)
+			writeError(w, http.StatusServiceUnavailable, "too many active workflows")
+			return
+		}
 		writeJSON(w, http.StatusAccepted, progress)
 		return
 	}
 	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, strings.TrimSpace(request.Title), &progress.Provenance)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "recording could not be started")
 		return
 	}
 	writeJSON(w, http.StatusCreated, detail(recording))
@@ -116,47 +134,108 @@ func (s *Server) workflowGet(w http.ResponseWriter, r *http.Request) {
 	}
 	progress, err := s.adapters.Workflow(r.PathValue("id"))
 	if err != nil {
+		s.deleteWorkflowTitle(r.PathValue("id"))
 		writeError(w, http.StatusNotFound, "workflow not found")
 		return
 	}
+	s.touchWorkflowTitle(r.PathValue("id"))
 	writeJSON(w, http.StatusOK, progress)
 }
 
-type workflowContinueRequest struct {
-	Values  map[string]json.RawMessage `json:"values,omitempty"`
-	Secrets map[string]string          `json:"secrets,omitempty"`
-	Persist bool                       `json:"persist,omitempty"`
-}
-
-func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
+func (s *Server) workflowCancel(w http.ResponseWriter, r *http.Request) {
 	if s.adapters == nil {
 		writeError(w, http.StatusServiceUnavailable, "adapter workflows are unavailable")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
+	err := s.adapters.CancelWorkflow(r.PathValue("id"))
+	s.deleteWorkflowTitle(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "workflow not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) storeWorkflowTitle(id, title string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupWorkflowTitlesLocked(time.Now())
+	if _, exists := s.workflowTitles[id]; !exists && len(s.workflowTitles) >= maxWorkflowTitles {
+		return false
+	}
+	s.workflowTitles[id] = workflowTitle{title: title, updatedAt: time.Now()}
+	return true
+}
+
+func (s *Server) takeWorkflowTitle(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupWorkflowTitlesLocked(time.Now())
+	item := s.workflowTitles[id]
+	delete(s.workflowTitles, id)
+	return item.title
+}
+
+func (s *Server) touchWorkflowTitle(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if item, ok := s.workflowTitles[id]; ok {
+		item.updatedAt = time.Now()
+		s.workflowTitles[id] = item
+	}
+}
+
+func (s *Server) deleteWorkflowTitle(id string) {
+	s.mu.Lock()
+	delete(s.workflowTitles, id)
+	s.mu.Unlock()
+}
+
+func (s *Server) cleanupWorkflowTitlesLocked(now time.Time) {
+	for id, item := range s.workflowTitles {
+		if now.Sub(item.updatedAt) > workflowTitleTTL {
+			delete(s.workflowTitles, id)
+		}
+	}
+}
+
+type workflowContinueRequest struct {
+	Values        map[string]json.RawMessage `json:"values,omitempty"`
+	Secrets       map[string]string          `json:"secrets,omitempty"`
+	Persist       bool                       `json:"persist,omitempty"`
+	PersistFields []string                   `json:"persist_fields,omitempty"`
+}
+
+func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 	var request workflowContinueRequest
-	if err := decoder.Decode(&request); err != nil {
+	if err := decodeJSONBody(w, r, 64<<10, &request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid workflow continuation")
 		return
 	}
-	progress, err := s.adapters.ContinueResolution(r.Context(), r.PathValue("id"), request.Values, request.Secrets, request.Persist)
+	if s.adapters == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter workflows are unavailable")
+		return
+	}
+	var progress adapterhost.WorkflowProgress
+	var err error
+	if request.Persist && len(request.PersistFields) == 0 {
+		progress, err = s.adapters.ContinueResolution(r.Context(), r.PathValue("id"), request.Values, request.Secrets, true)
+	} else {
+		progress, err = s.adapters.ContinueResolutionFields(r.Context(), r.PathValue("id"), request.Values, request.Secrets, request.PersistFields)
+	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "workflow continuation was rejected")
 		return
 	}
 	if progress.State != "resolved" || progress.Media == nil {
+		s.touchWorkflowTitle(progress.WorkflowID)
 		writeJSON(w, http.StatusAccepted, progress)
 		return
 	}
-	s.mu.Lock()
-	title := s.workflowTitles[progress.WorkflowID]
-	delete(s.workflowTitles, progress.WorkflowID)
-	s.mu.Unlock()
+	title := s.takeWorkflowTitle(progress.WorkflowID)
 	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, title, &progress.Provenance)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusBadRequest, "recording could not be started")
 		return
 	}
 	writeJSON(w, http.StatusCreated, detail(recording))
@@ -208,6 +287,7 @@ type configPutRequest struct {
 	Resource     *adapterproto.ResourceRef  `json:"resource,omitempty"`
 	Values       map[string]json.RawMessage `json:"values,omitempty"`
 	Secrets      map[string]string          `json:"secrets,omitempty"`
+	ClearValues  []string                   `json:"clear_values,omitempty"`
 	ClearSecrets []string                   `json:"clear_secrets,omitempty"`
 }
 type secretState struct {
@@ -234,23 +314,28 @@ type configAPIView struct {
 }
 
 func configView(values map[string]json.RawMessage, configured map[string]bool, schema adapterproto.Schema) configScopeView {
-	secretKeys := map[string]bool{}
+	fieldControls := map[string]string{}
 	for _, field := range schema.Fields {
-		if field.Control == "secret" {
-			secretKeys[field.Key] = true
-		}
+		fieldControls[field.Key] = field.Control
 	}
 	ordinary := map[string]json.RawMessage{}
 	for key, value := range values {
-		if !secretKeys[key] {
+		// Do not expose values whose current descriptor no longer declares a
+		// field. An older schema may have stored such a value as a secret.
+		if control, declared := fieldControls[key]; declared && control != "secret" {
 			ordinary[key] = append(json.RawMessage(nil), value...)
 		}
 	}
 	secrets := map[string]secretState{}
 	for key, value := range configured {
-		secrets[key] = secretState{Configured: value}
+		if fieldControls[key] == "secret" {
+			secrets[key] = secretState{Configured: value}
+		}
 	}
-	for key := range secretKeys {
+	for key, control := range fieldControls {
+		if control != "secret" {
+			continue
+		}
 		if _, ok := secrets[key]; !ok {
 			secrets[key] = secretState{}
 		}
@@ -288,16 +373,13 @@ func (s *Server) configGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, configAPI(schema, snapshot, resource))
 }
 func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
-	if s.configs == nil || s.adapters == nil {
-		writeError(w, http.StatusServiceUnavailable, "adapter configuration is unavailable")
+	var request configPutRequest
+	if err := decodeJSONBody(w, r, 64<<10, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid configuration request")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	var request configPutRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid configuration request")
+	if s.configs == nil || s.adapters == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter configuration is unavailable")
 		return
 	}
 	id := r.PathValue("id")
@@ -306,8 +388,8 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "adapter configuration schema is unavailable")
 		return
 	}
-	if err = s.configs.PutPartial(pluginconfig.Scope{PluginID: id, Resource: request.Resource}, schema, request.Values, request.Secrets, request.ClearSecrets); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err = s.configs.PutPartialWithClears(pluginconfig.Scope{PluginID: id, Resource: request.Resource}, schema, request.Values, request.Secrets, request.ClearValues, request.ClearSecrets); err != nil {
+		writeError(w, http.StatusBadRequest, "configuration update was rejected")
 		return
 	}
 	snapshot, err := s.adapters.ConfigSnapshot(id, request.Resource)
@@ -319,20 +401,21 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
 }
 
 func projectConfig(values map[string]json.RawMessage, configured map[string]bool, schema adapterproto.Schema) maskedConfig {
-	secretKeys := make(map[string]bool)
+	fieldControls := make(map[string]string)
 	for _, field := range schema.Fields {
-		if field.Control == "secret" {
-			secretKeys[field.Key] = true
-		}
+		fieldControls[field.Key] = field.Control
 	}
 	maskedValues := make(map[string]json.RawMessage, len(values))
 	for key, value := range values {
-		if !secretKeys[key] {
+		if control, declared := fieldControls[key]; declared && control != "secret" {
 			maskedValues[key] = value
 		}
 	}
 	maskedSecrets := maskSecrets(configured, schema)
-	for key := range secretKeys {
+	for key, control := range fieldControls {
+		if control != "secret" {
+			continue
+		}
 		if _, exists := values[key]; exists {
 			maskedSecrets[key] = secretState{Configured: true}
 		}
@@ -373,22 +456,22 @@ func resourceQuery(r *http.Request) (*adapterproto.ResourceRef, error) {
 }
 
 type recordingSummary struct {
-	ID                      string                          `json:"id"`
-	Title                   string                          `json:"title,omitempty"`
-	AdapterID               string                          `json:"adapter_id,omitempty"`
-	Adapter                 *adapterproto.AdapterProvenance `json:"adapter,omitempty"`
-	SourceURIClassification string                          `json:"source_uri_classification"`
-	Resource                *adapterproto.ResourceRef       `json:"resource,omitempty"`
-	SourceURL               string                          `json:"source_url,omitempty"`
-	State                   domain.RecordingState           `json:"state"`
-	CreatedAt               time.Time                       `json:"created_at"`
-	StartedAt               time.Time                       `json:"started_at"`
-	StoppedAt               any                             `json:"stopped_at,omitempty"`
-	TrackCount              int                             `json:"track_count"`
-	SegmentCount            int                             `json:"segment_count"`
-	Duration                float64                         `json:"duration_seconds"`
-	GapCount                int                             `json:"gap_count"`
-	LastError               string                          `json:"last_error,omitempty"`
+	ID                      string                    `json:"id"`
+	Title                   string                    `json:"title,omitempty"`
+	AdapterID               string                    `json:"adapter_id,omitempty"`
+	Adapter                 *domain.AdapterProvenance `json:"adapter,omitempty"`
+	SourceURIClassification string                    `json:"source_uri_classification"`
+	Resource                *domain.ResourceReference `json:"resource,omitempty"`
+	SourceURL               string                    `json:"source_url,omitempty"`
+	State                   domain.RecordingState     `json:"state"`
+	CreatedAt               time.Time                 `json:"created_at"`
+	StartedAt               time.Time                 `json:"started_at"`
+	StoppedAt               any                       `json:"stopped_at,omitempty"`
+	TrackCount              int                       `json:"track_count"`
+	SegmentCount            int                       `json:"segment_count"`
+	Duration                float64                   `json:"duration_seconds"`
+	GapCount                int                       `json:"gap_count"`
+	LastError               string                    `json:"last_error,omitempty"`
 }
 
 func summary(r *domain.Recording) recordingSummary {
@@ -480,6 +563,10 @@ func (s *Server) masterPlaylist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "recording has no captured media segments yet")
 		return
 	}
+	if !s.playableTrackPayloadsAvailable(recording, track) {
+		writeError(w, http.StatusServiceUnavailable, "recording media payload is unavailable")
+		return
+	}
 	bandwidth := track.Bandwidth
 	if bandwidth <= 0 {
 		bandwidth = 1_000_000
@@ -504,8 +591,12 @@ func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "recording has no captured media segments yet")
 		return
 	}
+	if !s.playableTrackPayloadsAvailable(recording, track) {
+		writeError(w, http.StatusServiceUnavailable, "recording media payload is unavailable")
+		return
+	}
 	segments := append([]domain.Segment(nil), track.Segments...)
-	sort.Slice(segments, func(i, j int) bool { return segments[i].Sequence < segments[j].Sequence })
+	sort.Slice(segments, func(i, j int) bool { return segmentBefore(segments[i], segments[j]) })
 	maxDuration := 0.0
 	for _, segment := range segments {
 		if segment.Duration > maxDuration {
@@ -517,12 +608,16 @@ func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
 		target = 1
 	}
 	var builder strings.Builder
-	fmt.Fprintf(&builder, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, segments[0].Sequence)
-	previousSequence := segments[0].Sequence
+	mediaSequence := segments[0].Sequence
+	if segments[0].ArchiveOrdinal > 0 {
+		mediaSequence = segments[0].ArchiveOrdinal - 1
+	}
+	fmt.Fprintf(&builder, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, mediaSequence)
+	previous := segments[0]
 	previousInit := ""
 	lastDiscontinuity := false
 	for index, segment := range segments {
-		if index > 0 && hasGapBetween(recording.Gaps, trackID, previousSequence, segment.Sequence) {
+		if index > 0 && (previous.SourceEpoch != segment.SourceEpoch || previous.DiscontinuitySequence != segment.DiscontinuitySequence || hasGapBetweenEpoch(recording.Gaps, trackID, previous.SourceEpoch, previous.Sequence, segment.Sequence)) {
 			fmt.Fprintln(&builder, "#EXT-X-DISCONTINUITY")
 			lastDiscontinuity = true
 		}
@@ -544,11 +639,37 @@ func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(&builder, "#EXT-X-PROGRAM-DATE-TIME:%s\n", segment.ProgramDateTime.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"))
 		}
 		fmt.Fprintf(&builder, "#EXTINF:%s,\n/api/recordings/%s/play/segments/%s\n", strconv.FormatFloat(segment.Duration, 'f', -1, 64), recording.ID, segment.ID)
-		previousSequence = segment.Sequence
+		previous = segment
 		lastDiscontinuity = false
 	}
 	builder.WriteString("#EXT-X-ENDLIST\n")
 	writePlaylist(w, builder.String())
+}
+
+func (s *Server) playableTrackPayloadsAvailable(recording *domain.Recording, track *domain.Track) bool {
+	store := s.manager.Store()
+	if store.HasCanonicalPayloadIssue(recording.ID) {
+		return false
+	}
+	for _, segment := range track.Segments {
+		file, err := store.OpenPayload(recording.ID, segment.StoragePath)
+		if err != nil {
+			return false
+		}
+		_ = file.Close()
+		if segment.InitSegmentID != "" {
+			init, ok := findInit(track, segment.InitSegmentID)
+			if !ok {
+				return false
+			}
+			file, err := store.OpenPayload(recording.ID, init.StoragePath)
+			if err != nil {
+				return false
+			}
+			_ = file.Close()
+		}
+	}
+	return true
 }
 
 func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
@@ -584,9 +705,16 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	// net/http applies the server's WriteTimeout to the entire handler body.
+	// Streaming a large source segment to a slow browser may legitimately take
+	// longer, so clear that deadline only for this file response.
+	if err = http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		writeError(w, http.StatusInternalServerError, "stored payload could not be streamed")
+		return
+	}
 	w.Header().Set("Content-Type", mediaContentType(found.StoragePath))
 	w.Header().Set("Content-Length", strconv.FormatInt(found.PayloadSize, 10))
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Cache-Control", "private, no-store")
 	if _, err = io.Copy(w, f); err != nil {
 		return
 	}
@@ -603,15 +731,37 @@ func (s *Server) playableRecording(id string) (*domain.Recording, error) {
 	return r, nil
 }
 func hasGapBetween(gaps []domain.Gap, trackID string, previous, next uint64) bool {
+	return hasGapBetweenEpoch(gaps, trackID, 0, previous, next)
+}
+
+func hasGapBetweenEpoch(gaps []domain.Gap, trackID string, epoch, previous, next uint64) bool {
 	if next <= previous || previous == ^uint64(0) {
 		return false
 	}
 	for _, gap := range gaps {
-		if gap.TrackID == trackID && gap.ToSequence > previous && gap.FromSequence < next {
+		if gap.TrackID == trackID && gap.SourceEpoch == epoch && gap.ToSequence > previous && gap.FromSequence < next {
 			return true
 		}
 	}
 	return next-previous > 1
+}
+
+func segmentBefore(a, b domain.Segment) bool {
+	if a.ArchiveOrdinal > 0 || b.ArchiveOrdinal > 0 {
+		if a.SourceEpoch != b.SourceEpoch {
+			return a.SourceEpoch < b.SourceEpoch
+		}
+		if a.ArchiveOrdinal != b.ArchiveOrdinal {
+			if a.ArchiveOrdinal == 0 {
+				return a.Sequence < b.Sequence
+			}
+			if b.ArchiveOrdinal == 0 {
+				return false
+			}
+			return a.ArchiveOrdinal < b.ArchiveOrdinal
+		}
+	}
+	return a.Sequence < b.Sequence
 }
 func findInit(track *domain.Track, id string) (domain.Segment, bool) {
 	for _, segment := range track.InitSegments {
@@ -632,6 +782,10 @@ func mediaContentType(storagePath string) string {
 		return "video/mp4"
 	case ".aac":
 		return "audio/aac"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".vtt":
+		return "text/vtt; charset=utf-8"
 	default:
 		return "application/octet-stream"
 	}
@@ -652,37 +806,36 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 func writeStorageError(w http.ResponseWriter, err error) {
-	if err == storage.ErrNotFound {
+	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "recording not found")
 		return
 	}
-	writeError(w, http.StatusInternalServerError, err.Error())
+	writeError(w, http.StatusInternalServerError, "recording storage operation failed")
 }
 
-const indexHTML = `<!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stream archive</title><body>
-<h1>Stream archive</h1>
-<form id="start"><label>Adapter <select id="adapter" required></select></label> <label>Title <input name="title"></label><fieldset><legend>Recording input</legend><div id="input-fields"></div></fieldset><button>Start recording</button></form>
-<section id="configuration-panel"><h2>Adapter settings</h2><div id="config-fields"></div><button id="save-config" type="button">Save Settings</button></section>
-<section id="challenge-panel" hidden><h2>Continue adapter workflow</h2><p id="challenge-message"></p><div id="challenge-fields"></div><label id="persist-choice" hidden><input id="persist-answer" type="checkbox"> Save these values for this resource</label><button id="continue-workflow" type="button">Continue</button></section>
-<p id="message" role="status"></p><ul id="recordings"></ul><video id="player" controls playsinline style="width:min(100%,800px)"></video>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
-<script>
-const message=document.querySelector('#message'),list=document.querySelector('#recordings'),video=document.querySelector('#player'),adapterSelect=document.querySelector('#adapter'),inputFields=document.querySelector('#input-fields'),configFields=document.querySelector('#config-fields'),challengeFields=document.querySelector('#challenge-fields');let hls,inputSchema={fields:[]},activeWorkflow=null;
-async function api(url,opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const body=await r.json();if(!r.ok)throw Error(body.error||r.statusText);return body}
-function encodedResource(resource){const bytes=new TextEncoder().encode(JSON.stringify(resource));let binary='';bytes.forEach(value=>binary+=String.fromCharCode(value));return btoa(binary).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_')}
-function currentScope(resource){return resource?'resource:'+encodedResource(resource):'plugin'}
-function serialValue(field,control){if(field.control==='boolean')return control.checked;if(field.control==='number')return control.value===''?undefined:Number(control.value);if(field.control==='select')return control.value===''?undefined:JSON.parse(control.value);if(field.control==='multi-select')return Array.from(control.selectedOptions).map(option=>JSON.parse(option.value));return control.value===''?undefined:control.value}
-function renderSchema(target,schema,projection={}){target.replaceChildren();const values=projection.values||{},secrets=projection.secrets||{},sources=projection.sources||{},secretSources=projection.secretSources||{};const resource=projection.resource||null,current=projection.currentScope||currentScope(resource);for(const field of schema.fields||[]){const row=document.createElement('div');const title=document.createElement('label');title.append(document.createTextNode(field.label+' '));if(field.control==='action'||field.control==='status'){const display=document.createElement('span');display.textContent=field.description||'';row.append(title,display);target.append(row);continue}let control;if(field.control==='textarea'){control=document.createElement('textarea')}else if(field.control==='select'||field.control==='multi-select'){control=document.createElement('select');control.multiple=field.control==='multi-select';(field.options||[]).forEach(option=>{const item=document.createElement('option');item.value=JSON.stringify(option.value);item.textContent=option.label;control.append(item)})}else{control=document.createElement('input');control.type=field.control==='secret'?'password':field.control==='number'?'number':field.control==='boolean'?'checkbox':'text'}control.dataset.key=field.key;if(field.required&&field.control!=='secret')control.required=true;const constraint=field.constraints||{};if(control.type==='number'){if(constraint.min!==undefined)control.min=constraint.min;if(constraint.max!==undefined)control.max=constraint.max}if(control.type==='text'||control.tagName==='TEXTAREA'){if(constraint.min_length!==undefined)control.minLength=constraint.min_length;if(constraint.max_length!==undefined)control.maxLength=constraint.max_length;if(constraint.pattern)control.pattern=constraint.pattern}let initial=values[field.key];if(initial===undefined&&field.default!==undefined)initial=field.default;if(field.control==='secret'){control.value='';const state=secrets[field.key]||{configured:false};const status=document.createElement('small');status.textContent=state.configured?' configured':' not configured';title.append(status);const clearLabel=document.createElement('label');const clear=document.createElement('input');clear.type='checkbox';clear.dataset.clearSecret=field.key;clearLabel.append(clear,document.createTextNode(' Clear'));if(state.configured)row.append(clearLabel);control.required=!!field.required&&!state.configured}else if(initial!==undefined){if(field.control==='boolean')control.checked=!!initial;else if(field.control==='select')control.value=JSON.stringify(initial);else if(field.control==='multi-select'){const selected=new Set(initial||[]);Array.from(control.options).forEach(option=>option.selected=selected.has(JSON.parse(option.value)))}else control.value=initial}control.dataset.initial=JSON.stringify(serialValue(field,control));title.append(control);row.append(title);if(field.description){const hint=document.createElement('small');hint.textContent=field.description;row.append(hint)}const source=field.control==='secret'?secretSources[field.key]:sources[field.key];if(source&&source!==current){const inherited=document.createElement('small');inherited.textContent='Inherited from '+source;row.append(inherited)}target.append(row)}}
-function collect(target,schema,partial){const values={},secrets={},clear=[];for(const field of schema.fields||[]){if(field.control==='action'||field.control==='status')continue;if(field.control==='secret'){const control=target.querySelector('[data-key="'+CSS.escape(field.key)+'"]');const clearControl=target.querySelector('[data-clear-secret="'+CSS.escape(field.key)+'"]');if(clearControl&&clearControl.checked){clear.push(field.key);continue}if(control&&control.value!=='')secrets[field.key]=control.value;continue}const control=target.querySelector('[data-key="'+CSS.escape(field.key)+'"]');if(!control)continue;const value=serialValue(field,control);if(value===undefined)continue;if(partial&&control.dataset.initial===JSON.stringify(value))continue;values[field.key]=value}return {values:values,secrets:secrets,clear:clear}}
-async function loadSchema(){const id=adapterSelect.value;inputFields.replaceChildren();configFields.replaceChildren();if(!id)return;const schema=await api('/api/adapters/'+encodeURIComponent(id)+'/schema');inputSchema=schema.input_schema||{fields:[]};renderSchema(inputFields,inputSchema);await loadConfiguration(id,null)}
-async function loadConfiguration(id,resource){const query=resource?'?resource='+encodedResource(resource):'';const data=await api('/api/adapters/'+encodeURIComponent(id)+'/config'+query);const config=data.configuration||data;renderSchema(configFields,data.schema||{fields:[]},{values:config.effective_values||config.effective?.values||{},secrets:config.effective_secrets||config.effective?.secrets||{},sources:data.value_sources||config.value_sources||{},secretSources:data.secret_sources||config.secret_sources||{},resource:resource,currentScope:data.current_scope});document.querySelector('#save-config').onclick=async()=>{try{const fields=data.schema||{fields:[]},submitted=collect(configFields,fields,true);await api('/api/adapters/'+encodeURIComponent(id)+'/config',{method:'PUT',body:JSON.stringify({resource:resource||undefined,values:submitted.values,secrets:submitted.secrets,clear_secrets:submitted.clear})});await loadConfiguration(id,resource);message.textContent='Settings saved.'}catch(error){message.textContent=error.message}}}
-async function loadAdapters(){const adapters=await api('/api/adapters');adapterSelect.replaceChildren();adapters.forEach(item=>{const option=document.createElement('option');if(item.descriptor){option.value=item.descriptor.id;option.textContent=item.descriptor.name+' — '+item.status.state+' v'+item.descriptor.version}else{option.value='';option.textContent=item.status.id+' — '+item.status.state;option.disabled=true}adapterSelect.append(option)});await loadSchema()}
-async function refresh(){const items=await api('/api/recordings');list.replaceChildren(...items.map(item=>{const li=document.createElement('li');li.append(document.createTextNode((item.title||item.id)+' — '+item.state+' — '+item.segment_count+' segments '));if(item.state==='recording'){const stop=document.createElement('button');stop.textContent='Stop';stop.onclick=async()=>{try{await api('/api/recordings/'+item.id+'/stop',{method:'POST'});refresh()}catch(error){message.textContent=error.message}};li.append(stop)}else{const play=document.createElement('button');play.textContent='Play VOD';play.onclick=()=>playRecording(item.id);li.append(play)}return li}))}
-function playRecording(id){const src='/api/recordings/'+id+'/play/master.m3u8';if(hls)hls.destroy();if(video.canPlayType('application/vnd.apple.mpegurl')){video.src=src;video.play()}else if(window.Hls&&Hls.isSupported()){hls=new Hls();hls.loadSource(src);hls.attachMedia(video);hls.on(Hls.Events.MANIFEST_PARSED,()=>video.play())}else{message.textContent='This browser has no HLS playback support.'}}
-async function showWorkflow(progress){activeWorkflow=progress;const panel=document.querySelector('#challenge-panel');panel.hidden=false;document.querySelector('#challenge-message').textContent=(progress.challenge.prompt?.title||'Additional configuration is required')+' '+(progress.challenge.prompt?.message||'');await loadConfiguration(adapterSelect.value,progress.resource||null);renderSchema(challengeFields,progress.challenge.schema);const persist=document.querySelector('#persist-choice');persist.hidden=!progress.challenge.persistable;document.querySelector('#persist-answer').checked=false}
-document.querySelector('#continue-workflow').onclick=async()=>{if(!activeWorkflow)return;try{const result=collect(challengeFields,activeWorkflow.challenge.schema,false),persist=activeWorkflow.challenge.persistable&&document.querySelector('#persist-answer').checked;const next=await api('/api/resolve-workflows/'+encodeURIComponent(activeWorkflow.workflow_id)+'/continue',{method:'POST',body:JSON.stringify({values:result.values,secrets:result.secrets,persist:persist})});if(next.workflow_id){await showWorkflow(next);return}document.querySelector('#challenge-panel').hidden=true;activeWorkflow=null;message.textContent='Started '+next.id;refresh()}catch(error){message.textContent=error.message}}
-document.querySelector('#start').addEventListener('submit',async event=>{event.preventDefault();const values=collect(inputFields,inputSchema,false);try{const result=await api('/api/recordings',{method:'POST',body:JSON.stringify({adapter_id:adapterSelect.value,input:values.values,title:event.currentTarget.elements.title.value})});if(result.workflow_id){await showWorkflow(result);message.textContent='Adapter needs additional information.';return}message.textContent='Started '+result.id;event.currentTarget.elements.title.value='';refresh()}catch(error){message.textContent=error.message}})
-adapterSelect.addEventListener('change',()=>loadSchema().catch(error=>message.textContent=error.message));loadAdapters().catch(error=>message.textContent=error.message);refresh().catch(error=>message.textContent=error.message);setInterval(()=>refresh().catch(()=>{}),5000);
-</script></body></html>`
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, limit int64, destination any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return fmt.Errorf("invalid JSON request")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("request must contain exactly one JSON value")
+	}
+	return nil
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
+}

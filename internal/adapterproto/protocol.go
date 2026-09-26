@@ -17,6 +17,11 @@ const (
 	MaxFrameBytes = 8 << 20
 )
 
+// ErrUnsupportedProtocolVersion identifies a well-formed protocol frame that
+// cannot be handled by this implementation. Callers may use errors.Is to
+// distinguish compatibility failures from malformed transient output.
+var ErrUnsupportedProtocolVersion = errors.New("unsupported protocol version")
+
 // Capabilities name generic protocol behaviors and contain no platform domain.
 const (
 	CapabilityResolve         = "resolve"
@@ -155,6 +160,9 @@ func WriteNotification(w io.Writer, notification Notification) error {
 // keep their legacy wire format; the parser also accepts typed forms and the
 // reserved notification extension.
 func ParseFrame(data []byte) (Frame, error) {
+	if len(data) > MaxFrameBytes {
+		return Frame{}, fmt.Errorf("protocol frame exceeds %d bytes", MaxFrameBytes)
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return Frame{}, fmt.Errorf("malformed protocol frame JSON: %w", err)
@@ -167,7 +175,7 @@ func ParseFrame(data []byte) (Frame, error) {
 		return Frame{}, errors.New("protocol version is required")
 	}
 	if version != Version {
-		return Frame{}, fmt.Errorf("unsupported protocol version %d", version)
+		return Frame{}, fmt.Errorf("%w %d", ErrUnsupportedProtocolVersion, version)
 	}
 	if rawType, ok := fields["type"]; ok {
 		var frameType string
@@ -259,7 +267,7 @@ func parseResponseFrame(data []byte) (Frame, error) {
 
 func validateNotification(notification Notification) error {
 	if notification.ProtocolVersion != Version {
-		return fmt.Errorf("unsupported protocol version %d", notification.ProtocolVersion)
+		return fmt.Errorf("%w %d", ErrUnsupportedProtocolVersion, notification.ProtocolVersion)
 	}
 	if strings.TrimSpace(notification.Method) == "" {
 		return errors.New("notification method is required")

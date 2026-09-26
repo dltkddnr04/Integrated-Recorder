@@ -28,6 +28,7 @@ type process struct {
 	sequence     atomic.Uint64
 	unusable     atomic.Bool
 	stderr       *boundedCapture
+	startedAt    time.Time
 }
 
 type readResult struct {
@@ -70,22 +71,45 @@ func startProcess(path string) (*process, error) {
 	if err = cmd.Start(); err != nil {
 		return nil, err
 	}
-	p := &process{cmd: cmd, stdin: stdin, requests: make(chan struct{}, 1), responses: make(chan readResult, 1), done: make(chan struct{}), stderr: stderr}
+	p := &process{cmd: cmd, stdin: stdin, requests: make(chan struct{}, 1), responses: make(chan readResult, 1), done: make(chan struct{}), stderr: stderr, startedAt: time.Now()}
 	p.requests <- struct{}{}
-	go p.readLoop(bufio.NewReaderSize(stdout, 32<<10))
-	go func() { _ = cmd.Wait(); close(p.done) }()
+	go func() {
+		p.readLoop(bufio.NewReaderSize(stdout, 32<<10))
+		// StdoutPipe requires its reader to finish before Wait reaps the child.
+		// Waiting concurrently can close the pipe before a just-written frame
+		// has been consumed, losing a valid response from a short-lived adapter.
+		_ = cmd.Wait()
+		close(p.done)
+	}()
 	return p, nil
 }
 
 func (p *process) readLoop(reader *bufio.Reader) {
 	for {
 		response, err := adapterproto.ReadResponse(reader)
-		select {
-		case p.responses <- readResult{response: response, err: err}:
-		case <-p.done:
+		if err != nil {
+			// The caller may have canceled after writing a request and left a
+			// complete response queued. Preserve that frame; EOF is also signaled
+			// by readerDone/done, so a second queue item is not necessary.
+			select {
+			case p.responses <- readResult{err: err}:
+			default:
+			}
+			if !errors.Is(err, io.EOF) {
+				p.unusable.Store(true)
+				p.kill()
+				_, _ = io.Copy(io.Discard, reader)
+			}
 			return
 		}
-		if err != nil {
+		select {
+		case p.responses <- readResult{response: response}:
+		default:
+			// More than one frame arrived without a request/response consumer.
+			// The stream can no longer be synchronized, so discard this process.
+			p.unusable.Store(true)
+			p.kill()
+			_, _ = io.Copy(io.Discard, reader)
 			return
 		}
 	}
@@ -119,39 +143,73 @@ func (p *process) call(ctx context.Context, method string, params any) (json.Raw
 		return nil, err
 	}
 	request := adapterproto.Request{ProtocolVersion: adapterproto.Version, ID: id, Method: method, Params: paramsJSON}
-	if err = adapterproto.WriteRequest(p.stdin, request); err != nil {
+	writeResult := make(chan error, 1)
+	go func() { writeResult <- adapterproto.WriteRequest(p.stdin, request) }()
+	select {
+	case err = <-writeResult:
+		if err != nil {
+			p.kill()
+			return nil, errors.New("adapter request failed")
+		}
+	case <-ctx.Done():
+		// Writes to a child stdin pipe are not context-aware. Kill the process
+		// to interrupt a blocked write, then join the writer before allowing a
+		// later call to reuse this process slot.
 		p.kill()
-		return nil, errors.New("adapter request failed")
+		<-writeResult
+		return nil, fmt.Errorf("adapter request timed out or was canceled")
+	case <-p.done:
+		p.kill()
+		<-writeResult
+		return nil, errors.New("adapter process exited")
 	}
 	select {
 	case <-ctx.Done():
+		select {
+		case result := <-p.responses:
+			return p.consumeResponse(result, id)
+		default:
+		}
 		p.kill()
 		return nil, fmt.Errorf("adapter request timed out or was canceled")
 	case <-p.done:
-		return nil, errors.New("adapter process exited")
+		// The process can write a complete response and exit immediately. The
+		// read goroutine may have queued that frame just before Wait closed done;
+		// prefer the complete frame over the process-exit notification.
+		select {
+		case result := <-p.responses:
+			return p.consumeResponse(result, id)
+		default:
+			return nil, errors.New("adapter process exited")
+		}
 	case result := <-p.responses:
-		if result.err != nil {
-			p.kill()
-			if errors.Is(result.err, io.EOF) {
-				return nil, errors.New("adapter closed protocol output")
-			}
-			return nil, errors.New("adapter returned malformed protocol output")
-		}
-		if result.response.ID != id {
-			p.kill()
-			return nil, errors.New("adapter response id mismatch")
-		}
-		if result.response.ProtocolVersion != adapterproto.Version {
-			p.kill()
-			return nil, errors.New("adapter protocol version mismatch")
-		}
-		if result.response.Error != nil {
-			// Adapter-controlled error fields can echo values from request params.
-			// Keep every field private and return only a stable generic error.
-			return nil, errors.New("adapter returned an error")
-		}
-		return result.response.Result, nil
+		return p.consumeResponse(result, id)
 	}
+}
+
+func (p *process) consumeResponse(result readResult, id string) (json.RawMessage, error) {
+	if result.err != nil {
+		p.kill()
+		if errors.Is(result.err, io.EOF) {
+			return nil, errors.New("adapter closed protocol output")
+		}
+		if errors.Is(result.err, adapterproto.ErrUnsupportedProtocolVersion) {
+			return nil, result.err
+		}
+		return nil, errors.New("adapter returned malformed protocol output")
+	}
+	if result.response.ID != id {
+		p.kill()
+		return nil, errors.New("adapter response id mismatch")
+	}
+	if result.response.ProtocolVersion != adapterproto.Version {
+		p.kill()
+		return nil, adapterproto.ErrUnsupportedProtocolVersion
+	}
+	if result.response.Error != nil {
+		return nil, errors.New("adapter returned an error")
+	}
+	return result.response.Result, nil
 }
 
 func (p *process) isUnusable() bool {

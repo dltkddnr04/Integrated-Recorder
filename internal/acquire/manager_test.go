@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -46,7 +49,7 @@ func runAcquireAdapterHelper() int {
 		var response adapterproto.Response
 		switch request.Method {
 		case adapterproto.MethodDescribe:
-			descriptor := adapterproto.Descriptor{ID: "test-helper", Name: "Test Helper", Version: "1", ProtocolVersion: adapterproto.Version, Capabilities: []string{"resolve"}, InputSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "manifest_url", Control: "text", Label: "Manifest URL", Required: true}}}, ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "opaque_value", Control: "text", Label: "Opaque value"}, {Key: "opaque_secret", Control: "secret", Label: "Opaque secret"}}}, MediaTypes: []string{"hls"}}
+			descriptor := adapterproto.Descriptor{ID: "test-helper", Name: "Test Helper", Version: "1", ProtocolVersion: adapterproto.Version, Capabilities: []string{"resolve"}, InputSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "manifest_url", Control: "text", Label: "Manifest URL", Required: true}}}, ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "opaque_value", Control: "text", Label: "Opaque value"}, {Key: "opaque_secret", Control: "secret", Label: "Opaque secret"}}}, ResourceTypes: []adapterproto.ResourceType{{Type: "arbitrary-kind", ParentTypes: []string{"outer"}}, {Type: "outer"}}, MediaTypes: []string{"hls"}}
 			response, _ = adapterproto.Success(request.ID, descriptor)
 		case adapterproto.MethodResolve:
 			var params adapterproto.ResolveParams
@@ -285,10 +288,10 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 	playlistBody, _ := io.ReadAll(response.Body)
 	response.Body.Close()
 	playlist := string(playlistBody)
-	if response.StatusCode != http.StatusOK || !strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD") || !strings.Contains(playlist, "#EXT-X-MAP:") || !strings.Contains(playlist, "#EXT-X-ENDLIST") || strings.Index(playlist, "seg-00000000000000000010") > strings.Index(playlist, "seg-00000000000000000011") {
+	if response.StatusCode != http.StatusOK || !strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD") || !strings.Contains(playlist, "#EXT-X-MAP:") || !strings.Contains(playlist, "#EXT-X-ENDLIST") || strings.Index(playlist, track.Segments[0].ID) > strings.Index(playlist, track.Segments[1].ID) {
 		t.Fatalf("VOD playlist invalid:\n%s", playlist)
 	}
-	response, err = api.Client().Get(api.URL + "/api/recordings/" + recording.ID + "/play/segments/seg-00000000000000000010")
+	response, err = api.Client().Get(api.URL + "/api/recordings/" + recording.ID + "/play/segments/" + track.Segments[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,6 +305,26 @@ func TestLocalHTTPAcquireStopReloadAndVOD(t *testing.T) {
 	}
 	if strings.Contains(playlist, "#EXT-X-DISCONTINUITY") {
 		t.Fatalf("unexpected discontinuity: %s", playlist)
+	}
+}
+
+func TestCanceledResolvedRequestDoesNotPublishRecording(t *testing.T) {
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = manager.StartResolved(ctx, "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: "https://media.example/live.m3u8"}, nil, "canceled", nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StartResolved error = %v, want context canceled", err)
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("canceled request published recording: %#v", got)
 	}
 }
 
@@ -506,6 +529,143 @@ func TestExternalAdapterSubprocessAcquireReloadAndVOD(t *testing.T) {
 		}
 		if endpoint == "/api/adapters/test-helper/schema" && !strings.Contains(string(body), "manifest_url") {
 			t.Fatalf("schema response omitted adapter fields: %s", body)
+		}
+	}
+}
+
+func TestOwncastBinaryAcquireStopRestartAndVOD(t *testing.T) {
+	const firstPayload = "owncast-original-segment-one"
+	const secondPayload = "owncast-original-segment-two"
+	source := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hls/stream.m3u8":
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:40\n#EXTINF:1.25,first\nfirst.ts\n#EXTINF:2.5,second\nsecond.ts\n#EXT-X-ENDLIST\n")
+		case "/hls/first.ts":
+			_, _ = io.WriteString(w, firstPayload)
+		case "/hls/second.ts":
+			_, _ = io.WriteString(w, secondPayload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer source.Close()
+
+	_, currentFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not resolve test source location")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(currentFile), "..", ".."))
+	adapterDir := t.TempDir()
+	adapterBinary := filepath.Join(adapterDir, "integrated-recorder-adapter-owncast")
+	build := exec.Command("go", "build", "-o", adapterBinary, "./cmd/adapters/owncast")
+	build.Dir = repoRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build Owncast adapter: %v\n%s", err, output)
+	}
+
+	dataDir := t.TempDir()
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configStore, secretStore, err := pluginconfig.NewTypedFileStores(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err := pluginconfig.NewService(configStore, secretStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := adapterhost.Discover(context.Background(), adapterDir, configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := host.List(); len(got) != 1 || got[0].Status.ID != "owncast" || got[0].Status.State != "ready" {
+		host.Close()
+		t.Fatalf("actual Owncast binary was not discovered: %#v", got)
+	}
+	validateLocalFixture := func(context.Context, string) error { return nil }
+	manager, err := acquire.NewManager(store, source.Client(), host, validateLocalFixture)
+	if err != nil {
+		host.Close()
+		t.Fatal(err)
+	}
+	input, _ := json.Marshal(map[string]string{"source_url": source.URL})
+	recording, err := manager.Start(context.Background(), "owncast", input, nil, "actual adapter binary")
+	if err != nil {
+		host.Close()
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var completed *domain.Recording
+	for time.Now().Before(deadline) {
+		completed, _ = manager.Get(recording.ID)
+		if completed != nil && completed.State == domain.StateCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if completed == nil || completed.State != domain.StateCompleted {
+		manager.Close(context.Background())
+		host.Close()
+		t.Fatalf("Owncast recording did not complete: %#v", completed)
+	}
+	if err = manager.Close(context.Background()); err != nil {
+		host.Close()
+		t.Fatal(err)
+	}
+	host.Close()
+
+	// A fresh process discovers the real binary again and reloads only the
+	// self-describing recording directory before rendering the VOD projection.
+	configStore, secretStore, err = pluginconfig.NewTypedFileStores(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err = pluginconfig.NewService(configStore, secretStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err = adapterhost.Discover(context.Background(), adapterDir, configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	reloaded, err := acquire.NewManager(store, source.Client(), host, validateLocalFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, err := reloaded.Get(recording.ID)
+	if err != nil || previous.State != domain.StateCompleted || len(previous.Tracks["main"].Segments) != 2 {
+		t.Fatalf("Owncast recording reload = %#v, err=%v", previous, err)
+	}
+	api := newIPv4TestServer(t, server.New(reloaded, host, configs))
+	defer api.Close()
+	response, err := api.Client().Get(api.URL + "/api/recordings/" + recording.ID + "/play/tracks/main/playlist.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	playlistBytes, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	playlist := string(playlistBytes)
+	firstID, secondID := previous.Tracks["main"].Segments[0].ID, previous.Tracks["main"].Segments[1].ID
+	if response.StatusCode != http.StatusOK || !strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD") || strings.Index(playlist, firstID) < 0 || strings.Index(playlist, firstID) > strings.Index(playlist, secondID) || !strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("Owncast VOD playlist invalid (status %d):\n%s", response.StatusCode, playlist)
+	}
+	for index, expected := range []string{firstPayload, secondPayload} {
+		segment := previous.Tracks["main"].Segments[index]
+		segmentResponse, getErr := api.Client().Get(api.URL + "/api/recordings/" + recording.ID + "/play/segments/" + segment.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		got, _ := io.ReadAll(segmentResponse.Body)
+		segmentResponse.Body.Close()
+		if segmentResponse.StatusCode != http.StatusOK || string(got) != expected {
+			t.Fatalf("Owncast playback segment %d = %q (status %d)", index, got, segmentResponse.StatusCode)
+		}
+		digest := sha256.Sum256([]byte(expected))
+		if segment.SHA256 != fmt.Sprintf("%x", digest[:]) || segment.PayloadSize != int64(len(expected)) {
+			t.Fatalf("Owncast payload integrity mismatch: %#v", segment)
 		}
 	}
 }
