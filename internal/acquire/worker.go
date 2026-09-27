@@ -462,8 +462,11 @@ func (m *Manager) acquireInit(ctx context.Context, e *entry, source hls.Map, epo
 	return m.acquireInitUsing(ctx, e, source, epoch, discontinuitySequence, media, m.downloadObject)
 }
 
-func (m *Manager) acquireInitOnce(ctx context.Context, e *entry, source hls.Map, epoch, discontinuitySequence uint64, media adapterproto.MediaSource) (string, error) {
-	return m.acquireInitUsing(ctx, e, source, epoch, discontinuitySequence, media, m.downloadObjectOnce)
+func (m *Manager) acquireInitOnce(ctx context.Context, e *entry, source hls.Map, epoch, discontinuitySequence uint64, media adapterproto.MediaSource, expectedGeneration uint64) (string, error) {
+	download := func(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource) (storage.PayloadResult, error) {
+		return m.downloadObjectOnceAtGeneration(ctx, uri, byteRange, recordingID, relative, media, e, expectedGeneration)
+	}
+	return m.acquireInitUsing(ctx, e, source, epoch, discontinuitySequence, media, download)
 }
 
 func (m *Manager) acquireInitUsing(ctx context.Context, e *entry, source hls.Map, epoch, discontinuitySequence uint64, media adapterproto.MediaSource, download func(context.Context, string, *domain.ByteRange, string, string, adapterproto.MediaSource) (storage.PayloadResult, error)) (string, error) {
@@ -512,8 +515,11 @@ func (m *Manager) acquireMedia(ctx context.Context, e *entry, source hls.MediaSe
 	return m.acquireMediaUsing(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media, m.downloadObject)
 }
 
-func (m *Manager) acquireMediaOnce(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource) (domain.Segment, error) {
-	return m.acquireMediaUsing(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media, m.downloadObjectOnce)
+func (m *Manager) acquireMediaOnce(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource, expectedGeneration uint64) (domain.Segment, error) {
+	download := func(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource) (storage.PayloadResult, error) {
+		return m.downloadObjectOnceAtGeneration(ctx, uri, byteRange, recordingID, relative, media, e, expectedGeneration)
+	}
+	return m.acquireMediaUsing(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media, download)
 }
 
 func (m *Manager) acquireMediaUsing(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource, download func(context.Context, string, *domain.ByteRange, string, string, adapterproto.MediaSource) (storage.PayloadResult, error)) (domain.Segment, error) {
@@ -535,7 +541,19 @@ func (m *Manager) downloadObjectOnce(ctx context.Context, uri string, byteRange 
 	return m.downloadObjectAttempts(ctx, uri, byteRange, recordingID, relative, media, 1)
 }
 
+func (m *Manager) downloadObjectOnceAtGeneration(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64) (storage.PayloadResult, error) {
+	return m.downloadObjectAttemptsAtGeneration(ctx, uri, byteRange, recordingID, relative, media, 1, e, expectedGeneration)
+}
+
 func (m *Manager) downloadObjectAttempts(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, attempts int) (storage.PayloadResult, error) {
+	return m.downloadObjectAttemptsInternal(ctx, uri, byteRange, recordingID, relative, media, attempts, nil, 0)
+}
+
+func (m *Manager) downloadObjectAttemptsAtGeneration(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, attempts int, e *entry, expectedGeneration uint64) (storage.PayloadResult, error) {
+	return m.downloadObjectAttemptsInternal(ctx, uri, byteRange, recordingID, relative, media, attempts, e, expectedGeneration)
+}
+
+func (m *Manager) downloadObjectAttemptsInternal(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, attempts int, generationEntry *entry, expectedGeneration uint64) (storage.PayloadResult, error) {
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return storage.PayloadResult{}, fmt.Errorf("byte range is invalid or exceeds the %d byte payload limit", maxPayloadBytes)
 	}
@@ -552,7 +570,12 @@ func (m *Manager) downloadObjectAttempts(ctx context.Context, uri string, byteRa
 			end := byteRange.Offset + byteRange.Length - 1
 			request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, end))
 		}
-		response, err := doMediaRequest(m.client, request, media.Headers, media.ManifestURL, media.RequestPolicy)
+		var response *http.Response
+		if generationEntry != nil {
+			response, err = doMediaRequestAtGeneration(m.client, request, media.Headers, media.ManifestURL, media.RequestPolicy, generationEntry, expectedGeneration, m.fetchBoundaryHook)
+		} else {
+			response, err = doMediaRequest(m.client, request, media.Headers, media.ManifestURL, media.RequestPolicy)
+		}
 		if err == nil {
 			expected := http.StatusOK
 			if byteRange != nil {
@@ -590,6 +613,9 @@ func (m *Manager) downloadObjectAttempts(ctx context.Context, uri string, byteRa
 				last = newFetchError("segment", 0, tracked.err != nil, false)
 			}
 		} else {
+			if errors.Is(err, errStaleMediaGeneration) {
+				return storage.PayloadResult{}, errStaleMediaGeneration
+			}
 			last = newFetchError("segment", 0, true, false)
 		}
 		if last != nil && last.Retryable && attempt+1 < attempts {
@@ -1066,9 +1092,25 @@ func applyHeadersForMediaURL(request *http.Request, headers map[string]string, m
 }
 
 func doMediaRequest(client *http.Client, request *http.Request, headers map[string]string, manifestURL string, policy *adapterproto.RequestPolicy) (*http.Response, error) {
+	return doMediaRequestWithTransport(client, request, headers, manifestURL, policy, nil)
+}
+
+func doMediaRequestAtGeneration(client *http.Client, request *http.Request, headers map[string]string, manifestURL string, policy *adapterproto.RequestPolicy, e *entry, expectedGeneration uint64, beforeCheck func(uri string)) (*http.Response, error) {
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	transport := generationGuardRoundTripper{base: base, e: e, expected: expectedGeneration, beforeCheck: beforeCheck}
+	return doMediaRequestWithTransport(client, request, headers, manifestURL, policy, transport)
+}
+
+func doMediaRequestWithTransport(client *http.Client, request *http.Request, headers map[string]string, manifestURL string, policy *adapterproto.RequestPolicy, transport http.RoundTripper) (*http.Response, error) {
 	applyHeadersForMediaURL(request, headers, manifestURL, policy)
 	request.Header.Set("Accept-Encoding", "identity")
 	copyClient := *client
+	if transport != nil {
+		copyClient.Transport = transport
+	}
 	originalCheck := client.CheckRedirect
 	copyClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
 		clearHeaders(next, headers)
@@ -1084,6 +1126,26 @@ func doMediaRequest(client *http.Client, request *http.Request, headers map[stri
 		return nil
 	}
 	return copyClient.Do(request)
+}
+
+type generationGuardRoundTripper struct {
+	base        http.RoundTripper
+	e           *entry
+	expected    uint64
+	beforeCheck func(uri string)
+}
+
+func (t generationGuardRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if t.beforeCheck != nil {
+		t.beforeCheck(request.URL.String())
+	}
+	t.e.mu.Lock()
+	current := t.e.mediaGeneration
+	t.e.mu.Unlock()
+	if current != t.expected {
+		return nil, errStaleMediaGeneration
+	}
+	return t.base.RoundTrip(request)
 }
 
 func hasNonIdentityContentEncoding(header http.Header) bool {

@@ -675,13 +675,19 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	initID := ""
 	if source.Init != nil {
 		var err error
-		initID, err = s.acquireInit(source, epoch, media)
+		initID, err = s.acquireInit(source, epoch, media, generation)
 		if err != nil {
+			if errors.Is(err, errStaleMediaGeneration) {
+				return s.awaitCurrentGeneration(task)
+			}
 			return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 		}
 	}
-	segment, err := s.manager.acquireMediaOnce(s.ctx, s.e, source, epoch, ordinal, initID, firstInEpoch, media)
+	segment, err := s.manager.acquireMediaOnce(s.ctx, s.e, source, epoch, ordinal, initID, firstInEpoch, media, generation)
 	if err != nil {
+		if errors.Is(err, errStaleMediaGeneration) {
+			return s.awaitCurrentGeneration(task)
+		}
 		return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 	}
 	s.commitMu.Lock()
@@ -782,6 +788,32 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 
 var errAwaitManifest = errors.New("segment retry awaits refreshed manifest")
 
+// errStaleMediaGeneration indicates that a scheduler-owned source URI no
+// longer belongs to the recording's current media source generation.
+var errStaleMediaGeneration = errors.New("media source generation changed before fetch")
+
+// awaitCurrentGeneration records the generation that invalidated a fetch and
+// keeps any concurrently observed manifest from that generation or newer.
+// Lock order matches discovery and admission: scheduler, then entry.
+func (s *segmentScheduler) awaitCurrentGeneration(task *segmentTask) error {
+	s.mu.Lock()
+	if s.tasks[task.key] == task {
+		s.e.mu.Lock()
+		generation := s.e.mediaGeneration
+		if generation > task.requiredGeneration {
+			task.requiredGeneration = generation
+		}
+		if !task.available || !task.observed || task.observedGeneration < generation {
+			task.available = false
+			task.observed = false
+		}
+		s.e.mu.Unlock()
+		s.signalLocked()
+	}
+	s.mu.Unlock()
+	return errAwaitManifest
+}
+
 func (s *segmentScheduler) handleFetchFailure(task *segmentTask, media adapterproto.MediaSource, generation uint64, refreshCycles int, err error) error {
 	if !s.manager.shouldRefresh(media, err) {
 		return err
@@ -824,7 +856,7 @@ func (s *segmentScheduler) markRefreshing(task *segmentTask) bool {
 	return true
 }
 
-func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource) (string, error) {
+func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64) (string, error) {
 	source := *segment.Init
 	key := initIdentity(source, epoch, segment.DiscontinuitySequence)
 	s.mu.Lock()
@@ -842,7 +874,7 @@ func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, m
 	s.init[key] = flight
 	s.mu.Unlock()
 
-	id, err := s.manager.acquireInitOnce(s.ctx, s.e, source, epoch, segment.DiscontinuitySequence, media)
+	id, err := s.manager.acquireInitOnce(s.ctx, s.e, source, epoch, segment.DiscontinuitySequence, media, generation)
 	s.mu.Lock()
 	flight.id, flight.err = id, err
 	delete(s.init, key)

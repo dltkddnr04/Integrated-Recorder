@@ -64,6 +64,10 @@ type Manager struct {
 	starts     sync.WaitGroup
 	startsWait sync.Once
 	startsDone chan struct{}
+
+	// fetchBoundaryHook is a deterministic test seam for scheduler-owned
+	// generation checks. It is configured before recording goroutines start.
+	fetchBoundaryHook func(uri string)
 }
 
 var errManagerClosed = errors.New("recording manager is closed")

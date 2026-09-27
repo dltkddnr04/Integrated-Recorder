@@ -1583,3 +1583,295 @@ func newIPv4Server(t *testing.T, handler http.Handler) *httptest.Server {
 	server.Start()
 	return server
 }
+
+func TestFetchBoundaryRejectsStaleMediaGeneration(t *testing.T) {
+	var oldRequests, freshRequests atomic.Int32
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old.ts":
+			oldRequests.Add(1)
+			_, _ = io.WriteString(w, "stale")
+		case "/fresh.ts":
+			freshRequests.Add(1)
+			_, _ = io.WriteString(w, "fresh-media")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	fixture := newGenerationBoundaryFixture(t, server, hls.MediaSegment{Sequence: 17, URI: server.URL + "/old.ts", Duration: 1})
+	fixture.blockAtBoundary(t, server.URL+"/old.ts", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/new.m3u8"})
+	fixture.advanceAndAwait(t)
+	fixture.rediscoverAndCapture(t, hls.MediaSegment{Sequence: 17, URI: server.URL + "/fresh.ts", Duration: 1})
+
+	if got := oldRequests.Load(); got != 0 {
+		t.Fatalf("stale media URL was requested %d times", got)
+	}
+	if got := freshRequests.Load(); got != 1 {
+		t.Fatalf("fresh media URL request count = %d, want 1", got)
+	}
+	fixture.assertCaptured(t, "fresh-media", "")
+}
+
+func TestFetchBoundaryRejectsStaleInitGeneration(t *testing.T) {
+	var oldInitRequests, oldMediaRequests, freshInitRequests, freshMediaRequests atomic.Int32
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old-init.mp4":
+			oldInitRequests.Add(1)
+			_, _ = io.WriteString(w, "stale-init")
+		case "/old.ts":
+			oldMediaRequests.Add(1)
+			_, _ = io.WriteString(w, "stale-media")
+		case "/new-init.mp4":
+			freshInitRequests.Add(1)
+			_, _ = io.WriteString(w, "fresh-init")
+		case "/fresh.ts":
+			freshMediaRequests.Add(1)
+			_, _ = io.WriteString(w, "fresh-media")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	initial := hls.MediaSegment{Sequence: 18, URI: server.URL + "/old.ts", Duration: 1, Init: &hls.Map{URI: server.URL + "/old-init.mp4"}}
+	fixture := newGenerationBoundaryFixture(t, server, initial)
+	fixture.blockAtBoundary(t, server.URL+"/old-init.mp4", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/new.m3u8"})
+	fixture.advanceAndAwait(t)
+	fresh := hls.MediaSegment{Sequence: 18, URI: server.URL + "/fresh.ts", Duration: 1, Init: &hls.Map{URI: server.URL + "/new-init.mp4"}}
+	fixture.rediscoverAndCapture(t, fresh)
+
+	if got := oldInitRequests.Load(); got != 0 {
+		t.Fatalf("stale init URL was requested %d times", got)
+	}
+	if got := oldMediaRequests.Load(); got != 0 {
+		t.Fatalf("stale media URL was requested %d times", got)
+	}
+	if got := freshInitRequests.Load(); got != 1 {
+		t.Fatalf("fresh init URL request count = %d, want 1", got)
+	}
+	if got := freshMediaRequests.Load(); got != 1 {
+		t.Fatalf("fresh media URL request count = %d, want 1", got)
+	}
+	fixture.assertCaptured(t, "fresh-media", server.URL+"/new-init.mp4")
+}
+
+func TestFetchBoundaryRejectsStaleMediaAfterInit(t *testing.T) {
+	var initRequests, oldMediaRequests, freshMediaRequests atomic.Int32
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/shared-init.mp4":
+			initRequests.Add(1)
+			_, _ = io.WriteString(w, "shared-init")
+		case "/old.ts":
+			oldMediaRequests.Add(1)
+			_, _ = io.WriteString(w, "stale-media")
+		case "/fresh.ts":
+			freshMediaRequests.Add(1)
+			_, _ = io.WriteString(w, "fresh-media")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	sharedInit := &hls.Map{URI: server.URL + "/shared-init.mp4"}
+	initial := hls.MediaSegment{Sequence: 19, URI: server.URL + "/old.ts", Duration: 1, Init: sharedInit}
+	fixture := newGenerationBoundaryFixture(t, server, initial)
+	fixture.blockAtBoundary(t, server.URL+"/old.ts", adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/new.m3u8"})
+	if got := initRequests.Load(); got != 1 {
+		t.Fatalf("init request count before media boundary = %d, want 1", got)
+	}
+	fixture.advanceAndAwait(t)
+	fresh := hls.MediaSegment{Sequence: 19, URI: server.URL + "/fresh.ts", Duration: 1, Init: &hls.Map{URI: server.URL + "/shared-init.mp4"}}
+	fixture.rediscoverAndCapture(t, fresh)
+
+	if got := oldMediaRequests.Load(); got != 0 {
+		t.Fatalf("stale media URL was requested %d times", got)
+	}
+	if got := freshMediaRequests.Load(); got != 1 {
+		t.Fatalf("fresh media URL request count = %d, want 1", got)
+	}
+	if got := initRequests.Load(); got != 1 {
+		t.Fatalf("shared init request count = %d, want existing object to be reused", got)
+	}
+	fixture.assertCaptured(t, "fresh-media", server.URL+"/shared-init.mp4")
+}
+
+type generationBoundaryFixture struct {
+	manager   *Manager
+	e         *entry
+	scheduler *segmentScheduler
+	task      *segmentTask
+	ctx       context.Context
+	started   chan struct{}
+	release   chan struct{}
+	refreshed adapterproto.MediaSource
+}
+
+func newGenerationBoundaryFixture(t *testing.T, server *httptest.Server, initial hls.MediaSegment) *generationBoundaryFixture {
+	t.Helper()
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "feec0badfeec0badfeec0badfeec0bad"
+	recording := &domain.Recording{FormatVersion: 1, ID: id, State: domain.StateRecording, Tracks: map[string]*domain.Track{"main": {ID: "main", NextArchiveOrdinal: 2, Segments: []domain.Segment{}}}}
+	if err = store.CreateRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	e := &entry{recording: recording, media: adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/old.m3u8"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	key := segmentTaskKey{epoch: 0, sequence: initial.Sequence}
+	task := &segmentTask{key: key, source: initial, ordinal: 1, available: true, observed: true, state: segmentTaskQueued}
+	scheduler := &segmentScheduler{
+		manager: manager, e: e, ctx: ctx, cancel: cancel, changed: make(chan struct{}),
+		tasks: map[segmentTaskKey]*segmentTask{key: task}, ready: []*segmentTask{task}, init: make(map[string]*initFlight),
+		workers: minSegmentWorkers,
+		next:    2, epochMarkers: make(map[uint64]epochMarker), manifestWake: make(chan struct{}, 1),
+		latestManifestGeneration: 0, manifestGenerationSet: true,
+	}
+	scheduler.wg.Add(1)
+	return &generationBoundaryFixture{manager: manager, e: e, scheduler: scheduler, task: task, ctx: ctx}
+}
+
+func (f *generationBoundaryFixture) blockAtBoundary(t *testing.T, uri string, refreshed adapterproto.MediaSource) {
+	t.Helper()
+	f.started = make(chan struct{})
+	f.release = make(chan struct{})
+	var once sync.Once
+	f.manager.fetchBoundaryHook = func(requestURI string) {
+		if requestURI == uri {
+			once.Do(func() {
+				close(f.started)
+				<-f.release
+			})
+		}
+	}
+	t.Cleanup(func() { _ = f.scheduler.close() })
+	go f.scheduler.worker(false)
+	select {
+	case <-f.started:
+	case <-time.After(5 * time.Second):
+		close(f.release)
+		t.Fatal("acquisition did not reach the generation-guarded fetch boundary")
+	}
+	f.refreshed = refreshed
+}
+
+func (f *generationBoundaryFixture) advanceAndAwait(t *testing.T) {
+	t.Helper()
+	f.e.mu.Lock()
+	f.e.media = cloneMediaSource(f.refreshed)
+	f.e.mediaGeneration = 1
+	f.e.mu.Unlock()
+	f.scheduler.noteMediaGeneration(1)
+	close(f.release)
+	waitForTaskState(t, f.scheduler, f.task, segmentTaskAwaitManifest)
+	f.scheduler.mu.Lock()
+	state, attempt, refreshCycles := f.task.state, f.task.attempt, f.task.refreshCycles
+	f.scheduler.mu.Unlock()
+	if attempt != 0 || refreshCycles != 0 {
+		t.Fatalf("stale generation consumed retry/refresh budget: attempt=%d refreshCycles=%d", attempt, refreshCycles)
+	}
+	if f.scheduler.failure() != nil {
+		t.Fatalf("stale generation made the scheduler fatal: %v", f.scheduler.failure())
+	}
+	f.e.mu.Lock()
+	gapCount := len(f.e.recording.Gaps)
+	f.e.mu.Unlock()
+	if gapCount != 0 {
+		t.Fatalf("stale generation persisted %d gap(s)", gapCount)
+	}
+	f.scheduler.mu.Lock()
+	state, required, available, observed := f.task.state, f.task.requiredGeneration, f.task.available, f.task.observed
+	f.scheduler.mu.Unlock()
+	if state != segmentTaskAwaitManifest || required != 1 || available || observed {
+		t.Fatalf("task did not await generation 1 manifest: state=%d required=%d available=%v observed=%v", state, required, available, observed)
+	}
+}
+
+func (f *generationBoundaryFixture) rediscoverAndCapture(t *testing.T, source hls.MediaSegment) {
+	t.Helper()
+	accepted, err := f.scheduler.discoverAtGeneration(f.ctx, 0, hls.MediaPlaylist{TargetDuration: 1, Segments: []hls.MediaSegment{source}}, 1)
+	if err != nil || !accepted {
+		t.Fatalf("fresh-generation discovery accepted=%v err=%v", accepted, err)
+	}
+	waitForFixtureSegmentCount(t, f.e, 1)
+}
+
+func waitForFixtureSegmentCount(t *testing.T, e *entry, count int) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		e.mu.Lock()
+		current := e.recording.SegmentCount()
+		e.mu.Unlock()
+		if current >= count {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("recording segment count did not reach %d; got %d", count, current)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForTaskState(t *testing.T, scheduler *segmentScheduler, task *segmentTask, want segmentTaskState) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		scheduler.mu.Lock()
+		state := task.state
+		changed := scheduler.changed
+		scheduler.mu.Unlock()
+		if state == want {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("task state did not become %d; got %d", want, state)
+		case <-changed:
+		}
+	}
+}
+
+func (f *generationBoundaryFixture) assertCaptured(t *testing.T, payload, initURI string) {
+	t.Helper()
+	f.e.mu.Lock()
+	recording := clone(f.e.recording)
+	f.e.mu.Unlock()
+	track := recording.Tracks["main"]
+	if len(track.Segments) != 1 {
+		t.Fatalf("captured segment count = %d, want 1", len(track.Segments))
+	}
+	segment := track.Segments[0]
+	digest := sha256.Sum256([]byte(payload))
+	if segment.Sequence != f.task.key.sequence || segment.SourceURI != f.task.source.URI || segment.SHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatalf("captured segment metadata/payload hash = %#v", segment)
+	}
+	if len(recording.Gaps) != 0 {
+		t.Fatalf("captured segment has gap metadata: %#v", recording.Gaps)
+	}
+	if initURI == "" {
+		if segment.InitSegmentID != "" || len(track.InitSegments) != 0 {
+			t.Fatalf("unexpected init metadata: segment=%#v init=%#v", segment, track.InitSegments)
+		}
+		return
+	}
+	if len(track.InitSegments) != 1 || segment.InitSegmentID == "" || segment.InitSegmentID != track.InitSegments[0].ID || track.InitSegments[0].SourceURI != initURI {
+		t.Fatalf("captured init metadata/reference is invalid: segment=%#v init=%#v", segment, track.InitSegments)
+	}
+}
