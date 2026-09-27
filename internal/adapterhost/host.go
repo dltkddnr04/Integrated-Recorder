@@ -26,9 +26,20 @@ const binaryPrefix = "integrated-recorder-adapter-"
 const maxWorkflowTransitions = 32
 const maxActiveWorkflows = 128
 const workflowTTL = 30 * time.Minute
+const maxPendingWorkflowLifecycleEvents = 512
 
 var (
 	errAdapterDescriptorInvalid = errors.New("invalid adapter descriptor")
+	// ErrUnsupportedResourceBrowse indicates that an adapter did not declare
+	// the generic resource browsing capability.
+	ErrUnsupportedResourceBrowse = errors.New("adapter does not support resource browsing")
+)
+
+const (
+	defaultResourcePageLimit = 20
+	maxResourcePageLimit     = 50
+	maxResourceCursorBytes   = 4096
+	maxResourceQueryBytes    = 1024
 )
 
 type Status struct {
@@ -57,6 +68,8 @@ type entry struct {
 	nextRestart     time.Time
 	baseFingerprint string
 	restartRejected bool
+	disabled        bool
+	restarting      bool
 }
 
 type workflowSession struct {
@@ -71,6 +84,26 @@ type workflowSession struct {
 	transitions    int
 	continuing     bool
 	continuationID uint64
+}
+
+// WorkflowLifecycleChallenge is a redacted, structural challenge projection.
+// It never contains adapter-provided prompt text, schema defaults, or answers.
+type WorkflowLifecycleChallenge struct {
+	PromptType      string `json:"prompt_type,omitempty"`
+	FieldCount      int    `json:"field_count"`
+	HasSecretFields bool   `json:"has_secret_fields"`
+}
+
+// WorkflowLifecycleEvent reports an active workflow's terminal transition.
+// Media sources and adapter errors are intentionally not represented.
+type WorkflowLifecycleEvent struct {
+	ID         string                      `json:"id"`
+	WorkflowID string                      `json:"workflow_id"`
+	AdapterID  string                      `json:"adapter_id"`
+	State      string                      `json:"state"`
+	At         time.Time                   `json:"at"`
+	Resource   *adapterproto.ResourceRef   `json:"resource,omitempty"`
+	Challenge  *WorkflowLifecycleChallenge `json:"challenge,omitempty"`
 }
 
 type WorkflowProgress struct {
@@ -92,6 +125,8 @@ type Host struct {
 	workflows      map[string]workflowSession
 	workflowCall   uint64
 	workflowStarts int
+	lifecycleSeq   uint64
+	lifecycleQueue []WorkflowLifecycleEvent
 	closed         bool
 }
 
@@ -320,6 +355,98 @@ func (h *Host) ValidateResource(id string, ref *adapterproto.ResourceRef) error 
 	return nil
 }
 
+// BrowseResources invokes the adapter's generic resource listing or search
+// operation. Resource identifiers and attributes are passed through without
+// interpreting their platform-defined meaning.
+func (h *Host) BrowseResources(ctx context.Context, adapterID string, parent *adapterproto.ResourceRef, resourceType, query, cursor string, limit int) (adapterproto.ResourcePage, error) {
+	descriptor, err := h.Descriptor(adapterID)
+	if err != nil {
+		return adapterproto.ResourcePage{}, err
+	}
+	if !hasCapability(descriptor, adapterproto.CapabilityResourceBrowse) {
+		return adapterproto.ResourcePage{}, ErrUnsupportedResourceBrowse
+	}
+	if parent != nil {
+		if err := adapterproto.ValidateResourceRefForDescriptor(descriptor, parent); err != nil {
+			return adapterproto.ResourcePage{}, fmt.Errorf("invalid resource parent")
+		}
+	}
+	if resourceType != "" {
+		if len(resourceType) > 64 || !declaresResourceType(descriptor, resourceType) {
+			return adapterproto.ResourcePage{}, fmt.Errorf("invalid resource type")
+		}
+	}
+	if len(cursor) > maxResourceCursorBytes {
+		return adapterproto.ResourcePage{}, fmt.Errorf("resource cursor exceeds limit")
+	}
+	if len(query) > maxResourceQueryBytes {
+		return adapterproto.ResourcePage{}, fmt.Errorf("resource query exceeds limit")
+	}
+	if limit < 0 {
+		return adapterproto.ResourcePage{}, fmt.Errorf("resource page limit is invalid")
+	}
+	if limit == 0 {
+		limit = defaultResourcePageLimit
+	} else if limit > maxResourcePageLimit {
+		limit = maxResourcePageLimit
+	}
+
+	method := adapterproto.MethodResourceList
+	var params any = adapterproto.ResourceListParams{Parent: cloneResourceRef(parent), ResourceType: resourceType, Cursor: cursor, Limit: limit}
+	if query != "" {
+		method = adapterproto.MethodResourceSearch
+		params = adapterproto.ResourceSearchParams{Parent: cloneResourceRef(parent), ResourceType: resourceType, Query: query, Cursor: cursor, Limit: limit}
+	}
+	result, err := h.call(ctx, adapterID, method, params)
+	if err != nil {
+		return adapterproto.ResourcePage{}, err
+	}
+	var page adapterproto.ResourcePage
+	if err := json.Unmarshal(result, &page); err != nil || page.Items == nil {
+		return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned an invalid resource page")
+	}
+	if len(page.Items) > limit || len(page.NextCursor) > maxResourceCursorBytes {
+		return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned an invalid resource page")
+	}
+	seen := make(map[string]struct{}, len(page.Items))
+	for _, item := range page.Items {
+		if err := adapterproto.ValidateResourceRefForDescriptor(descriptor, &item.ResourceRef); err != nil {
+			return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned an invalid resource reference")
+		}
+		if !sameResourceRef(item.Parent, parent) {
+			return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned a resource outside the requested parent")
+		}
+		if resourceType != "" && item.Type != resourceType {
+			return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned a resource outside the requested type")
+		}
+		key, marshalErr := json.Marshal(item.ResourceRef)
+		if marshalErr != nil {
+			return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned an invalid resource reference")
+		}
+		if _, duplicate := seen[string(key)]; duplicate {
+			return adapterproto.ResourcePage{}, fmt.Errorf("adapter returned duplicate resources")
+		}
+		seen[string(key)] = struct{}{}
+	}
+	return page, nil
+}
+
+func declaresResourceType(descriptor adapterproto.Descriptor, resourceType string) bool {
+	for _, declared := range descriptor.ResourceTypes {
+		if declared.Type == resourceType {
+			return true
+		}
+	}
+	return false
+}
+
+func sameResourceRef(left, right *adapterproto.ResourceRef) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Type == right.Type && left.ID == right.ID && sameResourceRef(left.Parent, right.Parent)
+}
+
 func (h *Host) schemaChain(id string, resource *adapterproto.ResourceRef) ([]pluginconfig.ScopeSchema, error) {
 	if err := h.ValidateResource(id, resource); err != nil {
 		return nil, err
@@ -441,11 +568,20 @@ func (h *Host) entryFor(id string) (*entry, error) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if h.closed {
-		return nil, fmt.Errorf("adapter host is closed")
+		return nil, ErrAdapterHostClosed
 	}
 	e, ok := h.entries[id]
 	if !ok || e.descriptor == nil {
-		return nil, fmt.Errorf("adapter is unavailable")
+		return nil, ErrAdapterUnavailable
+	}
+	e.stateMu.Lock()
+	disabled, restarting := e.disabled, e.restarting
+	e.stateMu.Unlock()
+	if disabled {
+		return nil, ErrAdapterDisabled
+	}
+	if restarting {
+		return nil, ErrAdapterBusy
 	}
 	return e, nil
 }
@@ -458,9 +594,17 @@ func (h *Host) ensureProcess(ctx context.Context, e *entry) (*process, error) {
 		return nil, fmt.Errorf("adapter host is closed")
 	}
 	e.stateMu.Lock()
+	if e.disabled {
+		e.stateMu.Unlock()
+		return nil, ErrAdapterDisabled
+	}
+	if e.restarting {
+		e.stateMu.Unlock()
+		return nil, ErrAdapterBusy
+	}
 	if e.restartRejected {
 		e.stateMu.Unlock()
-		return nil, fmt.Errorf("adapter restart was rejected")
+		return nil, ErrAdapterRestartRejected
 	}
 	if e.process != nil && !e.process.isUnusable() {
 		p := e.process

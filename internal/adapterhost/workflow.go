@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -13,6 +14,10 @@ import (
 )
 
 const hostCloseTimeout = 20 * time.Second
+
+// ErrWorkflowFailed marks an adapter's explicit terminal workflow result.
+// Callers should return a generic gateway error and never expose adapter data.
+var ErrWorkflowFailed = errors.New("adapter workflow failed")
 
 func provenance(d adapterproto.Descriptor) adapterproto.AdapterProvenance {
 	return adapterproto.AdapterProvenance{ID: d.ID, Version: d.Version, ProtocolVersion: d.ProtocolVersion, Fingerprint: descriptorFingerprint(d)}
@@ -70,6 +75,14 @@ func (h *Host) BeginResolution(ctx context.Context, id string, input json.RawMes
 	var result adapterproto.ResolveWorkflowResult
 	if json.Unmarshal(raw, &result) != nil {
 		return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
+	}
+	if result.State == "error" {
+		if result.WorkflowID != wfID {
+			return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
+		}
+		eventResource := safeWorkflowResource(d, result.Resource, resource)
+		h.recordWorkflowLifecycle(id, wfID, "failed", eventResource, result.Challenge)
+		return WorkflowProgress{}, ErrWorkflowFailed
 	}
 	if err = h.validateWorkflowResult(d, result, wfID, resource); err != nil {
 		return WorkflowProgress{}, err
@@ -252,6 +265,14 @@ func (h *Host) validateWorkflowResult(d adapterproto.Descriptor, result adapterp
 
 func (h *Host) advanceWorkflow(ctx context.Context, d adapterproto.Descriptor, session workflowSession, result adapterproto.ResolveWorkflowResult) (WorkflowProgress, error) {
 	for {
+		if result.State == "error" {
+			if result.WorkflowID != session.workflowID {
+				return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
+			}
+			resource := safeWorkflowResource(d, result.Resource, session.resource)
+			h.finishWorkflowLifecycle(session, "failed", resource, result.Challenge)
+			return WorkflowProgress{}, ErrWorkflowFailed
+		}
 		if session.continuing && !h.continuationActive(session) {
 			return WorkflowProgress{}, fmt.Errorf("workflow canceled")
 		}
@@ -319,6 +340,16 @@ func (h *Host) advanceWorkflow(ctx context.Context, d adapterproto.Descriptor, s
 		session.progress = progress
 		session.updatedAt = now
 		h.mu.Lock()
+		if !h.workflowGenerationCurrentLocked(session) {
+			if current, exists := h.workflows[result.WorkflowID]; exists && current.generation == session.generation {
+				h.removeWorkflowLocked(result.WorkflowID, current, "expired")
+			}
+			h.mu.Unlock()
+			if newID := interactionID(progress); newID != "" && h.interactions != nil {
+				h.interactions.Remove(newID)
+			}
+			return WorkflowProgress{}, errAdapterGenerationChanged
+		}
 		if existing, exists := h.workflows[result.WorkflowID]; exists {
 			if session.continuing && (!existing.continuing || existing.continuationID != session.continuationID) {
 				h.mu.Unlock()
@@ -348,7 +379,7 @@ func (h *Host) advanceWorkflow(ctx context.Context, d adapterproto.Descriptor, s
 		h.workflows[result.WorkflowID] = session
 		h.mu.Unlock()
 	} else {
-		h.removeWorkflow(result.WorkflowID)
+		h.removeWorkflow(result.WorkflowID, "resolved")
 	}
 	return progress, nil
 }
@@ -374,6 +405,12 @@ func (h *Host) reserveWorkflow() (func(), error) {
 	if h.closed {
 		return nil, fmt.Errorf("adapter host is closed")
 	}
+	// Keep one terminal-event slot available for every active or in-flight
+	// workflow. This provides backpressure if the management history writer is
+	// unavailable instead of allowing terminal-event loss when the queue fills.
+	if len(h.lifecycleQueue)+len(h.workflows)+h.workflowStarts >= maxPendingWorkflowLifecycleEvents {
+		return nil, fmt.Errorf("too many pending workflow history events")
+	}
 	if len(h.workflows)+h.workflowStarts >= maxActiveWorkflows {
 		return nil, fmt.Errorf("too many active workflows")
 	}
@@ -392,32 +429,173 @@ func (h *Host) reserveWorkflow() (func(), error) {
 func (h *Host) cleanupWorkflowsLocked(now time.Time) {
 	for id, session := range h.workflows {
 		if now.Sub(session.updatedAt) > workflowTTL {
-			h.removeWorkflowLocked(id, session)
+			h.removeWorkflowLocked(id, session, "expired")
 		}
 	}
-	h.interactions.Cleanup()
+	if h.interactions != nil {
+		h.interactions.Cleanup()
+	}
 }
 
-func (h *Host) removeWorkflowLocked(id string, session workflowSession) {
+func (h *Host) removeWorkflowLocked(id string, session workflowSession, terminalState string) {
 	delete(h.workflows, id)
+	h.queueWorkflowLifecycleLocked(session.adapterID, session.workflowID, terminalState, session.resource, session.progress.Challenge)
 	if session.cancel != nil {
 		session.cancel()
 	}
-	if interaction := interactionID(session.progress); interaction != "" {
+	if interaction := interactionID(session.progress); interaction != "" && h.interactions != nil {
 		h.interactions.Remove(interaction)
 	}
 }
 
-func (h *Host) removeWorkflow(id string) {
+func (h *Host) removeWorkflow(id, terminalState string) {
 	h.mu.Lock()
 	if session, ok := h.workflows[id]; ok {
-		h.removeWorkflowLocked(id, session)
+		h.removeWorkflowLocked(id, session, terminalState)
 	}
 	h.mu.Unlock()
 }
 
 func (h *Host) expireWorkflow(id string) {
-	h.removeWorkflow(id)
+	h.removeWorkflow(id, "expired")
+}
+
+// safeWorkflowResource uses only a descriptor-validated opaque reference. If
+// an adapter error result contains an invalid resource, retain the validated
+// resource already known to the workflow instead.
+func safeWorkflowResource(descriptor adapterproto.Descriptor, candidate, fallback *adapterproto.ResourceRef) *adapterproto.ResourceRef {
+	if candidate != nil && adapterproto.ValidateResourceRefForDescriptor(descriptor, candidate) == nil {
+		return cloneResourceRef(candidate)
+	}
+	return cloneResourceRef(fallback)
+}
+
+func (h *Host) recordWorkflowLifecycle(adapterID, workflowID, state string, resource *adapterproto.ResourceRef, challenge *adapterproto.WorkflowChallenge) {
+	h.mu.Lock()
+	h.queueWorkflowLifecycleLocked(adapterID, workflowID, state, resource, challenge)
+	h.mu.Unlock()
+}
+
+func (h *Host) finishWorkflowLifecycle(session workflowSession, state string, resource *adapterproto.ResourceRef, challenge *adapterproto.WorkflowChallenge) {
+	h.mu.Lock()
+	if current, exists := h.workflows[session.workflowID]; exists {
+		if current.generation == session.generation {
+			h.removeWorkflowLocked(session.workflowID, current, state)
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+		return
+	}
+	// A continuing session that disappeared has already been canceled or
+	// expired by another operation. Do not race that terminal event with a
+	// second adapter-result event.
+	if session.continuing {
+		h.mu.Unlock()
+		return
+	}
+	h.queueWorkflowLifecycleLocked(session.adapterID, session.workflowID, state, resource, challenge)
+	h.mu.Unlock()
+}
+
+func (h *Host) queueWorkflowLifecycleLocked(adapterID, workflowID, state string, resource *adapterproto.ResourceRef, challenge *adapterproto.WorkflowChallenge) {
+	if workflowID == "" || (state != "resolved" && state != "canceled" && state != "expired" && state != "failed") {
+		return
+	}
+	h.lifecycleSeq++
+	event := WorkflowLifecycleEvent{
+		ID:         fmt.Sprintf("%s-%d", workflowID, h.lifecycleSeq),
+		WorkflowID: workflowID,
+		AdapterID:  adapterID,
+		State:      state,
+		At:         time.Now().UTC(),
+		Resource:   cloneResourceRef(resource),
+		Challenge:  summarizeWorkflowChallenge(challenge),
+	}
+	if len(h.lifecycleQueue) >= maxPendingWorkflowLifecycleEvents {
+		copy(h.lifecycleQueue, h.lifecycleQueue[1:])
+		h.lifecycleQueue = h.lifecycleQueue[:len(h.lifecycleQueue)-1]
+	}
+	h.lifecycleQueue = append(h.lifecycleQueue, event)
+}
+
+func summarizeWorkflowChallenge(challenge *adapterproto.WorkflowChallenge) *WorkflowLifecycleChallenge {
+	if challenge == nil {
+		return nil
+	}
+	fieldCount := len(challenge.Schema.Fields)
+	hasSecret := false
+	for _, field := range challenge.Schema.Fields {
+		if field.Control == "secret" {
+			hasSecret = true
+			break
+		}
+	}
+	if fieldCount == 0 && challenge.Prompt != nil {
+		fieldCount = len(challenge.Prompt.Fields)
+		for _, field := range challenge.Prompt.Fields {
+			if field.Control == "secret" {
+				hasSecret = true
+				break
+			}
+		}
+	}
+	if fieldCount > 256 {
+		fieldCount = 256
+	}
+	summary := &WorkflowLifecycleChallenge{FieldCount: fieldCount, HasSecretFields: hasSecret}
+	if challenge.Prompt != nil {
+		switch challenge.Prompt.Type {
+		case "action", "prompt", "secret_prompt", "navigate", "display", "status", "complete", "error":
+			summary.PromptType = challenge.Prompt.Type
+		}
+	}
+	return summary
+}
+
+// PendingWorkflowLifecycleEvents returns answer-free terminal events in
+// queue order. Event IDs remain stable until the corresponding acknowledgement.
+func (h *Host) PendingWorkflowLifecycleEvents() []WorkflowLifecycleEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	items := make([]WorkflowLifecycleEvent, len(h.lifecycleQueue))
+	for i, event := range h.lifecycleQueue {
+		items[i] = cloneWorkflowLifecycleEvent(event)
+	}
+	return items
+}
+
+// AckWorkflowLifecycleEvent removes one event only after its consumer has
+// persisted it. Unknown IDs are harmless and return false.
+func (h *Host) AckWorkflowLifecycleEvent(id string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, event := range h.lifecycleQueue {
+		if event.ID == id {
+			copy(h.lifecycleQueue[i:], h.lifecycleQueue[i+1:])
+			h.lifecycleQueue = h.lifecycleQueue[:len(h.lifecycleQueue)-1]
+			return true
+		}
+	}
+	return false
+}
+
+// DiscardWorkflowLifecycleEvents is used when no management history store is
+// configured. It keeps the bounded in-memory queue from accumulating forever.
+func (h *Host) DiscardWorkflowLifecycleEvents() {
+	h.mu.Lock()
+	h.lifecycleQueue = nil
+	h.mu.Unlock()
+}
+
+func cloneWorkflowLifecycleEvent(event WorkflowLifecycleEvent) WorkflowLifecycleEvent {
+	copy := event
+	copy.Resource = cloneResourceRef(event.Resource)
+	if event.Challenge != nil {
+		challenge := *event.Challenge
+		copy.Challenge = &challenge
+	}
+	return copy
 }
 
 func (h *Host) Workflow(id string) (WorkflowProgress, error) {
@@ -434,6 +612,74 @@ func (h *Host) Workflow(id string) (WorkflowProgress, error) {
 	return cloneProgress(session.progress), nil
 }
 
+// WorkflowChallengeSummary contains only bounded structural information about
+// an active challenge. Adapter-provided prompt text, schema defaults, answer
+// values, and media source data are intentionally omitted because those fields
+// are not guaranteed to be safe for a workflow-list response.
+type WorkflowChallengeSummary struct {
+	PromptType      string `json:"prompt_type,omitempty"`
+	FieldCount      int    `json:"field_count"`
+	HasSecretFields bool   `json:"has_secret_fields"`
+}
+
+// WorkflowSummary is the safe management-plane projection of an active
+// workflow. It deliberately does not contain WorkflowProgress.
+type WorkflowSummary struct {
+	WorkflowID string                    `json:"workflow_id"`
+	AdapterID  string                    `json:"adapter_id"`
+	State      string                    `json:"state"`
+	Resource   *adapterproto.ResourceRef `json:"resource,omitempty"`
+	Challenge  *WorkflowChallengeSummary `json:"challenge,omitempty"`
+	CreatedAt  time.Time                 `json:"created_at"`
+	UpdatedAt  time.Time                 `json:"updated_at"`
+	ExpiresAt  time.Time                 `json:"expires_at"`
+	InProgress bool                      `json:"in_progress"`
+}
+
+// ListWorkflows returns active workflow summaries ordered by most recently
+// updated first. Expired sessions are removed under the same lock and through
+// the same cleanup path used by other workflow operations.
+func (h *Host) ListWorkflows() []WorkflowSummary {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cleanupWorkflowsLocked(time.Now().UTC())
+
+	out := make([]WorkflowSummary, 0, len(h.workflows))
+	for _, session := range h.workflows {
+		item := WorkflowSummary{
+			WorkflowID: session.workflowID,
+			AdapterID:  session.adapterID,
+			State:      session.progress.State,
+			Resource:   cloneResourceRef(session.resource),
+			CreatedAt:  session.createdAt,
+			UpdatedAt:  session.updatedAt,
+			ExpiresAt:  session.updatedAt.Add(workflowTTL),
+			InProgress: session.continuing,
+		}
+		if challenge := session.progress.Challenge; challenge != nil {
+			summary := &WorkflowChallengeSummary{FieldCount: len(challenge.Schema.Fields)}
+			for _, field := range challenge.Schema.Fields {
+				if field.Control == "secret" {
+					summary.HasSecretFields = true
+					break
+				}
+			}
+			if prompt := challenge.Prompt; prompt != nil {
+				summary.PromptType = prompt.Type
+			}
+			item.Challenge = summary
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].WorkflowID < out[j].WorkflowID
+		}
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
+}
+
 func cloneProgress(progress WorkflowProgress) WorkflowProgress {
 	data, _ := json.Marshal(progress)
 	var copy WorkflowProgress
@@ -446,7 +692,7 @@ func (h *Host) CancelWorkflow(id string) error {
 	h.cleanupWorkflowsLocked(time.Now().UTC())
 	session, ok := h.workflows[id]
 	if ok {
-		h.removeWorkflowLocked(id, session)
+		h.removeWorkflowLocked(id, session, "canceled")
 	}
 	h.mu.Unlock()
 	if !ok {
@@ -572,6 +818,14 @@ func (h *Host) ContinueResolutionFields(ctx context.Context, id string, values m
 	var result adapterproto.ResolveWorkflowResult
 	if json.Unmarshal(raw, &result) != nil {
 		return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
+	}
+	if result.State == "error" {
+		if result.WorkflowID != id {
+			return WorkflowProgress{}, fmt.Errorf("adapter returned invalid workflow result")
+		}
+		resource := safeWorkflowResource(d, result.Resource, session.resource)
+		h.finishWorkflowLifecycle(session, "failed", resource, result.Challenge)
+		return WorkflowProgress{}, ErrWorkflowFailed
 	}
 	if err = h.validateWorkflowResult(d, result, id, session.resource); err != nil {
 		return WorkflowProgress{}, err
@@ -989,7 +1243,7 @@ func (h *Host) Close() {
 	}
 	h.closed = true
 	for id, session := range h.workflows {
-		h.removeWorkflowLocked(id, session)
+		h.removeWorkflowLocked(id, session, "canceled")
 	}
 	entries := make([]*entry, 0, len(h.entries))
 	for _, e := range h.entries {

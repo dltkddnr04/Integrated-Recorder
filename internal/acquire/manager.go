@@ -72,6 +72,14 @@ type Manager struct {
 
 var errManagerClosed = errors.New("recording manager is closed")
 
+// ErrActiveRecording is returned when a management operation attempts to
+// delete a recording whose acquisition worker is still active.
+var ErrActiveRecording = errors.New("active recording cannot be deleted")
+
+// ErrListLimit is returned when a bounded management snapshot would exceed
+// the caller's maximum recording count.
+var ErrListLimit = errors.New("recording list exceeds management limit")
+
 func NewManager(store *storage.Store, client *http.Client, resolver Resolver, validate SourceValidator) (*Manager, error) {
 	if store == nil {
 		return nil, fmt.Errorf("storage is required")
@@ -237,6 +245,31 @@ func (m *Manager) Stop(id string) (*domain.Recording, error) {
 	return recording, err
 }
 
+// Delete removes one inactive recording from the manager registry and its
+// archive. The registry lock keeps concurrent list/get/start operations from
+// observing a half-removed entry; the entry lock serializes against worker
+// metadata commits. Active acquisitions must be stopped explicitly first.
+func (m *Manager) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.entries[id]
+	if !ok {
+		// Store deletion is idempotent and also handles a tombstone left by an
+		// interrupted previous delete.
+		return m.store.DeleteRecordingData(id)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.recording == nil || e.recording.State == domain.StateRecording {
+		return ErrActiveRecording
+	}
+	if err := m.store.DeleteRecordingData(id); err != nil {
+		return err
+	}
+	delete(m.entries, id)
+	return nil
+}
+
 // Close stops admission of new work, cancels active workers and waits for
 // their durable terminal state. The caller supplies the overall shutdown
 // deadline; a timed-out call may be repeated to continue waiting.
@@ -331,6 +364,72 @@ func (m *Manager) List() []*domain.Recording {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
 	return result
+}
+
+// ListForManagement returns a bounded, read-only snapshot for management
+// queries. It rejects oversized collections before cloning any recording,
+// releases the manager lock before acquiring entry locks, and returns no
+// partial snapshot when the caller's context is canceled.
+func (m *Manager) ListForManagement(ctx context.Context, max int) ([]*domain.Recording, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.RLock()
+	if len(m.entries) > max {
+		m.mu.RUnlock()
+		return nil, ErrListLimit
+	}
+	entries := make([]*entry, 0, len(m.entries))
+	for _, e := range m.entries {
+		if err := ctx.Err(); err != nil {
+			m.mu.RUnlock()
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	m.mu.RUnlock()
+
+	result := make([]*domain.Recording, 0, len(entries))
+	lockRetry := time.NewTicker(time.Millisecond)
+	defer lockRetry.Stop()
+	for _, e := range entries {
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if e.mu.TryLock() {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-lockRetry.C:
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			return nil, err
+		}
+		recording := clone(e.recording)
+		e.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if recording == nil {
+			return nil, errors.New("recording snapshot could not be copied")
+		}
+		result = append(result, recording)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Keep List's newest-first ordering and equivalent timestamp tie behavior.
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (m *Manager) Store() *storage.Store { return m.store }

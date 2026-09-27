@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -97,7 +98,14 @@ func runHelperAdapter() int {
 			if variant == "resources" {
 				resourceTypes = append(resourceTypes, adapterproto.ResourceType{Type: "alpha"})
 			}
-			if mode == "required_config" || mode == "required_inherited" || mode == "workflow_required" || mode == "workflow_cancel" || mode == "workflow_default" {
+			if strings.HasPrefix(mode, "browse") {
+				capabilities = append(capabilities, adapterproto.CapabilityResourceBrowse)
+				resourceTypes = []adapterproto.ResourceType{
+					{Type: "alpha"},
+					{Type: "beta", ParentTypes: []string{"alpha"}},
+				}
+			}
+			if mode == "required_config" || mode == "required_inherited" || mode == "workflow_required" || mode == "workflow_cancel" || mode == "workflow_default" || mode == "workflow_error" {
 				configurationSchema.Fields = []adapterproto.Field{{Key: "required_setting", Control: "text", Label: "Required setting", Required: true}}
 			}
 			if mode == "required_inherited" {
@@ -107,11 +115,60 @@ func runHelperAdapter() int {
 					{Type: "beta", ParentTypes: []string{"alpha"}, ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}}},
 				}
 			}
-			if mode == "workflow_required" || mode == "workflow_cancel" || mode == "workflow_default" {
+			if mode == "workflow_required" || mode == "workflow_cancel" || mode == "workflow_default" || mode == "workflow_error" {
 				capabilities = []string{adapterproto.CapabilityResolveWorkflow}
 			}
 			descriptor := adapterproto.Descriptor{ID: os.Getenv("IR_ADAPTER_ID"), Name: "Test adapter", Version: version, ProtocolVersion: protocolVersion, Capabilities: capabilities, InputSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "manifest_url", Control: "text", Label: "Manifest URL", Required: true}}}, ConfigurationSchema: configurationSchema, ResourceTypes: resourceTypes, MediaTypes: []string{"hls"}}
 			response, _ = adapterproto.Success(request.ID, descriptor)
+		case adapterproto.MethodResourceList, adapterproto.MethodResourceSearch:
+			marker := os.Getenv("IR_ADAPTER_MARKER")
+			if marker != "" {
+				file, openErr := os.OpenFile(marker, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+				if openErr != nil {
+					return 8
+				}
+				_, _ = fmt.Fprintf(file, "%s %s\n", request.Method, request.Params)
+				_ = file.Close()
+			}
+			if !strings.HasPrefix(mode, "browse") {
+				response = adapterproto.Failure(request.ID, "unsupported_method", "unsupported", nil)
+				break
+			}
+			var params adapterproto.ResourceListParams
+			if request.Method == adapterproto.MethodResourceSearch {
+				var search adapterproto.ResourceSearchParams
+				_ = json.Unmarshal(request.Params, &search)
+				params = adapterproto.ResourceListParams{Parent: search.Parent, ResourceType: search.ResourceType, Cursor: search.Cursor, Limit: search.Limit}
+			} else {
+				_ = json.Unmarshal(request.Params, &params)
+			}
+			item := adapterproto.Resource{ResourceRef: adapterproto.ResourceRef{Type: "alpha", ID: "root"}, DisplayName: "Root", Attributes: map[string]json.RawMessage{"opaque": json.RawMessage(`{"rank":3}`)}}
+			if params.Parent != nil {
+				item = adapterproto.Resource{ResourceRef: adapterproto.ResourceRef{Type: "beta", ID: "child", Parent: params.Parent}, DisplayName: "Child", Attributes: map[string]json.RawMessage{"opaque": json.RawMessage(`{"rank":4}`)}}
+			}
+			if params.ResourceType != "" && params.ResourceType != item.Type {
+				item = adapterproto.Resource{}
+			}
+			items := []adapterproto.Resource{}
+			if item.Type != "" {
+				items = append(items, item)
+			}
+			if mode == "browse_bad_parent" && len(items) > 0 {
+				items[0].Parent = &adapterproto.ResourceRef{Type: "alpha", ID: "other"}
+			}
+			if mode == "browse_bad_ref" && len(items) > 0 {
+				items[0].Type = "gamma"
+			}
+			if mode == "browse_duplicate" && len(items) > 0 {
+				items = append(items, items[0])
+			}
+			if mode == "browse_over_limit" {
+				items = []adapterproto.Resource{
+					{ResourceRef: adapterproto.ResourceRef{Type: "alpha", ID: "root-1"}},
+					{ResourceRef: adapterproto.ResourceRef{Type: "alpha", ID: "root-2"}},
+				}
+			}
+			response, _ = adapterproto.Success(request.ID, adapterproto.ResourcePage{Items: items, NextCursor: "next-page"})
 		case adapterproto.MethodResolveBegin:
 			var params adapterproto.ResolveBeginParams
 			_ = json.Unmarshal(request.Params, &params)
@@ -125,6 +182,12 @@ func runHelperAdapter() int {
 			}
 			response, _ = adapterproto.Success(request.ID, adapterproto.ResolveWorkflowResult{State: "configuration_required", WorkflowID: params.WorkflowID, Challenge: challenge})
 		case adapterproto.MethodResolveContinue:
+			if mode == "workflow_error" {
+				var params adapterproto.ResolveContinueParams
+				_ = json.Unmarshal(request.Params, &params)
+				response, _ = adapterproto.Success(request.ID, adapterproto.ResolveWorkflowResult{State: "error", WorkflowID: params.WorkflowID})
+				break
+			}
 			if mode == "workflow_cancel" {
 				marker := os.Getenv("IR_ADAPTER_MARKER")
 				if marker != "" {
@@ -223,7 +286,7 @@ func runHelperAdapter() int {
 			time.Sleep(30 * time.Second)
 			return 0
 		}
-		if request.Method == adapterproto.MethodShutdown || mode == "exitafterdescribe" && request.Method == adapterproto.MethodDescribe {
+		if request.Method == adapterproto.MethodShutdown || mode == "exitafterdescribe" && request.Method == adapterproto.MethodDescribe || mode == "browse_exitafterlist" && request.Method == adapterproto.MethodResourceList {
 			return 0
 		}
 	}
@@ -245,6 +308,155 @@ func TestDiscoverExecutableAndIgnoresNonExecutable(t *testing.T) {
 	got, err := host.Get("ready")
 	if err != nil || got.Descriptor == nil || got.Descriptor.Name != "Test adapter" {
 		t.Fatalf("Get = %#v, %v", got, err)
+	}
+}
+
+func TestBrowseResourcesDispatchesListAndSearchWithOpaqueData(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "calls")
+	writeAdapterWithMarker(t, dir, "browse", "browse", marker)
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	page, err := host.BrowseResources(context.Background(), "browse", nil, "alpha", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Type != "alpha" || page.Items[0].ID != "root" || string(page.Items[0].Attributes["opaque"]) != `{"rank":3}` || page.NextCursor != "next-page" {
+		t.Fatalf("list page = %#v", page)
+	}
+	parent := &adapterproto.ResourceRef{Type: "alpha", ID: "root"}
+	page, err = host.BrowseResources(context.Background(), "browse", parent, "beta", "opaque query", "cursor-in", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Type != "beta" || page.Items[0].Parent == nil || page.Items[0].Parent.ID != "root" {
+		t.Fatalf("search page = %#v", page)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("adapter calls = %q", data)
+	}
+	if !strings.HasPrefix(lines[0], adapterproto.MethodResourceList+" ") || !strings.HasPrefix(lines[1], adapterproto.MethodResourceSearch+" ") {
+		t.Fatalf("adapter methods = %q", lines)
+	}
+	var listParams adapterproto.ResourceListParams
+	if err = json.Unmarshal([]byte(strings.TrimPrefix(lines[0], adapterproto.MethodResourceList+" ")), &listParams); err != nil {
+		t.Fatal(err)
+	}
+	if listParams.Limit != 20 || listParams.ResourceType != "alpha" {
+		t.Fatalf("list params = %#v", listParams)
+	}
+	var searchParams adapterproto.ResourceSearchParams
+	if err = json.Unmarshal([]byte(strings.TrimPrefix(lines[1], adapterproto.MethodResourceSearch+" ")), &searchParams); err != nil {
+		t.Fatal(err)
+	}
+	if searchParams.Limit != 50 || searchParams.Query != "opaque query" || searchParams.Cursor != "cursor-in" || searchParams.Parent == nil || searchParams.Parent.ID != "root" {
+		t.Fatalf("search params = %#v", searchParams)
+	}
+}
+
+func TestBrowseResourcesUnsupportedCapabilityDoesNotInvokeAdapter(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "calls")
+	writeAdapterWithMarker(t, dir, "normal", "plain", marker)
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	if _, err = host.BrowseResources(context.Background(), "plain", nil, "", "", "", 10); !errors.Is(err, ErrUnsupportedResourceBrowse) {
+		t.Fatalf("unsupported error = %v", err)
+	}
+	if _, err = os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("adapter was invoked for unsupported capability; marker stat error = %v", err)
+	}
+}
+
+func TestBrowseResourcesRejectsInvalidInputAndPages(t *testing.T) {
+	tests := []struct {
+		name     string
+		mode     string
+		parent   *adapterproto.ResourceRef
+		typeName string
+		query    string
+		cursor   string
+		limit    int
+	}{
+		{name: "undeclared parent", mode: "browse", parent: &adapterproto.ResourceRef{Type: "gamma", ID: "x"}},
+		{name: "undeclared requested type", mode: "browse", typeName: "gamma"},
+		{name: "long query", mode: "browse", query: strings.Repeat("q", maxResourceQueryBytes+1)},
+		{name: "long cursor", mode: "browse", cursor: strings.Repeat("c", maxResourceCursorBytes+1)},
+		{name: "negative limit", mode: "browse", limit: -1},
+		{name: "outside parent", mode: "browse_bad_parent", parent: &adapterproto.ResourceRef{Type: "alpha", ID: "root"}, typeName: "beta", limit: 2},
+		{name: "undeclared returned ref", mode: "browse_bad_ref", limit: 2},
+		{name: "duplicate refs", mode: "browse_duplicate", limit: 2},
+		{name: "over limit", mode: "browse_over_limit", limit: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeAdapter(t, dir, binaryPrefix+"browse", tt.mode, "browse", true)
+			host, err := Discover(context.Background(), dir, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer host.Close()
+			_, err = host.BrowseResources(context.Background(), "browse", tt.parent, tt.typeName, tt.query, tt.cursor, tt.limit)
+			if err == nil {
+				t.Fatal("expected request or page rejection")
+			}
+		})
+	}
+}
+
+func TestBrowseResourcesRecoversThroughSupervisedProcessRestart(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "started")
+	callLog := filepath.Join(dir, "calls")
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nif [ ! -f " + shellQuote(marker) + " ]; then : > " + shellQuote(marker) + "; IR_ADAPTER_HELPER=1 IR_ADAPTER_MODE=browse_exitafterlist IR_ADAPTER_ID=browse IR_ADAPTER_MARKER=" + shellQuote(callLog) + " exec " + shellQuote(binary) + "; fi\nIR_ADAPTER_HELPER=1 IR_ADAPTER_MODE=browse IR_ADAPTER_ID=browse IR_ADAPTER_MARKER=" + shellQuote(callLog) + " exec " + shellQuote(binary) + "\n"
+	if err = os.WriteFile(filepath.Join(dir, binaryPrefix+"browse"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	first, err := host.BrowseResources(context.Background(), "browse", nil, "alpha", "", "", 1)
+	if err != nil || len(first.Items) != 1 {
+		t.Fatalf("first browse = %#v, %v", first, err)
+	}
+	var second adapterproto.ResourcePage
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		second, err = host.BrowseResources(context.Background(), "browse", nil, "alpha", "", "", 1)
+		if err == nil && len(second.Items) == 1 {
+			break
+		}
+		// The first call after a just-exited child may observe EOF before the
+		// supervisor has marked it unusable. The following call must recover
+		// through the normal bounded restart path.
+		time.Sleep(120 * time.Millisecond)
+	}
+	if err != nil || len(second.Items) != 1 {
+		t.Fatalf("browse after supervised restart = %#v, %v", second, err)
+	}
+	adapter, err := host.Get("browse")
+	if err != nil || adapter.Status.Generation < 2 || adapter.Status.State != "ready" {
+		t.Fatalf("restarted adapter = %#v, %v", adapter.Status, err)
 	}
 }
 
@@ -594,6 +806,15 @@ func TestWorkflowCleanupLimitsAndCumulativeTransitionBound(t *testing.T) {
 	}
 }
 
+func TestWorkflowReservationBackpressuresWhenLifecycleQueueIsFull(t *testing.T) {
+	host := &Host{
+		lifecycleQueue: make([]WorkflowLifecycleEvent, maxPendingWorkflowLifecycleEvents),
+	}
+	if _, err := host.reserveWorkflow(); err == nil {
+		t.Fatal("workflow reservation succeeded with a full lifecycle queue")
+	}
+}
+
 func TestCancelWorkflowCancelsInFlightAdapterContinuation(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "continuing")
@@ -665,6 +886,10 @@ func TestWorkflowExpiresWhenAdapterGenerationChanges(t *testing.T) {
 	}
 	if _, err := host.Workflow(session.workflowID); err == nil {
 		t.Fatal("stale workflow survived process restart")
+	}
+	events := host.PendingWorkflowLifecycleEvents()
+	if len(events) != 1 || events[0].WorkflowID != session.workflowID || events[0].State != "expired" {
+		t.Fatalf("generation mismatch lifecycle events = %#v", events)
 	}
 }
 

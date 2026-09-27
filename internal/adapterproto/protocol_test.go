@@ -36,6 +36,46 @@ func TestRequestResponseFramesAndStructuredError(t *testing.T) {
 	}
 }
 
+func TestResourceBrowseRequestAndPageWireTypes(t *testing.T) {
+	parent := &ResourceRef{Type: "opaque.alpha", ID: "parent-id"}
+	list, err := json.Marshal(ResourceListParams{Parent: parent, ResourceType: "opaque.beta", Cursor: "cursor-1", Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listDecoded ResourceListParams
+	if err = json.Unmarshal(list, &listDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if listDecoded.Parent == nil || listDecoded.Parent.Type != parent.Type || listDecoded.Parent.ID != parent.ID || listDecoded.ResourceType != "opaque.beta" || listDecoded.Cursor != "cursor-1" || listDecoded.Limit != 20 {
+		t.Fatalf("list params round trip = %#v", listDecoded)
+	}
+
+	search, err := json.Marshal(ResourceSearchParams{Parent: parent, ResourceType: "opaque.beta", Query: "opaque query", Cursor: "cursor-2", Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var searchDecoded ResourceSearchParams
+	if err = json.Unmarshal(search, &searchDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if searchDecoded.Parent == nil || searchDecoded.Query != "opaque query" || searchDecoded.Limit != 50 {
+		t.Fatalf("search params round trip = %#v", searchDecoded)
+	}
+
+	page := ResourcePage{Items: []Resource{{ResourceRef: ResourceRef{Type: "opaque.beta", ID: "item", Parent: parent}, DisplayName: "Example", Attributes: map[string]json.RawMessage{"opaque": json.RawMessage(`{"nested":[1,true]}`)}}}, NextCursor: "next"}
+	wire, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pageDecoded ResourcePage
+	if err = json.Unmarshal(wire, &pageDecoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(pageDecoded.Items) != 1 || pageDecoded.Items[0].Attributes["opaque"] == nil || string(pageDecoded.Items[0].Attributes["opaque"]) != `{"nested":[1,true]}` || pageDecoded.NextCursor != "next" {
+		t.Fatalf("resource page round trip = %#v", pageDecoded)
+	}
+}
+
 func TestRejectsUnsupportedVersionsMalformedAndOversizedFrames(t *testing.T) {
 	for name, line := range map[string]string{"unsupported": `{"protocol_version":2,"id":"1","method":"describe"}` + "\n", "malformed": "{bad json}\n", "oversized": strings.Repeat("x", MaxFrameBytes+10) + "\n"} {
 		t.Run(name, func(t *testing.T) {

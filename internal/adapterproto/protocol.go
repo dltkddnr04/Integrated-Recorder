@@ -32,6 +32,7 @@ const (
 	CapabilityEvents          = "events"
 	CapabilityRefresh         = "refresh"
 	CapabilityResolveWorkflow = "resolve_workflow"
+	CapabilityResourceBrowse  = "resource_browse"
 )
 
 const (
@@ -47,6 +48,8 @@ const (
 	MethodMetadata            = "metadata"
 	MethodEvents              = "events"
 	MethodRefresh             = "refresh"
+	MethodResourceList        = "resource.list"
+	MethodResourceSearch      = "resource.search"
 )
 
 type Request struct {

@@ -195,6 +195,17 @@ func (s *Store) LoadAll() ([]*domain.Recording, error) {
 	}
 	var recordings []*domain.Recording
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".deleting-") {
+			match := deletionTombstonePattern.FindStringSubmatch(entry.Name())
+			if len(match) != 3 {
+				s.addRecoveryIssue(RecoveryIssue{Code: "deletion_tombstone_invalid", Message: "recording deletion residue could not be identified safely"})
+				continue
+			}
+			if cleanupErr := removeDeletionTombstones(base, match[1]); cleanupErr != nil {
+				s.addRecoveryIssue(RecoveryIssue{ID: match[1], Code: "deletion_cleanup_failed", Message: "a pending recording deletion could not be completed"})
+			}
+			continue
+		}
 		if !entry.IsDir() {
 			continue
 		}

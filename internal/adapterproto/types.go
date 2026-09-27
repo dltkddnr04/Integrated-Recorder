@@ -123,6 +123,31 @@ type Resource struct {
 	Attributes  map[string]json.RawMessage `json:"attributes,omitempty"`
 }
 
+// ResourceListParams requests one page of adapter-defined resources. Resource
+// types, identifiers, cursor values, and attributes are opaque to Core.
+type ResourceListParams struct {
+	Parent       *ResourceRef `json:"parent,omitempty"`
+	ResourceType string       `json:"resource_type,omitempty"`
+	Cursor       string       `json:"cursor,omitempty"`
+	Limit        int          `json:"limit"`
+}
+
+// ResourceSearchParams requests one page matching an adapter-defined query.
+type ResourceSearchParams struct {
+	Parent       *ResourceRef `json:"parent,omitempty"`
+	ResourceType string       `json:"resource_type,omitempty"`
+	Query        string       `json:"query"`
+	Cursor       string       `json:"cursor,omitempty"`
+	Limit        int          `json:"limit"`
+}
+
+// ResourcePage is an opaque, bounded page returned by resource.list or
+// resource.search.
+type ResourcePage struct {
+	Items      []Resource `json:"items"`
+	NextCursor string     `json:"next_cursor,omitempty"`
+}
+
 type ResolveParams struct {
 	Input         json.RawMessage            `json:"input"`
 	Resource      *ResourceRef               `json:"resource,omitempty"`
