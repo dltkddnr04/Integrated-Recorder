@@ -21,18 +21,54 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/dltkddnr04/integrated-recorder/internal/applog"
+	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
+	"github.com/dltkddnr04/integrated-recorder/internal/management"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 )
 
 type Server struct {
-	manager        *acquire.Manager
-	adapters       *adapterhost.Host
-	configs        *pluginconfig.Service
-	mux            *http.ServeMux
-	mu             sync.Mutex
-	workflowTitles map[string]workflowTitle
+	manager                     *acquire.Manager
+	adapters                    *adapterhost.Host
+	configs                     *pluginconfig.Service
+	products                    *management.Store
+	integrity                   *integrity.Service
+	derivatives                 *derivative.Service
+	auth                        *authn.Service
+	settings                    *systemsettings.Store
+	logs                        *applog.Store
+	initialIntegrityConcurrency int
+	forceSecureCookie           bool
+	version                     string
+	commit                      string
+	mux                         *http.ServeMux
+	mu                          sync.Mutex
+	workflowTitles              map[string]workflowTitle
+	startedAt                   time.Time
+	productLocks                [64]sync.RWMutex
+	retentionGate               chan struct{}
+	handler                     http.Handler
+}
+
+// Options contains optional product-management services. New remains available
+// for embedders and tests that only need the original control API.
+type Options struct {
+	Management                  *management.Store
+	Integrity                   *integrity.Service
+	Derivatives                 *derivative.Service
+	Auth                        *authn.Service
+	Settings                    *systemsettings.Store
+	Logs                        *applog.Store
+	InitialIntegrityConcurrency int
+	ForceSecureCookies          bool
+	StartedAt                   time.Time
+	Version                     string
+	Commit                      string
 }
 
 type workflowTitle struct {
@@ -49,9 +85,31 @@ const (
 var staticFiles embed.FS
 
 func New(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginconfig.Service) http.Handler {
-	s := &Server{manager: manager, adapters: adapters, configs: configs, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}}
+	return NewWithOptions(manager, adapters, configs, Options{})
+}
+
+func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginconfig.Service, options Options) *Server {
+	startedAt := options.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	version := options.Version
+	if version == "" {
+		version = "dev"
+	}
+	commit := options.Commit
+	if commit == "" {
+		commit = "unknown"
+	}
+	logs := options.Logs
+	if logs == nil {
+		logs = applog.NewStore()
+	}
+	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, auth: options.Auth, settings: options.Settings, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
+	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
+	s.registerAuthRoutes()
 	static, _ := fs.Sub(staticFiles, "static")
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
 	s.mux.HandleFunc("POST /api/recordings", s.create)
@@ -64,12 +122,40 @@ func New(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginco
 	s.mux.HandleFunc("GET /api/adapters/{id}/config", s.configGet)
 	s.mux.HandleFunc("PUT /api/adapters/{id}/config", s.configPut)
 	s.mux.HandleFunc("GET /api/recordings", s.list)
+	s.registerProductRoutes()
+	s.registerAdapterControlRoutes()
+	s.registerSettingsRoutes()
+	s.mux.Handle("GET /api/logs", NewLogHandler(s.logs))
 	s.mux.HandleFunc("GET /api/recordings/{id}", s.get)
 	s.mux.HandleFunc("POST /api/recordings/{id}/stop", s.stop)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/segments/{segmentID}", s.segment)
-	return securityHeaders(s.mux)
+	var handler http.Handler = s.mux
+	if s.auth != nil {
+		handler = s.authMiddleware(handler)
+	}
+	handler = s.flushWorkflowLifecycleMiddleware(handler)
+	handler = requestLogMiddleware(s.logs, handler)
+	s.handler = securityHeaders(handler)
+	return s
+}
+
+// ServeHTTP makes the configured Server usable directly by net/http while
+// retaining access to its lifecycle services, including RunRetention.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s == nil || s.handler == nil {
+		http.Error(w, "server is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	s.handler.ServeHTTP(w, r)
+}
+
+func (s *Server) flushWorkflowLifecycleMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer s.flushWorkflowLifecycleEvents()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
@@ -107,10 +193,16 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	progress, err := s.adapters.BeginResolution(r.Context(), request.AdapterID, request.Input, request.Resource)
 	if err != nil {
+		if errors.Is(err, adapterhost.ErrWorkflowFailed) {
+			writeError(w, http.StatusBadGateway, "adapter resolution failed")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "adapter could not resolve the input")
 		return
 	}
 	if progress.State != "resolved" || progress.Media == nil {
+		s.appendWorkflowHistory(progress, "started")
+		s.appendWorkflowHistory(progress, "challenge_required")
 		if !s.storeWorkflowTitle(progress.WorkflowID, strings.TrimSpace(request.Title)) {
 			_ = s.adapters.CancelWorkflow(progress.WorkflowID)
 			writeError(w, http.StatusServiceUnavailable, "too many active workflows")
@@ -119,11 +211,14 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, progress)
 		return
 	}
+	s.appendWorkflowHistory(progress, "started")
+	s.appendWorkflowHistory(progress, "resolved")
 	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, strings.TrimSpace(request.Title), &progress.Provenance)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "recording could not be started")
 		return
 	}
+	s.appendRecordingEvent(recording.ID, "recording_started", recording.StartedAt, 0, "")
 	writeJSON(w, http.StatusCreated, detail(recording))
 }
 
@@ -224,10 +319,16 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 		progress, err = s.adapters.ContinueResolutionFields(r.Context(), r.PathValue("id"), request.Values, request.Secrets, request.PersistFields)
 	}
 	if err != nil {
+		if errors.Is(err, adapterhost.ErrWorkflowFailed) {
+			writeError(w, http.StatusBadGateway, "adapter resolution failed")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "workflow continuation was rejected")
 		return
 	}
+	s.appendWorkflowHistory(progress, "continued")
 	if progress.State != "resolved" || progress.Media == nil {
+		s.appendWorkflowHistory(progress, "challenge_required")
 		s.touchWorkflowTitle(progress.WorkflowID)
 		writeJSON(w, http.StatusAccepted, progress)
 		return
@@ -238,6 +339,7 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "recording could not be started")
 		return
 	}
+	s.appendRecordingEvent(recording.ID, "recording_started", recording.StartedAt, 0, "")
 	writeJSON(w, http.StatusCreated, detail(recording))
 }
 
@@ -397,6 +499,11 @@ func (s *Server) configPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "adapter configuration could not be read")
 		return
 	}
+	if auditErr := s.appendAudit("config_changed", id); auditErr != nil {
+		w.Header().Set("X-Config-Audit", "failed")
+	} else if s.products != nil {
+		w.Header().Set("X-Config-Audit", "recorded")
+	}
 	writeJSON(w, http.StatusOK, configAPI(schema, snapshot, request.Resource))
 }
 
@@ -491,9 +598,25 @@ func publicLastError(value string) string {
 
 type recordingDetail struct {
 	*domain.Recording
-	TrackCount   int     `json:"track_count"`
-	SegmentCount int     `json:"segment_count"`
-	Duration     float64 `json:"duration_seconds"`
+	TrackCount   int                  `json:"track_count"`
+	SegmentCount int                  `json:"segment_count"`
+	Duration     float64              `json:"duration_seconds"`
+	Statistics   *recordingStatistics `json:"statistics,omitempty"`
+}
+
+type recordingStatistics struct {
+	ArchiveSizeBytes      int64                   `json:"archive_size_bytes"`
+	MediaPayloadSizeBytes int64                   `json:"media_payload_size_bytes"`
+	ManifestSizeBytes     int64                   `json:"manifest_size_bytes"`
+	InitPayloadSizeBytes  int64                   `json:"init_payload_size_bytes"`
+	SegmentCount          int                     `json:"segment_count"`
+	InitSegmentCount      int                     `json:"init_segment_count"`
+	ManifestSnapshotCount int                     `json:"manifest_snapshot_count"`
+	DurationSeconds       float64                 `json:"duration_seconds"`
+	GapCount              int                     `json:"gap_count"`
+	GapSegmentCount       int                     `json:"gap_segment_count"`
+	GapDurationSeconds    *float64                `json:"gap_duration_seconds"`
+	Integrity             storage.IntegrityStatus `json:"integrity"`
 }
 
 func detail(r *domain.Recording) recordingDetail {
@@ -532,12 +655,20 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
 	recording, err := s.manager.Get(r.PathValue("id"))
 	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, detail(recording))
+	response, err := s.recordingDetail(recording)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "recording statistics are temporarily unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 	recording, err := s.manager.Stop(r.PathValue("id"))
@@ -545,10 +676,22 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
+	kind, message := "recording_stopped", "recording stopped"
+	if recording.State == domain.StateCompleted {
+		kind, message = "recording_completed", "recording completed"
+	} else if recording.State == domain.StateInterrupted {
+		kind, message = "recording_interrupted", "recording interrupted"
+	}
+	if recording.StoppedAt != nil {
+		s.appendRecordingEvent(recording.ID, kind, *recording.StoppedAt, 0, message)
+	}
 	writeJSON(w, http.StatusOK, detail(recording))
 }
 
 func (s *Server) masterPlaylist(w http.ResponseWriter, r *http.Request) {
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
 	recording, err := s.playableRecording(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -576,6 +719,9 @@ func (s *Server) masterPlaylist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
 	recording, err := s.playableRecording(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
@@ -673,6 +819,9 @@ func (s *Server) playableTrackPayloadsAvailable(recording *domain.Recording, tra
 }
 
 func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
 	recording, err := s.manager.Get(r.PathValue("id"))
 	if err != nil {
 		writeStorageError(w, err)

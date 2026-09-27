@@ -73,16 +73,36 @@ Segment와 manifest payload 저장 후 각각 sidecar를 만들고 root recordin
 
 `internal/domain` archive type은 protocol wire type과 분리되어 있습니다. 기존 JSON field 이름을 유지하고 epoch, ordinal, provenance, URI classification은 optional이므로 구 recording도 읽을 수 있습니다. Adapter ID/version/protocol version/fingerprint는 provenance이며 credential, header, adapter state는 recording metadata에 복사하지 않습니다. Source URL과 raw manifest snapshot은 credential이 포함된 경우에도 원본 canonical data로 보존합니다. 따라서 recording directory 권한을 제한하고 public list/detail 응답에서는 URL을 제거합니다.
 
-Recording directory는 `0700`, metadata/payload/sidecar 파일은 `0600`입니다. File backend는 at-rest encryption을 제공하지 않습니다. 인증/권한 기능이 없는 management API는 신뢰 경계 내부의 control plane입니다. Local 실행은 loopback에 bind하고 Compose도 host의 `127.0.0.1`에만 port를 공개합니다. Untrusted network에 직접 노출하지 말고 신뢰된 private network 또는 인증 reverse proxy를 사용하세요. 관리 페이지는 로컬 pinned hls.js 1.5.17(Apache-2.0)과 restrictive CSP/security header를 사용합니다.
+## Management API와 projection
+
+`internal/recordquery`는 canonical recording snapshot에서 필터, 검색, 정렬, stable cursor pagination, 크기·segment·gap statistics를 계산합니다. `/api/v2/recordings`와 dashboard는 매 요청마다 archive를 다시 해석하지만 기록을 수정하지 않습니다. 계산 근거가 없는 gap duration은 `null`입니다. 태그, workflow history, recording event projection, audit, notification, adapter enable preference는 `internal/management`의 별도 제한된 JSON store에 기록합니다. 이 데이터가 없어도 canonical recording을 해석할 수 있습니다.
+
+Storage API는 private filesystem 통계와 archive index를 제공하고, delete는 inactive recording만 허용합니다. 서버의 recording lock은 playback 및 export 입력 읽기와 deletion을 직렬화하며 active export/integrity job이 있으면 삭제를 거절합니다. 완료된 export artifact는 독립 projection이므로 export job을 삭제할 때까지 유지됩니다. Delete는 directory를 tombstone 이름으로 먼저 rename한 뒤 제거하며 남은 tombstone은 다음 시작에서 제거를 재시도합니다. Archive index는 canonical metadata가 참조하는 object만 나열하며 absolute path와 source URI는 API로 내보내지 않습니다.
+
+무결성 확인은 canonical SHA-256/size metadata를 streaming 방식으로 검증하는 bounded job service입니다. 각 job은 recording metadata snapshot을 대상으로 하고 acquisition 중인 녹화는 거절합니다. 동일 recording의 중복 요청은 coalesce됩니다. Job/result는 별도 management projection에 저장되며 재시작 당시 queued/running 작업은 interrupted/failed 상태로 회수됩니다. Verification은 segment capture를 수정하거나 막지 않습니다.
+
+Adapter resource browsing은 protocol capability `resource_browse`를 선언한 adapter에서만 동작하며 list/search 결과, cursor, attributes를 Core가 opaque data로 전달합니다. Query와 결과 크기는 제한되고 호출 timeout이 적용됩니다. Adapter enable/disable preference는 별도 저장하며 startup discovery 후 적용합니다. Manual restart는 descriptor fingerprint를 다시 확인하고 해당 adapter의 workflow만 취소합니다. 이미 resolve가 끝난 recording의 acquisition process는 이 제어와 무관합니다.
+
+첫 dashboard, paginated recording query, tags, delete, archive index, events, integrity, workflow list/history, resource browse/search, global search, notification, system-info/storage, bounded request-log API는 실제 저장소와 process status projection을 사용합니다. `/api/logs`는 HTTP method/status/duration과 안전한 component label만 process memory에 보관합니다. OS/application log 파일을 읽지 않고 URL, query, header, body를 저장하지 않으며 process restart 시 비워집니다. Global resource search는 recording에 알려진 resource chain만 검색하며 외부 network search를 호출하지 않습니다. Notification store와 workflow/audit/event history는 bounded retention을 사용합니다. 현재 recording event projection은 recording 상태, 관측된 manifest, gaps, management job 요청/결과 범위이며 segment마다 무제한 event를 기록하지 않습니다. 무결성 확인은 `POST /api/integrity/jobs/{job_id}/cancel`로 취소할 수 있습니다.
+
+## 인증, settings와 파생 export
+
+기본 실행은 single administrator authentication을 활성화합니다. 초기에는 `DATA_DIR/security/bootstrap-token`의 0600 token으로 12바이트 이상 password를 설정하고 bcrypt hash만 저장합니다. Session token은 CSPRNG에서 만들고 SHA-256 key로 process memory에만 저장되므로 Core restart는 모든 session을 폐기합니다. Browser cookie는 HttpOnly, SameSite=Strict이며 mutation에는 CSRF token header가 필요합니다. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제합니다. `AUTH_DISABLED=1`은 loopback bind에서만 허용됩니다. 현재 user/role system, password reset, remote identity provider는 없습니다.
+
+`internal/systemsettings`는 UI theme(즉시 적용), integrity concurrency(저장 후 server restart 적용), 선택적 recording retention을 관리합니다. Retention 기본값은 비활성화와 30일 기준입니다. 활성화하면 설정 일수보다 오래된 completed recording만 후보가 되며, tag가 하나라도 있는 recording과 integrity/derivative job 진행 중인 recording은 보호합니다. Server 시작 시 한 번, 이후 24시간마다 bounded pass를 수행하며 pass당 최대 100개를 삭제합니다. `GET /api/retention/candidates`는 미리보기이고 `POST /api/retention/run`은 명시적으로 pass를 실행합니다. Bind address, storage root, adapter directory는 read-only입니다. Settings JSON은 strict validation 및 atomic private-file replacement로 저장됩니다.
+
+Optional `internal/derivative` service는 FFmpeg executable이 확인될 때에만 활성화됩니다. Export는 완료/중지 recording의 원본 HLS payload를 private staging directory에 검증 복사하고 local playlist를 만들어 MKV `-c copy` remux만 수행합니다. FFmpeg 인자는 shell을 통하지 않는 argument vector이고 network protocol은 허용되지 않습니다. Job, cancellation, timeout, restart recovery, download artifact는 canonical archive 외부에 저장됩니다. Thumbnail generation은 저장된 첫 video frame을 bounded private JPEG projection으로 생성하며, 검증한 local payload만 사용하고 source URI를 fetch하지 않습니다. `GET /api/recordings/{id}/thumbnail`은 projection을 반환하고 `POST .../thumbnail/regenerate`는 다시 생성합니다. 생성 실패는 canonical archive에 영향을 주지 않습니다. FFmpeg가 없으면 export와 thumbnail 생성이 unavailable이며 UI는 placeholder를 표시합니다. Transcoding과 다른 container는 구현하지 않았습니다.
+
+Recording directory는 `0700`, metadata/payload/sidecar 파일은 `0600`입니다. File secret/state backend는 at-rest encryption을 제공하지 않습니다. Management API는 single-admin 인증을 제공하지만 multi-user/role authorization은 없습니다. Local 실행은 loopback에 bind하고 Compose도 host의 `127.0.0.1`에만 port를 공개합니다. Reverse proxy 사용 시 TLS 및 cookie Secure 설정을 적용하고 untrusted network에 직접 노출하지 마세요. 관리 페이지는 로컬 pinned hls.js 1.5.17(Apache-2.0)과 restrictive CSP/security header를 사용합니다.
 
 ## Server lifecycle과 Docker
 
 SIGINT/SIGTERM에서 Core는 신규 HTTP 요청을 받지 않은 뒤 모든 recording worker를 먼저 취소하고 종료 및 durable terminal state 저장을 기다린 다음 adapter process를 종료합니다. Shutdown에는 제한 시간이 있습니다. Compose는 worker 종료 제한 시간보다 긴 45초 grace period를 사용합니다. 실제 crash에서는 active recording이 재시작 후 `interrupted`로 표시됩니다.
 
-Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 쓰며 control port는 host loopback에 공개합니다. Image에는 Owncast adapter가 `/adapters`에 포함됩니다. 추가 executable adapter는 `./adapter-binaries`에 두고 `/external-adapters`에 read-only mount합니다. Compose 실행 전 executable bit를 설정해야 합니다. Core restart 후 새 binary를 발견하며 hot reload는 없습니다. API authentication이 없으므로 `ADDR`는 신뢰 경계 안에 두어야 합니다.
+Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 쓰며 control port는 host loopback에 공개합니다. Image에는 Owncast adapter가 `/adapters`에 포함됩니다. 추가 executable adapter는 `./adapter-binaries`에 두고 `/external-adapters`에 read-only mount합니다. Compose 실행 전 executable bit를 설정해야 합니다. Core restart 후 새 binary를 발견하며 hot reload는 없습니다. Authentication을 명시적으로 disable한 배포도 loopback bind 외에는 허용하지 않습니다.
 
 ## Playback과 의도적으로 미구현인 항목
 
 중지/완료/interrupted recording의 저장 segment를 참조하는 finite HLS VOD manifest를 생성합니다. Segment endpoint는 저장된 원본 byte를 직접 반환하며 파일을 이어 붙이거나 remux하지 않습니다. 재생 가능한 codec인지 여부는 browser 지원에 달려 있습니다.
 
-미구현: chat/metadata timeline, notification runtime, 실제 platform authentication flow, 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export/transcoding, database, authentication/authorization, adapter sandbox, adapter hot reload.
+미구현: chat/metadata timeline, 비동기 adapter notification runtime, 실제 platform authentication flow, 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export transcoding/추가 format, multi-user/role authorization, adapter sandbox, adapter hot reload.

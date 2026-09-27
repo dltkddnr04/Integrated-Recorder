@@ -1,0 +1,1184 @@
+package server
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"math"
+	"net/http"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
+	"github.com/dltkddnr04/integrated-recorder/internal/management"
+	"github.com/dltkddnr04/integrated-recorder/internal/recordquery"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+)
+
+const (
+	maxSearchQuery       = 128
+	maxSearchResults     = 50
+	defaultSearchResults = 20
+	maxGlobalSearchScan  = 10000
+	globalSearchTimeout  = 2 * time.Second
+)
+
+func (s *Server) registerProductRoutes() {
+	s.registerDerivativeRoutes()
+	s.mux.HandleFunc("GET /api/v2/recordings", s.recordingsQuery)
+	s.mux.HandleFunc("GET /api/dashboard", s.dashboard)
+	s.mux.HandleFunc("GET /api/system/storage", s.systemStorage)
+	s.mux.HandleFunc("GET /api/system/info", s.systemInfo)
+	s.mux.HandleFunc("GET /api/recordings/{id}/tags", s.recordingTagsGet)
+	s.mux.HandleFunc("PUT /api/recordings/{id}/tags", s.recordingTagsPut)
+	s.mux.HandleFunc("DELETE /api/recordings/{id}", s.recordingDelete)
+	s.mux.HandleFunc("GET /api/recordings/{id}/archive/index", s.archiveIndex)
+	s.mux.HandleFunc("GET /api/recordings/{id}/integrity", s.integrityGet)
+	s.mux.HandleFunc("POST /api/recordings/{id}/integrity/verify", s.integrityStart)
+	s.mux.HandleFunc("GET /api/integrity/jobs/{job_id}", s.integrityJobGet)
+	s.mux.HandleFunc("POST /api/integrity/jobs/{job_id}/cancel", s.integrityJobCancel)
+	s.mux.HandleFunc("GET /api/resolve-workflows", s.workflowList)
+	s.mux.HandleFunc("GET /api/workflow-history", s.workflowHistoryList)
+	s.mux.HandleFunc("GET /api/workflow-history/{id}", s.workflowHistoryGet)
+	s.mux.HandleFunc("GET /api/adapters/{id}/resources", s.resourceList)
+	s.mux.HandleFunc("GET /api/adapters/{id}/resources/search", s.resourceSearch)
+	s.mux.HandleFunc("GET /api/search", s.globalSearch)
+	s.mux.HandleFunc("GET /api/recordings/{id}/events", s.recordingEvents)
+	s.mux.HandleFunc("GET /api/audit", s.auditList)
+	s.mux.HandleFunc("GET /api/notifications", s.notificationList)
+	s.mux.HandleFunc("POST /api/notifications/sync", s.notificationSync)
+	s.mux.HandleFunc("POST /api/notifications/{id}/read", s.notificationRead)
+	s.mux.HandleFunc("POST /api/notifications/read-all", s.notificationReadAll)
+}
+
+func (s *Server) productLock(id string) *sync.RWMutex {
+	return &s.productLocks[recordLockIndex(id)]
+}
+
+func recordLockIndex(id string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return h.Sum32() % 64
+}
+
+// recordingQueryItem is a read-model projection. All payload sizes come from
+// canonical files referenced by recording metadata; no source URI is returned.
+func (s *Server) recordingQueryItem(recording *domain.Recording) (recordquery.Item, error) {
+	item := recordquery.Item{
+		ID: recording.ID, Title: recording.Title, AdapterID: recording.AdapterID,
+		State: string(recording.State), StartedAt: recording.StartedAt, CreatedAt: recording.CreatedAt,
+		DurationSeconds: recording.Duration(), SegmentCount: recording.SegmentCount(),
+		InitSegmentCount: 0, ManifestSnapshotCount: len(recording.Snapshots), GapCount: len(recording.Gaps),
+		GapDurationSeconds: nil, Integrity: string(storage.IntegrityUnknown), Tags: []string{},
+	}
+	if recording.Adapter != nil {
+		item.AdapterName = recording.Adapter.Name
+	}
+	if item.AdapterName == "" && s.adapters != nil && recording.AdapterID != "" {
+		if adapter, err := s.adapters.Get(recording.AdapterID); err == nil && adapter.Descriptor != nil {
+			item.AdapterName = adapter.Descriptor.Name
+		}
+	}
+	if recording.Resource != nil {
+		item.ResourceType, item.ResourceID = recording.Resource.Type, recording.Resource.ID
+	}
+	if s.products != nil {
+		tags, err := s.products.Tags(recording.ID)
+		if err != nil {
+			return recordquery.Item{}, err
+		}
+		item.Tags = tags
+	}
+	for _, track := range recording.Tracks {
+		if track == nil {
+			return recordquery.Item{}, errors.New("invalid recording track")
+		}
+		for _, segment := range track.Segments {
+			if segment.PayloadSize < 0 || !addInt64(&item.MediaPayloadSizeBytes, segment.PayloadSize) {
+				return recordquery.Item{}, errors.New("recording payload size overflow")
+			}
+		}
+		for _, segment := range track.InitSegments {
+			if segment.PayloadSize < 0 || !addInt64(&item.InitPayloadSizeBytes, segment.PayloadSize) {
+				return recordquery.Item{}, errors.New("recording init size overflow")
+			}
+		}
+		item.InitSegmentCount += len(track.InitSegments)
+	}
+	for _, snapshot := range recording.Snapshots {
+		if snapshot.Size < 0 || !addInt64(&item.ManifestSizeBytes, snapshot.Size) {
+			return recordquery.Item{}, errors.New("recording manifest size overflow")
+		}
+	}
+	for _, gap := range recording.Gaps {
+		if gap.ToSequence < gap.FromSequence {
+			return recordquery.Item{}, errors.New("invalid gap metadata")
+		}
+		n := gap.ToSequence - gap.FromSequence + 1
+		maxInt := int(^uint(0) >> 1)
+		if n == 0 || item.GapSegmentCount < 0 || n > uint64(maxInt-item.GapSegmentCount) {
+			return recordquery.Item{}, errors.New("gap count overflow")
+		}
+		item.GapSegmentCount += int(n)
+	}
+	if s.integrity != nil {
+		if result, ok := s.integrity.Status(recording.ID); ok {
+			item.Integrity = string(result.Status)
+		}
+	}
+	archiveBytes, err := s.manager.Store().RecordingDirectoryBytes(recording.ID)
+	if err != nil {
+		return recordquery.Item{}, err
+	}
+	item.ArchiveSizeBytes = archiveBytes
+	return item, nil
+}
+
+func addInt64(target *int64, amount int64) bool {
+	if amount < 0 || *target > math.MaxInt64-amount {
+		return false
+	}
+	*target += amount
+	return true
+}
+
+func (s *Server) recordingDetail(recording *domain.Recording) (recordingDetail, error) {
+	item, err := s.recordingQueryItem(recording)
+	if err != nil {
+		return recordingDetail{}, err
+	}
+	response := detail(recording)
+	response.Statistics = &recordingStatistics{
+		ArchiveSizeBytes: item.ArchiveSizeBytes, MediaPayloadSizeBytes: item.MediaPayloadSizeBytes,
+		ManifestSizeBytes: item.ManifestSizeBytes, InitPayloadSizeBytes: item.InitPayloadSizeBytes,
+		SegmentCount: item.SegmentCount, InitSegmentCount: item.InitSegmentCount,
+		ManifestSnapshotCount: item.ManifestSnapshotCount, DurationSeconds: item.DurationSeconds,
+		GapCount: item.GapCount, GapSegmentCount: item.GapSegmentCount,
+		GapDurationSeconds: item.GapDurationSeconds, Integrity: storage.IntegrityStatus(item.Integrity),
+	}
+	return response, nil
+}
+
+func (s *Server) recordingsQuery(w http.ResponseWriter, r *http.Request) {
+	query, err := recordquery.ParseQuery(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid recording query")
+		return
+	}
+	if s.manager == nil {
+		writeError(w, http.StatusServiceUnavailable, "recording manager is unavailable")
+		return
+	}
+	recordings := s.manager.List()
+	items := make([]recordquery.Item, 0, len(recordings))
+	for _, listed := range recordings {
+		recording := listed
+		lock := s.productLock(recording.ID)
+		lock.RLock()
+		if current, getErr := s.manager.Get(recording.ID); getErr == nil {
+			recording = current
+		} else {
+			lock.RUnlock()
+			if errors.Is(getErr, storage.ErrNotFound) {
+				continue
+			}
+			writeStorageError(w, getErr)
+			return
+		}
+		item, itemErr := s.recordingQueryItem(recording)
+		lock.RUnlock()
+		if itemErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "recording statistics are temporarily unavailable")
+			return
+		}
+		items = append(items, item)
+	}
+	page, err := recordquery.Page(items, query)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid recording query")
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) systemStorage(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil {
+		writeError(w, http.StatusServiceUnavailable, "storage statistics are unavailable")
+		return
+	}
+	stats, err := s.manager.Store().StorageStats()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "storage statistics are unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"archive_root":               "recordings/",
+		"filesystem_total_bytes":     stats.FilesystemTotalBytes,
+		"filesystem_used_bytes":      stats.FilesystemUsedBytes,
+		"filesystem_available_bytes": stats.FilesystemAvailableBytes,
+		"recordings_bytes":           stats.RecordingBytes,
+		"recording_count":            stats.RecordingCount,
+		"segment_count":              stats.SegmentCount,
+		"init_segment_count":         stats.InitSegmentCount,
+		"manifest_count":             stats.ManifestCount,
+	})
+}
+
+func (s *Server) systemInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": s.version, "commit": s.commit, "go_version": runtime.Version(),
+		"goos": runtime.GOOS, "goarch": runtime.GOARCH, "started_at": s.startedAt,
+		"uptime_seconds":   int64(time.Since(s.startedAt).Seconds()),
+		"export_available": s.derivatives != nil && s.derivatives.Available(),
+	})
+}
+
+type dashboardResponse struct {
+	ActiveRecordingsCount int                `json:"active_recordings_count"`
+	CompletedLast24Hours  int                `json:"completed_last_24h"`
+	InterruptedLast24H    int                `json:"interrupted_last_24h"`
+	RecordingsTotal       int                `json:"recordings_total"`
+	SegmentsTotal         int                `json:"segments_total"`
+	GapsTotal             int                `json:"gaps_total"`
+	ArchiveBytes          uint64             `json:"archive_bytes"`
+	FilesystemTotalBytes  uint64             `json:"filesystem_total_bytes"`
+	FilesystemFreeBytes   uint64             `json:"filesystem_free_bytes"`
+	FilesystemUsedBytes   uint64             `json:"filesystem_used_bytes"`
+	Integrity             map[string]int     `json:"integrity"`
+	Adapters              map[string]int     `json:"adapters"`
+	ExportAvailable       bool               `json:"export_available"`
+	RecentRecordings      []recordingSummary `json:"recent_recordings"`
+	ActiveRecordingItems  []recordingSummary `json:"active_recordings"`
+}
+
+func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil {
+		writeError(w, http.StatusServiceUnavailable, "dashboard data is unavailable")
+		return
+	}
+	stats, err := s.manager.Store().StorageStats()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "dashboard storage data is unavailable")
+		return
+	}
+	items := s.manager.List()
+	now := time.Now().UTC()
+	cutoff := now.Add(-24 * time.Hour)
+	result := dashboardResponse{
+		RecordingsTotal: len(items), ArchiveBytes: stats.RecordingBytes,
+		FilesystemTotalBytes: stats.FilesystemTotalBytes, FilesystemFreeBytes: stats.FilesystemAvailableBytes,
+		FilesystemUsedBytes: stats.FilesystemUsedBytes,
+		Integrity:           map[string]int{"verified": 0, "degraded": 0, "failed": 0, "unknown": 0, "verifying": 0},
+		Adapters:            map[string]int{"total": 0, "ready": 0, "unavailable": 0, "failed": 0, "rejected": 0},
+		ExportAvailable:     s.derivatives != nil && s.derivatives.Available(),
+		RecentRecordings:    []recordingSummary{}, ActiveRecordingItems: []recordingSummary{},
+	}
+	for _, item := range items {
+		result.SegmentsTotal += item.SegmentCount()
+		result.GapsTotal += len(item.Gaps)
+		if item.State == domain.StateRecording {
+			result.ActiveRecordingsCount++
+			if len(result.ActiveRecordingItems) < 10 {
+				result.ActiveRecordingItems = append(result.ActiveRecordingItems, summary(item))
+			}
+		}
+		if item.StoppedAt != nil && !item.StoppedAt.Before(cutoff) {
+			if item.State == domain.StateCompleted {
+				result.CompletedLast24Hours++
+			}
+			if item.State == domain.StateInterrupted {
+				result.InterruptedLast24H++
+			}
+		}
+		status := string(storage.IntegrityUnknown)
+		if s.integrity != nil {
+			if report, ok := s.integrity.Status(item.ID); ok {
+				status = string(report.Status)
+			}
+		}
+		if _, ok := result.Integrity[status]; !ok {
+			status = string(storage.IntegrityUnknown)
+		}
+		result.Integrity[status]++
+	}
+	for i := 0; i < len(items) && i < 10; i++ {
+		result.RecentRecordings = append(result.RecentRecordings, summary(items[i]))
+	}
+	if s.adapters != nil {
+		for _, adapter := range s.adapters.List() {
+			result.Adapters["total"]++
+			if _, ok := result.Adapters[adapter.Status.State]; ok {
+				result.Adapters[adapter.Status.State]++
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) recordingTagsGet(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "management storage is unavailable")
+		return
+	}
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
+	if _, err := s.manager.Get(r.PathValue("id")); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	tags, err := s.products.Tags(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "recording tags are unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tags": tags})
+}
+
+func (s *Server) recordingTagsPut(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Tags []string `json:"tags"`
+	}
+	if err := decodeJSONBody(w, r, 8<<10, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid tags request")
+		return
+	}
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "management storage is unavailable")
+		return
+	}
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
+	if _, err := s.manager.Get(r.PathValue("id")); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if err := s.products.SetTags(r.PathValue("id"), request.Tags); err != nil {
+		writeError(w, http.StatusBadRequest, "tags update was rejected")
+		return
+	}
+	auditRecorded := s.appendAudit("recording_tags_updated", r.PathValue("id")) == nil
+	tags, _ := s.products.Tags(r.PathValue("id"))
+	writeJSON(w, http.StatusOK, map[string]any{"tags": tags, "audit_recorded": auditRecorded})
+}
+
+func (s *Server) recordingDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRecordingPathID(id) {
+		writeError(w, http.StatusNotFound, "recording not found")
+		return
+	}
+	lock := s.productLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	if s.integrity != nil && s.integrity.InProgress(id) {
+		writeError(w, http.StatusConflict, "recording integrity verification is active")
+		return
+	}
+	if s.derivatives != nil && s.derivatives.InProgress(id) {
+		writeError(w, http.StatusConflict, "recording export is active")
+		return
+	}
+	err := s.manager.Delete(id)
+	if errors.Is(err, acquire.ErrActiveRecording) {
+		writeError(w, http.StatusConflict, "active recordings must be stopped before deletion")
+		return
+	}
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if s.products != nil {
+		if err = s.products.ForgetRecording(id); err != nil {
+			writeError(w, http.StatusInternalServerError, "recording was deleted but management metadata cleanup is pending")
+			return
+		}
+	}
+	if s.products != nil {
+		_ = s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: "recording_deleted", At: time.Now().UTC(), ObjectID: id})
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func validRecordingPathID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, character := range id {
+		if character < '0' || character > '9' {
+			if character < 'a' || character > 'f' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Server) archiveIndex(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	lock := s.productLock(id)
+	lock.RLock()
+	defer lock.RUnlock()
+	recording, err := s.manager.Get(id)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	entries, err := s.manager.Store().ArchiveIndex(recording)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "archive index is unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"recording_id": id, "entries": entries})
+}
+
+func (s *Server) integrityGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.manager.Get(id); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if s.integrity == nil {
+		writeError(w, http.StatusServiceUnavailable, "integrity verification is unavailable")
+		return
+	}
+	result, ok := s.integrity.Status(id)
+	if !ok {
+		result = storage.IntegrityResult{Status: storage.IntegrityUnknown, Issues: []storage.IntegrityIssue{}}
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) integrityStart(w http.ResponseWriter, r *http.Request) {
+	if s.integrity == nil {
+		writeError(w, http.StatusServiceUnavailable, "integrity verification is unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	lock := s.productLock(id)
+	lock.RLock()
+	recording, err := s.manager.Get(id)
+	if err == nil && recording.State == domain.StateRecording {
+		err = acquire.ErrActiveRecording
+	}
+	if err == nil {
+		var job integrity.Job
+		job, err = s.integrity.Start(context.Background(), recording)
+		lock.RUnlock()
+		if err != nil {
+			writeError(w, http.StatusConflict, "integrity job could not be started")
+			return
+		}
+		if s.products != nil {
+			_ = s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: "integrity_requested", At: time.Now().UTC(), ObjectID: id})
+		}
+		s.appendRecordingEvent(id, "integrity_started", job.CreatedAt, 0, "integrity verification started")
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
+	lock.RUnlock()
+	if errors.Is(err, acquire.ErrActiveRecording) {
+		writeError(w, http.StatusConflict, "active recordings cannot be verified")
+		return
+	}
+	writeStorageError(w, err)
+}
+
+func (s *Server) integrityJobGet(w http.ResponseWriter, r *http.Request) {
+	if s.integrity == nil {
+		writeError(w, http.StatusServiceUnavailable, "integrity jobs are unavailable")
+		return
+	}
+	job, err := s.integrity.Get(r.PathValue("job_id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "integrity job not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) integrityJobCancel(w http.ResponseWriter, r *http.Request) {
+	if s.integrity == nil {
+		writeError(w, http.StatusServiceUnavailable, "integrity jobs are unavailable")
+		return
+	}
+	var request struct{}
+	if err := decodeJSONBody(w, r, 1024, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid integrity cancellation request")
+		return
+	}
+	job, err := s.integrity.Cancel(r.PathValue("job_id"))
+	if err != nil {
+		if errors.Is(err, integrity.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "integrity job not found")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "integrity job cancellation could not be saved")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) workflowList(w http.ResponseWriter, r *http.Request) {
+	if s.adapters == nil {
+		writeJSON(w, http.StatusOK, []adapterhost.WorkflowSummary{})
+		return
+	}
+	state, adapterID := r.URL.Query().Get("state"), r.URL.Query().Get("adapter")
+	if len(state) > 64 || len(adapterID) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid workflow filter")
+		return
+	}
+	items := s.adapters.ListWorkflows()
+	filtered := make([]adapterhost.WorkflowSummary, 0, len(items))
+	for _, item := range items {
+		if state != "" && item.State != state || adapterID != "" && item.AdapterID != adapterID {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	writeJSON(w, http.StatusOK, filtered)
+}
+
+func (s *Server) workflowHistoryList(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "workflow history is unavailable")
+		return
+	}
+	limit, err := boundedLimit(r, 100, 500)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid workflow history limit")
+		return
+	}
+	items := s.products.WorkflowHistory("", r.URL.Query().Get("adapter"), r.URL.Query().Get("state"), limit)
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) workflowHistoryGet(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "workflow history is unavailable")
+		return
+	}
+	items := s.products.WorkflowHistory(r.PathValue("id"), "", "", 5000)
+	if len(items) == 0 {
+		writeError(w, http.StatusNotFound, "workflow history not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workflow_id": r.PathValue("id"), "events": items})
+}
+
+func (s *Server) resourceList(w http.ResponseWriter, r *http.Request)   { s.resourceBrowse(w, r, false) }
+func (s *Server) resourceSearch(w http.ResponseWriter, r *http.Request) { s.resourceBrowse(w, r, true) }
+func (s *Server) resourceBrowse(w http.ResponseWriter, r *http.Request, search bool) {
+	if s.adapters == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter resource browsing is unavailable")
+		return
+	}
+	parent, err := resourceParentQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid parent resource")
+		return
+	}
+	query := ""
+	if search {
+		query = strings.TrimSpace(r.URL.Query().Get("q"))
+		if query == "" {
+			writeError(w, http.StatusBadRequest, "q is required")
+			return
+		}
+	}
+	limit, err := boundedLimit(r, 20, 50)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid resource page limit")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	page, err := s.adapters.BrowseResources(ctx, r.PathValue("id"), parent, r.URL.Query().Get("resource_type"), query, r.URL.Query().Get("cursor"), limit)
+	if errors.Is(err, adapterhost.ErrUnsupportedResourceBrowse) {
+		writeError(w, http.StatusNotImplemented, "adapter resource browsing is not supported")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "adapter resource query failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func resourceParentQuery(r *http.Request) (*adapterproto.ResourceRef, error) {
+	raw := r.URL.Query().Get("parent")
+	if raw == "" {
+		return nil, nil
+	}
+	if len(raw) > 8192 {
+		return nil, errors.New("resource parent is too large")
+	}
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	var ref adapterproto.ResourceRef
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&ref); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("resource parent must contain one JSON object")
+	}
+	if err = adapterproto.ValidateResourceRef(&ref); err != nil {
+		return nil, err
+	}
+	return &ref, nil
+}
+
+func (s *Server) globalSearch(w http.ResponseWriter, r *http.Request) {
+	values := r.URL.Query()
+	for key := range values {
+		if key != "q" && key != "limit" {
+			writeError(w, http.StatusBadRequest, "unknown search query parameter")
+			return
+		}
+	}
+	if len(values["q"]) > 1 {
+		writeError(w, http.StatusBadRequest, "search query must occur once")
+		return
+	}
+	query := ""
+	if len(values["q"]) == 1 {
+		if len(values["q"][0]) > maxSearchQuery {
+			writeError(w, http.StatusBadRequest, "search query exceeds limit")
+			return
+		}
+		query = strings.TrimSpace(values["q"][0])
+	}
+	if len(query) > maxSearchQuery {
+		writeError(w, http.StatusBadRequest, "search query exceeds limit")
+		return
+	}
+	limit, err := boundedLimit(r, defaultSearchResults, maxSearchResults)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid search limit")
+		return
+	}
+	if query == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"results": []any{}})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), globalSearchTimeout)
+	defer cancel()
+	searchFailure := func(err error) {
+		switch {
+		case errors.Is(err, context.Canceled):
+			// The client has gone away; there is no useful response to send.
+			return
+		case errors.Is(err, context.DeadlineExceeded):
+			writeError(w, http.StatusGatewayTimeout, "global search timed out")
+		case errors.Is(err, acquire.ErrListLimit):
+			writeError(w, http.StatusServiceUnavailable, "global search recording scan exceeds its limit")
+		default:
+			writeError(w, http.StatusServiceUnavailable, "global search is temporarily unavailable")
+		}
+	}
+	recordings, err := s.manager.ListForManagement(ctx, maxGlobalSearchScan)
+	if err != nil {
+		searchFailure(err)
+		return
+	}
+	lower := strings.ToLower(query)
+	results := make([]map[string]any, 0, limit)
+	resources := make(map[string]map[string]any)
+	add := func(item map[string]any) bool {
+		if len(results) >= limit {
+			return false
+		}
+		results = append(results, item)
+		return true
+	}
+	for _, recording := range recordings {
+		if err = ctx.Err(); err != nil {
+			searchFailure(err)
+			return
+		}
+		tags := []string{}
+		if s.products != nil {
+			tags, err = s.products.Tags(recording.ID)
+			if err != nil {
+				searchFailure(err)
+				return
+			}
+		}
+		resourceID, resourceType := "", ""
+		if recording.Resource != nil {
+			resourceID, resourceType = recording.Resource.ID, recording.Resource.Type
+		}
+		adapterName := ""
+		if recording.Adapter != nil {
+			adapterName = recording.Adapter.Name
+		}
+		blob := strings.ToLower(strings.Join(append([]string{recording.ID, recording.Title, recording.AdapterID, adapterName, resourceID}, tags...), " "))
+		if strings.Contains(blob, lower) {
+			if !add(map[string]any{"type": "recording", "id": recording.ID, "title": recording.Title, "state": recording.State, "adapter_id": recording.AdapterID, "resource_type": resourceType, "resource_id": resourceID}) {
+				break
+			}
+		}
+		for resource := recording.Resource; resource != nil; resource = resource.Parent {
+			if err = ctx.Err(); err != nil {
+				searchFailure(err)
+				return
+			}
+			resourceBlob := strings.ToLower(recording.AdapterID + " " + resource.Type + " " + resource.ID)
+			if !strings.Contains(resourceBlob, lower) {
+				continue
+			}
+			key := recording.AdapterID + "\x00" + resource.Type + "\x00" + resource.ID
+			if _, exists := resources[key]; !exists && len(resources) < maxSearchResults {
+				resources[key] = map[string]any{"type": "resource", "adapter_id": recording.AdapterID, "resource_type": resource.Type, "resource_id": resource.ID, "display_name": resource.ID}
+			}
+		}
+	}
+	if err = ctx.Err(); err != nil {
+		searchFailure(err)
+		return
+	}
+	resourceKeys := make([]string, 0, len(resources))
+	for key := range resources {
+		resourceKeys = append(resourceKeys, key)
+	}
+	sort.Strings(resourceKeys)
+	for _, key := range resourceKeys {
+		if err = ctx.Err(); err != nil {
+			searchFailure(err)
+			return
+		}
+		if !add(resources[key]) {
+			break
+		}
+	}
+	if len(results) < limit && s.adapters != nil {
+		for _, adapter := range s.adapters.List() {
+			if err = ctx.Err(); err != nil {
+				searchFailure(err)
+				return
+			}
+			d := adapter.Descriptor
+			if d == nil {
+				continue
+			}
+			if strings.Contains(strings.ToLower(d.ID+" "+d.Name), lower) {
+				if !add(map[string]any{"type": "adapter", "id": d.ID, "name": d.Name, "state": adapter.Status.State}) {
+					break
+				}
+			}
+		}
+	}
+	if len(results) < limit && s.adapters != nil {
+		for _, workflow := range s.adapters.ListWorkflows() {
+			if err = ctx.Err(); err != nil {
+				searchFailure(err)
+				return
+			}
+			if strings.Contains(strings.ToLower(workflow.WorkflowID+" "+workflow.AdapterID), lower) {
+				if !add(map[string]any{"type": "workflow", "id": workflow.WorkflowID, "adapter_id": workflow.AdapterID, "state": workflow.State}) {
+					break
+				}
+			}
+		}
+	}
+	if err = ctx.Err(); err != nil {
+		searchFailure(err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func (s *Server) recordingEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	lock := s.productLock(id)
+	lock.RLock()
+	defer lock.RUnlock()
+	recording, err := s.manager.Get(id)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	events := make([]management.RecordingEvent, 0)
+	add := func(kind string, at time.Time, count int, message string) {
+		events = append(events, management.RecordingEvent{ID: stableRecordingEventID(id, kind, at, count), RecordingID: id, Type: kind, At: at, Count: count, Message: message})
+	}
+	add("recording_started", recording.StartedAt, 0, "")
+	if len(recording.Snapshots) > 0 {
+		first := recording.Snapshots[0]
+		for _, snapshot := range recording.Snapshots[1:] {
+			if snapshot.FetchedAt.Before(first.FetchedAt) {
+				first = snapshot
+			}
+		}
+		add("manifest_observed", first.FetchedAt, len(recording.Snapshots), "manifest observed")
+	}
+	if len(recording.Gaps) > 0 {
+		add("gap_detected", recording.Gaps[0].DetectedAt, len(recording.Gaps), "gap detected")
+	}
+	if recording.StoppedAt != nil {
+		kind, message := "recording_stopped", "recording stopped"
+		if recording.State == domain.StateCompleted {
+			kind, message = "recording_completed", "recording completed"
+		}
+		if recording.State == domain.StateInterrupted {
+			kind, message = "recording_interrupted", "recording interrupted"
+		}
+		add(kind, *recording.StoppedAt, 0, message)
+	}
+	if s.products != nil {
+		projected, projectionErr := s.products.RecordingEvents(id, 2000)
+		if projectionErr == nil {
+			events = append(events, projected...)
+		}
+	}
+	if s.integrity != nil {
+		if result, ok := s.integrity.Status(id); ok && !result.LastVerifiedAt.IsZero() {
+			add("integrity_completed", result.LastVerifiedAt, result.ObjectsVerified, "integrity verification completed")
+		}
+	}
+	if s.derivatives != nil {
+		for _, job := range s.derivatives.List(id) {
+			if job.StartedAt != nil {
+				events = append(events, management.RecordingEvent{ID: "export-" + job.ID + "-started", RecordingID: id, Type: "export_started", At: job.StartedAt.UTC(), Message: "export started"})
+			}
+			if job.FinishedAt == nil {
+				continue
+			}
+			switch job.State {
+			case derivative.StateCompleted:
+				events = append(events, management.RecordingEvent{ID: "export-" + job.ID + "-completed", RecordingID: id, Type: "export_completed", At: job.FinishedAt.UTC(), Message: "export completed"})
+			case derivative.StateFailed:
+				events = append(events, management.RecordingEvent{ID: "export-" + job.ID + "-failed", RecordingID: id, Type: "export_failed", At: job.FinishedAt.UTC(), Message: "export failed"})
+			case derivative.StateCanceled:
+				events = append(events, management.RecordingEvent{ID: "export-" + job.ID + "-canceled", RecordingID: id, Type: "export_canceled", At: job.FinishedAt.UTC(), Message: "export canceled"})
+			}
+		}
+	}
+	seen := make(map[string]struct{}, len(events))
+	unique := events[:0]
+	for _, event := range events {
+		if _, ok := seen[event.ID]; ok {
+			continue
+		}
+		seen[event.ID] = struct{}{}
+		unique = append(unique, event)
+	}
+	events = unique
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].At.Equal(events[j].At) {
+			return events[i].ID < events[j].ID
+		}
+		return events[i].At.After(events[j].At)
+	})
+	limit, limitErr := boundedLimit(r, 100, 500)
+	if limitErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid event limit")
+		return
+	}
+	if len(events) > limit {
+		events = events[:limit]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": events})
+}
+
+func (s *Server) auditList(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "audit events are unavailable")
+		return
+	}
+	limit, err := boundedLimit(r, 100, 500)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid audit limit")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.products.Audit(limit)})
+}
+
+func (s *Server) notificationList(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "notifications are unavailable")
+		return
+	}
+	unread := r.URL.Query().Get("unread") == "true"
+	limit, err := boundedLimit(r, 100, 500)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid notification limit")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": s.products.Notifications(unread, limit)})
+}
+
+func (s *Server) notificationSync(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "notifications are unavailable")
+		return
+	}
+	var request struct{}
+	if err := decodeJSONBody(w, r, 1024, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid notification sync request")
+		return
+	}
+	if err := s.syncRecordingNotifications(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "notifications could not be synchronized")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// syncRecordingNotifications projects recent terminal recording states into
+// the bounded notification store. Stable IDs make polling idempotent, and old
+// archives do not create an initial flood when the UI is first opened.
+func (s *Server) syncRecordingNotifications() error {
+	if s.products == nil || s.manager == nil {
+		return nil
+	}
+	add := func(notification management.Notification) error {
+		err := s.products.AddNotification(notification)
+		if errors.Is(err, management.ErrDuplicateNotification) {
+			return nil
+		}
+		return err
+	}
+	recordings := s.manager.List()
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, recording := range recordings {
+		if recording.StoppedAt == nil || recording.StoppedAt.Before(cutoff) {
+			continue
+		}
+		kind := ""
+		switch recording.State {
+		case domain.StateCompleted:
+			kind = "recording_completed"
+		case domain.StateInterrupted:
+			kind = "recording_interrupted"
+		}
+		if kind == "" {
+			continue
+		}
+		id := "recording-" + recording.ID + "-" + string(recording.State)
+		if err := add(management.Notification{ID: id, Type: kind, At: recording.StoppedAt.UTC(), ObjectID: recording.ID}); err != nil {
+			return err
+		}
+	}
+	if s.adapters != nil {
+		for _, item := range s.adapters.List() {
+			if item.Status.State != "unavailable" && item.Status.State != "rejected" && item.Status.State != "failed" {
+				continue
+			}
+			id := "adapter-" + item.Status.ID + "-" + item.Status.State
+			if err := add(management.Notification{ID: id, Type: "adapter_unavailable", At: time.Now().UTC()}); err != nil {
+				return err
+			}
+		}
+	}
+	if s.integrity != nil {
+		for _, recording := range recordings {
+			result, ok := s.integrity.Status(recording.ID)
+			if !ok || result.Status != storage.IntegrityFailed || result.LastVerifiedAt.IsZero() {
+				continue
+			}
+			id := "integrity-" + recording.ID + "-" + strconv.FormatInt(result.LastVerifiedAt.UnixNano(), 10)
+			if err := add(management.Notification{ID: id, Type: "integrity_failure", At: result.LastVerifiedAt.UTC(), ObjectID: recording.ID}); err != nil {
+				return err
+			}
+		}
+	}
+	if s.derivatives != nil {
+		for _, job := range s.derivatives.List("") {
+			if job.State != derivative.StateFailed || job.FinishedAt == nil || job.FinishedAt.Before(cutoff) {
+				continue
+			}
+			id := "export-" + job.ID + "-failed"
+			if err := add(management.Notification{ID: id, Type: "export_failed", At: job.FinishedAt.UTC(), ObjectID: job.RecordingID}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) notificationRead(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "notifications are unavailable")
+		return
+	}
+	if err := s.products.MarkNotificationRead(r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, "notification not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) notificationReadAll(w http.ResponseWriter, r *http.Request) {
+	if s.products == nil {
+		writeError(w, http.StatusServiceUnavailable, "notifications are unavailable")
+		return
+	}
+	if err := s.products.MarkAllNotificationsRead(); err != nil {
+		writeError(w, http.StatusInternalServerError, "notification state could not be saved")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) appendAudit(kind, objectID string) error {
+	if s.products == nil {
+		return nil
+	}
+	return s.products.AppendAudit(management.AuditEvent{ID: randomProductID(), Type: kind, At: time.Now().UTC(), ObjectID: objectID})
+}
+
+func (s *Server) appendWorkflowHistory(progress adapterhost.WorkflowProgress, state string) {
+	if s.products == nil || progress.WorkflowID == "" || progress.AdapterID == "" {
+		return
+	}
+	var resource *management.ResourceRef
+	if progress.Resource != nil {
+		resource = managementResource(progress.Resource)
+	}
+	var challenge *management.ChallengeSummary
+	if progress.Challenge != nil {
+		fieldCount := len(progress.Challenge.Schema.Fields)
+		hasSecret := false
+		for _, field := range progress.Challenge.Schema.Fields {
+			if field.Control == "secret" {
+				hasSecret = true
+			}
+		}
+		if fieldCount == 0 && progress.Challenge.Prompt != nil {
+			fieldCount = len(progress.Challenge.Prompt.Fields)
+			for _, field := range progress.Challenge.Prompt.Fields {
+				if field.Control == "secret" {
+					hasSecret = true
+				}
+			}
+		}
+		summary := &management.ChallengeSummary{FieldCount: fieldCount, HasSecretFields: hasSecret}
+		if progress.Challenge.Prompt != nil {
+			summary.Title = safeWorkflowPromptType(progress.Challenge.Prompt.Type)
+		}
+		challenge = summary
+	}
+	event := management.WorkflowHistoryEvent{ID: randomProductID(), WorkflowID: progress.WorkflowID, AdapterID: progress.AdapterID, State: state, At: time.Now().UTC(), Resource: resource, Challenge: challenge}
+	_ = s.products.AppendWorkflowHistory(event)
+}
+
+func safeWorkflowPromptType(value string) string {
+	switch value {
+	case "action", "prompt", "secret_prompt", "navigate", "display", "status", "complete", "error":
+		return value
+	default:
+		return ""
+	}
+}
+
+func (s *Server) flushWorkflowLifecycleEvents() {
+	if s.adapters == nil {
+		return
+	}
+	if s.products == nil {
+		s.adapters.DiscardWorkflowLifecycleEvents()
+		return
+	}
+	for _, event := range s.adapters.PendingWorkflowLifecycleEvents() {
+		var resource *management.ResourceRef
+		if event.Resource != nil {
+			resource = managementResource(event.Resource)
+		}
+		var challenge *management.ChallengeSummary
+		if event.Challenge != nil {
+			challenge = &management.ChallengeSummary{
+				// The existing history projection has a title slot but no prompt
+				// type field. Store only the protocol's bounded prompt type enum in
+				// that slot; never persist adapter-provided title/message text.
+				Title:           safeWorkflowPromptType(event.Challenge.PromptType),
+				FieldCount:      event.Challenge.FieldCount,
+				HasSecretFields: event.Challenge.HasSecretFields,
+			}
+		}
+		persisted := management.WorkflowHistoryEvent{
+			ID: event.ID, WorkflowID: event.WorkflowID, AdapterID: event.AdapterID,
+			State: event.State, At: event.At, Resource: resource, Challenge: challenge,
+		}
+		err := s.products.AppendWorkflowHistory(persisted)
+		if err == nil || err.Error() == "duplicate workflow history event identifier" {
+			s.adapters.AckWorkflowLifecycleEvent(event.ID)
+			continue
+		}
+		// Keep the failed event and all following events queued. A later HTTP
+		// request retries persistence using the same stable event IDs.
+		return
+	}
+}
+
+func managementResource(ref *adapterproto.ResourceRef) *management.ResourceRef {
+	if ref == nil {
+		return nil
+	}
+	return &management.ResourceRef{Type: ref.Type, ID: ref.ID, Parent: managementResource(ref.Parent)}
+}
+
+func (s *Server) appendRecordingEvent(recordingID, kind string, at time.Time, count int, message string) {
+	if s.products == nil || recordingID == "" || at.IsZero() {
+		return
+	}
+	event := management.RecordingEvent{ID: stableRecordingEventID(recordingID, kind, at, count), RecordingID: recordingID, Type: kind, At: at.UTC(), Count: count, Message: message}
+	_ = s.products.AppendRecordingEvent(event)
+}
+
+func randomProductID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+func stableRecordingEventID(recordingID, kind string, at time.Time, count int) string {
+	digest := sha256.Sum256([]byte(recordingID + "\x00" + kind + "\x00" + at.UTC().Format(time.RFC3339Nano) + "\x00" + strconv.Itoa(count)))
+	return hex.EncodeToString(digest[:16])
+}
+
+func boundedLimit(r *http.Request, defaultValue, max int) (int, error) {
+	values := r.URL.Query()["limit"]
+	if len(values) == 0 || len(values) == 1 && values[0] == "" {
+		return defaultValue, nil
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("limit must occur once")
+	}
+	value, err := strconv.Atoi(values[0])
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("invalid limit")
+	}
+	if value == 0 {
+		return defaultValue, nil
+	}
+	if value > max {
+		return max, nil
+	}
+	return value, nil
+}

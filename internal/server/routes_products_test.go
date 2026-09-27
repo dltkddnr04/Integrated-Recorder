@@ -1,0 +1,627 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
+	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
+	"github.com/dltkddnr04/integrated-recorder/internal/management"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+)
+
+func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording := writeProductRecording(t, store, strings.Repeat("a", 32), domain.StateCompleted)
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrityService, err := integrity.Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer integrityService.Close(context.Background())
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products, Integrity: integrityService})
+
+	query := httptest.NewRecorder()
+	handler.ServeHTTP(query, httptest.NewRequest(http.MethodGet, "/api/v2/recordings?q=resource-stable&has_gaps=true&sort=-size&limit=1", nil))
+	if query.Code != http.StatusOK {
+		t.Fatalf("recording query status=%d body=%s", query.Code, query.Body.String())
+	}
+	var page struct {
+		Items []map[string]any `json:"items"`
+		Total int              `json:"total"`
+	}
+	if err := json.Unmarshal(query.Body.Bytes(), &page); err != nil || page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("recording query response=%s err=%v", query.Body.String(), err)
+	}
+	if page.Items[0]["archive_size_bytes"].(float64) <= 0 || page.Items[0]["gap_duration_seconds"] != nil || page.Items[0]["resource_id"] != "resource-stable" {
+		t.Fatalf("recording query statistics=%v", page.Items[0])
+	}
+
+	tagsPut := httptest.NewRecorder()
+	handler.ServeHTTP(tagsPut, httptest.NewRequest(http.MethodPut, "/api/recordings/"+recording.ID+"/tags", strings.NewReader(`{"tags":["Important","concert"]}`)))
+	if tagsPut.Code != http.StatusOK || !strings.Contains(tagsPut.Body.String(), `"tags":["concert","important"]`) {
+		t.Fatalf("tags put=%d %s", tagsPut.Code, tagsPut.Body.String())
+	}
+	tagsGet := httptest.NewRecorder()
+	handler.ServeHTTP(tagsGet, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID+"/tags", nil))
+	if tagsGet.Code != http.StatusOK || strings.Contains(tagsGet.Body.String(), "Important") {
+		t.Fatalf("tags get=%d %s", tagsGet.Code, tagsGet.Body.String())
+	}
+
+	index := httptest.NewRecorder()
+	handler.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID+"/archive/index", nil))
+	if index.Code != http.StatusOK || strings.Contains(index.Body.String(), "private.invalid") || strings.Contains(index.Body.String(), root) || !strings.Contains(index.Body.String(), "tracks/main/00000001.ts") {
+		t.Fatalf("archive index=%d %s", index.Code, index.Body.String())
+	}
+
+	verify := httptest.NewRecorder()
+	handler.ServeHTTP(verify, httptest.NewRequest(http.MethodPost, "/api/recordings/"+recording.ID+"/integrity/verify", nil))
+	if verify.Code != http.StatusAccepted {
+		t.Fatalf("integrity start=%d %s", verify.Code, verify.Body.String())
+	}
+	var job integrity.Job
+	if err := json.Unmarshal(verify.Body.Bytes(), &job); err != nil || job.ID == "" {
+		t.Fatalf("integrity job=%s err=%v", verify.Body.String(), err)
+	}
+	waitForIntegrityJob(t, handler, job.ID)
+	integrityGet := httptest.NewRecorder()
+	handler.ServeHTTP(integrityGet, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID+"/integrity", nil))
+	if integrityGet.Code != http.StatusOK || !strings.Contains(integrityGet.Body.String(), `"status":"verified"`) {
+		t.Fatalf("integrity status=%d %s", integrityGet.Code, integrityGet.Body.String())
+	}
+
+	dashboard := httptest.NewRecorder()
+	handler.ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
+	if dashboard.Code != http.StatusOK || !strings.Contains(dashboard.Body.String(), `"recordings_total":1`) || !strings.Contains(dashboard.Body.String(), `"active_recordings_count":0`) || !strings.Contains(dashboard.Body.String(), `"active_recordings":[]`) || !strings.Contains(dashboard.Body.String(), `"integrity":{"degraded":0,"failed":0,"unknown":0,"verified":1,"verifying":0}`) {
+		t.Fatalf("dashboard=%d %s", dashboard.Code, dashboard.Body.String())
+	}
+	storageStats := httptest.NewRecorder()
+	handler.ServeHTTP(storageStats, httptest.NewRequest(http.MethodGet, "/api/system/storage", nil))
+	if storageStats.Code != http.StatusOK || strings.Contains(storageStats.Body.String(), root) {
+		t.Fatalf("storage stats=%d %s", storageStats.Code, storageStats.Body.String())
+	}
+	search := httptest.NewRecorder()
+	handler.ServeHTTP(search, httptest.NewRequest(http.MethodGet, "/api/search?q=resource-stable", nil))
+	if search.Code != http.StatusOK || !strings.Contains(search.Body.String(), `"type":"resource"`) {
+		t.Fatalf("global search=%d %s", search.Code, search.Body.String())
+	}
+	if got := products.Audit(10); len(got) != 2 || got[0].Type != "integrity_requested" || got[1].Type != "recording_tags_updated" {
+		t.Fatalf("tag audit=%+v", got)
+	}
+}
+
+func TestGlobalSearchRejectsRepeatedAndUnknownParameters(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(manager, nil, nil)
+
+	for _, target := range []string{
+		"/api/search?q=alpha&q=beta",
+		"/api/search?q=alpha&limit=1&limit=2",
+		"/api/search?q=alpha&unexpected=true",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("GET %s status=%d body=%s, want 400", target, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestGlobalSearchCancellationReturnsNoPartialResults(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProductRecording(t, store, strings.Repeat("c", 32), domain.StateCompleted)
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(manager, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	request := httptest.NewRequest(http.MethodGet, "/api/search?q=resource-stable", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Body.Len() != 0 {
+		t.Fatalf("canceled search returned partial response: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestWorkflowLifecycleEventsPersistAndAcknowledgeOnlyAfterWrite(t *testing.T) {
+	root := t.TempDir()
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force the first projection write to fail. The host event must remain
+	// queued and keep its ID until a later request can persist it.
+	historyPath := filepath.Join(root, "management", "workflow-history.json")
+	if err := os.Mkdir(historyPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	adapterDir := t.TempDir()
+	writeWorkflowServerTestAdapter(t, adapterDir)
+	host, err := adapterhost.Discover(context.Background(), adapterDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	progress, err := host.BeginResolution(context.Background(), "workflow-test", json.RawMessage(`{"opaque_input":"resource-one"}`), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(nil, host, nil, Options{Management: products})
+	request := httptest.NewRequest(http.MethodDelete, "/api/resolve-workflows/"+progress.WorkflowID, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("cancel status=%d body=%s", response.Code, response.Body.String())
+	}
+	pending := host.PendingWorkflowLifecycleEvents()
+	if len(pending) != 1 || pending[0].State != "canceled" {
+		t.Fatalf("failed history write did not retain canceled event: %#v", pending)
+	}
+	eventID := pending[0].ID
+	if err := os.Remove(historyPath); err != nil {
+		t.Fatal(err)
+	}
+	// The middleware flushes after any completed request, not only the
+	// cancellation route that generated the event.
+	flush := httptest.NewRecorder()
+	handler.ServeHTTP(flush, httptest.NewRequest(http.MethodGet, "/api/workflow-history", nil))
+	if flush.Code != http.StatusOK {
+		t.Fatalf("flush request status=%d body=%s", flush.Code, flush.Body.String())
+	}
+	if events := host.PendingWorkflowLifecycleEvents(); len(events) != 0 {
+		t.Fatalf("persisted event was not acknowledged: %#v", events)
+	}
+	history := products.WorkflowHistory(progress.WorkflowID, "", "", 10)
+	if len(history) != 1 || history[0].ID != eventID || history[0].State != "canceled" {
+		t.Fatalf("persisted workflow lifecycle history=%#v want event id %q", history, eventID)
+	}
+	if history[0].Challenge == nil || history[0].Challenge.FieldCount != 2 || !history[0].Challenge.HasSecretFields {
+		t.Fatalf("persisted challenge summary=%#v", history[0].Challenge)
+	}
+	encoded, err := json.Marshal(history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"credential", "required answer", "https://127.0.0.1"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("workflow history leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestAdapterWorkflowErrorIsFailedGatewayResponseNotPendingChallenge(t *testing.T) {
+	root := t.TempDir()
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapterDir := t.TempDir()
+	writeFailedWorkflowServerTestAdapter(t, adapterDir)
+	host, err := adapterhost.Discover(context.Background(), adapterDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	handler := NewWithOptions(nil, host, nil, Options{Management: products})
+	body := `{"adapter_id":"history-error","input":{"manifest_url":"https://media.example/live.m3u8"}}`
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(body)))
+	if response.Code != http.StatusBadGateway || strings.Contains(response.Body.String(), "202") {
+		t.Fatalf("adapter error status=%d body=%s", response.Code, response.Body.String())
+	}
+	if workflows := host.ListWorkflows(); len(workflows) != 0 {
+		t.Fatalf("adapter error created a pending challenge: %#v", workflows)
+	}
+	history := products.WorkflowHistory("", "history-error", "failed", 10)
+	if len(history) != 1 || history[0].WorkflowID == "" || history[0].Challenge == nil {
+		t.Fatalf("failed workflow history=%#v", history)
+	}
+	if events := host.PendingWorkflowLifecycleEvents(); len(events) != 0 {
+		t.Fatalf("persisted failed event was not acknowledged: %#v", events)
+	}
+}
+
+func writeFailedWorkflowServerTestAdapter(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+while IFS= read -r line; do
+  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^\"]*\)".*/\1/p')
+  method=$(printf '%s\n' "$line" | sed -n 's/.*"method":"\([^\"]*\)".*/\1/p')
+  case "$method" in
+    describe)
+      printf '%s\n' '{"protocol_version":1,"id":"'"$request_id"'","result":{"id":"history-error","name":"History Error","version":"1","protocol_version":1,"capabilities":["resolve_workflow"],"input_schema":{"fields":[{"key":"manifest_url","control":"text","label":"Manifest URL","required":true}]},"configuration_schema":{"fields":[]},"resource_types":[],"media_types":["hls"]}}'
+      ;;
+    resolve.begin)
+      workflow_id=$(printf '%s\n' "$line" | sed -n 's/.*"workflow_id":"\([^\"]*\)".*/\1/p')
+      printf '%s\n' '{"protocol_version":1,"id":"'"$request_id"'","result":{"state":"error","workflow_id":"'"$workflow_id"'","challenge":{"schema":{"fields":[{"key":"secret","control":"secret","label":"Secret"},{"key":"ordinary","control":"text","label":"Ordinary","default":"error-default-sentinel"}]},"prompt":{"type":"secret_prompt","interaction_id":"error-prompt","title":"error-title-sentinel","message":"error-message-sentinel","fields":[{"key":"secret","control":"secret","label":"error-field-sentinel"}],"data":{"answer":"error-data-sentinel"}}}}}'
+      ;;
+    shutdown)
+      printf '%s\n' '{"protocol_version":1,"id":"'"$request_id"'","result":{"stopped":true}}'
+      ;;
+    *)
+      printf '%s\n' '{"protocol_version":1,"id":"'"$request_id"'","error":{"code":"unsupported_method","message":"unsupported"}}'
+      ;;
+  esac
+done
+`
+	if err := os.WriteFile(filepath.Join(dir, "integrated-recorder-adapter-history-error"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecordingDeleteRejectsActiveAndDeletesWholeArchiveIdempotently(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := writeProductRecording(t, store, strings.Repeat("b", 32), domain.StateCompleted)
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := products.SetTags(completed.ID, []string{"remove-me"}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products})
+
+	activeStore, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestStarted := make(chan struct{})
+	var requestStartedOnce sync.Once
+	activeClient := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		requestStartedOnce.Do(func() { close(requestStarted) })
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+	activeManager, err := acquire.NewManager(activeStore, activeClient, nil, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := activeManager.StartResolved(context.Background(), "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: "https://stream.invalid/live.m3u8"}, nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("active acquisition did not issue its manifest request")
+	}
+	activeHandler := NewWithOptions(activeManager, nil, nil, Options{})
+	activeDelete := httptest.NewRecorder()
+	activeHandler.ServeHTTP(activeDelete, httptest.NewRequest(http.MethodDelete, "/api/recordings/"+active.ID, nil))
+	if activeDelete.Code != http.StatusConflict {
+		t.Fatalf("active delete status=%d body=%s", activeDelete.Code, activeDelete.Body.String())
+	}
+	if _, err := activeManager.Stop(active.ID); err != nil {
+		t.Fatalf("stop active fixture: %v", err)
+	}
+	delete := httptest.NewRecorder()
+	handler.ServeHTTP(delete, httptest.NewRequest(http.MethodDelete, "/api/recordings/"+completed.ID, nil))
+	if delete.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%s", delete.Code, delete.Body.String())
+	}
+	if _, err := manager.Get(completed.ID); err == nil {
+		t.Fatal("deleted recording remains in manager")
+	}
+	if _, err := products.Tags(completed.ID); err != nil {
+		t.Fatal(err)
+	} else if tags, _ := products.Tags(completed.ID); len(tags) != 0 {
+		t.Fatalf("deleted recording tags remain: %v", tags)
+	}
+	if _, err := store.LoadAll(); err != nil {
+		t.Fatalf("remaining archive cannot reload: %v", err)
+	}
+	again := httptest.NewRecorder()
+	handler.ServeHTTP(again, httptest.NewRequest(http.MethodDelete, "/api/recordings/"+completed.ID, nil))
+	if again.Code != http.StatusNoContent {
+		t.Fatalf("idempotent delete=%d %s", again.Code, again.Body.String())
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestAuthMiddlewareProtectsProductMutationsAndRequiresCSRF(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapBytes, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapToken := strings.TrimSpace(string(bootstrapBytes))
+	if err := auth.Bootstrap(bootstrapToken, "correct horse battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(manager, nil, nil, Options{Management: products, Auth: auth})
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated dashboard=%d %s", unauthorized.Code, unauthorized.Body.String())
+	}
+	login := httptest.NewRecorder()
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"correct horse battery staple"}`))
+	handler.ServeHTTP(login, loginRequest)
+	if login.Code != http.StatusOK || login.Result().Cookies() == nil {
+		t.Fatalf("login=%d %s", login.Code, login.Body.String())
+	}
+	cookies := login.Result().Cookies()
+	loggedIn := httptest.NewRequest(http.MethodGet, "/api/dashboard", nil)
+	for _, cookie := range cookies {
+		loggedIn.AddCookie(cookie)
+	}
+	protected := httptest.NewRecorder()
+	handler.ServeHTTP(protected, loggedIn)
+	if protected.Code != http.StatusOK {
+		t.Fatalf("authenticated dashboard=%d %s", protected.Code, protected.Body.String())
+	}
+	withoutCSRF := httptest.NewRecorder()
+	badMutation := httptest.NewRequest(http.MethodPost, "/api/notifications/read-all", strings.NewReader(`{}`))
+	for _, cookie := range cookies {
+		badMutation.AddCookie(cookie)
+	}
+	handler.ServeHTTP(withoutCSRF, badMutation)
+	if withoutCSRF.Code != http.StatusForbidden {
+		t.Fatalf("mutation without CSRF=%d %s", withoutCSRF.Code, withoutCSRF.Body.String())
+	}
+	var session map[string]any
+	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	for _, cookie := range cookies {
+		sessionRequest.AddCookie(cookie)
+	}
+	sessionRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(sessionRecorder, sessionRequest)
+	if err := json.Unmarshal(sessionRecorder.Body.Bytes(), &session); err != nil {
+		t.Fatal(err)
+	}
+	csrf, _ := session["csrf_token"].(string)
+	mutation := httptest.NewRequest(http.MethodPost, "/api/notifications/read-all", strings.NewReader(`{}`))
+	for _, cookie := range cookies {
+		mutation.AddCookie(cookie)
+	}
+	mutation.Header.Set("X-CSRF-Token", csrf)
+	mutationRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(mutationRecorder, mutation)
+	if mutationRecorder.Code != http.StatusNoContent {
+		t.Fatalf("CSRF-protected mutation=%d %s", mutationRecorder.Code, mutationRecorder.Body.String())
+	}
+}
+
+func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.T) {
+	root := t.TempDir()
+	settings, err := systemsettings.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(nil, nil, nil, Options{Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency()})
+
+	get := httptest.NewRecorder()
+	handler.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/settings", nil))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"theme":"system"`) || !strings.Contains(get.Body.String(), `"concurrency":2`) {
+		t.Fatalf("settings get=%d %s", get.Code, get.Body.String())
+	}
+
+	update := httptest.NewRecorder()
+	handler.ServeHTTP(update, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"ui":{"theme":"dark"},"integrity":{"concurrency":3}}`)))
+	if update.Code != http.StatusOK || !strings.Contains(update.Body.String(), `"restart_required":["integrity.concurrency"]`) {
+		t.Fatalf("settings update=%d %s", update.Code, update.Body.String())
+	}
+	if current := settings.Current(); current.UI.Theme != "dark" || current.Integrity.Concurrency != 3 {
+		t.Fatalf("settings were not persisted: %+v", current)
+	}
+
+	invalid := httptest.NewRecorder()
+	handler.ServeHTTP(invalid, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"ui":{"theme":"dark"},"unknown":true}`)))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("unknown settings field status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestUnavailableExportIsAdvertisedAndNotImplemented(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(manager, nil, nil, Options{})
+	info := httptest.NewRecorder()
+	handler.ServeHTTP(info, httptest.NewRequest(http.MethodGet, "/api/system/info", nil))
+	if info.Code != http.StatusOK || !strings.Contains(info.Body.String(), `"export_available":false`) {
+		t.Fatalf("system info=%d %s", info.Code, info.Body.String())
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/exports", strings.NewReader(`{"format":"mkv"}`)))
+	if response.Code != http.StatusNotImplemented {
+		t.Fatalf("unavailable export status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestThumbnailRoutesReportUnavailableAndMissingProjection(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording := writeProductRecording(t, store, strings.Repeat("c", 32), domain.StateCompleted)
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derivatives, err := derivative.Open(root, store, "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer derivatives.Close(context.Background())
+	handler := NewWithOptions(manager, nil, nil, Options{Derivatives: derivatives})
+
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID+"/thumbnail", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing thumbnail status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	unavailable := httptest.NewRecorder()
+	handler.ServeHTTP(unavailable, httptest.NewRequest(http.MethodPost, "/api/recordings/"+recording.ID+"/thumbnail/regenerate", nil))
+	if unavailable.Code != http.StatusNotImplemented {
+		t.Fatalf("thumbnail regeneration status=%d body=%s", unavailable.Code, unavailable.Body.String())
+	}
+}
+
+func writeProductRecording(t *testing.T, store *storage.Store, id string, state domain.RecordingState) *domain.Recording {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Second)
+	recording := &domain.Recording{
+		FormatVersion: 1, ID: id, Title: "Fixture", AdapterID: "fixture",
+		Adapter:                 &domain.AdapterProvenance{ID: "fixture", Name: "Fixture adapter", Version: "1.0", ProtocolVersion: 1},
+		Resource:                &domain.ResourceReference{Type: "opaque.alpha", ID: "resource-stable"},
+		SourceURIClassification: "sensitive", State: state, CreatedAt: now.Add(-time.Minute), StartedAt: now,
+		Tracks: map[string]*domain.Track{"main": {ID: "main", SourcePlaylistURL: "https://private.invalid/playlist.m3u8?sig=hidden", Segments: []domain.Segment{}}},
+		Gaps:   []domain.Gap{{TrackID: "main", SourceEpoch: 0, FromSequence: 2, ToSequence: 3, DetectedAt: now.Add(time.Second), Reason: "fixture"}},
+	}
+	if state != domain.StateRecording {
+		stopped := now.Add(4 * time.Second)
+		recording.StoppedAt = &stopped
+	}
+	if err := store.CreateRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("original-media-payload")
+	result, err := store.SavePayload(id, "tracks/main/00000001.ts", bytes.NewReader(payload), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment := domain.Segment{ID: "segment-1", TrackID: "main", Sequence: 1, ArchiveOrdinal: 1, SourceURI: "https://private.invalid/segment.ts?sig=hidden", Duration: 4, StoragePath: "tracks/main/00000001.ts", PayloadSize: result.Size, SHA256: result.SHA256}
+	if err = store.SaveSidecar(id, segment.StoragePath, segment); err != nil {
+		t.Fatal(err)
+	}
+	initBytes := []byte("original-init-payload")
+	initResult, err := store.SavePayload(id, "tracks/main/init.mp4", bytes.NewReader(initBytes), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	init := domain.Segment{ID: "init-1", TrackID: "main", SourceURI: "https://private.invalid/init.mp4?sig=hidden", StoragePath: "tracks/main/init.mp4", PayloadSize: initResult.Size, SHA256: initResult.SHA256, IsInit: true}
+	if err = store.SaveSidecar(id, init.StoragePath, init); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.SaveSnapshot(id, "main", "https://private.invalid/index.m3u8?sig=hidden", []byte("#EXTM3U\n"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment.InitSegmentID = init.ID
+	recording.Tracks["main"].Segments = []domain.Segment{segment}
+	recording.Tracks["main"].InitSegments = []domain.Segment{init}
+	recording.Snapshots = []domain.ManifestSnapshot{manifest}
+	recording.State = state
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
+	return recording
+}
+
+func waitForIntegrityJob(t *testing.T, handler http.Handler, id string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/integrity/jobs/"+id, nil))
+		if response.Code == http.StatusOK && strings.Contains(response.Body.String(), `"state":"completed"`) {
+			return
+		}
+		if response.Code != http.StatusOK {
+			t.Fatalf("integrity job status=%d %s", response.Code, response.Body.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("integrity job did not complete")
+}
+
+func TestDeletePathInputCannotTraverse(t *testing.T) {
+	// ServeMux wildcard values are decoded path components. A traversal attempt
+	// must be rejected as a missing or invalid recording ID, never used as a path.
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(manager, nil, nil)
+	request := httptest.NewRequest(http.MethodDelete, "/api/recordings/..%2f..%2fetc%2fpasswd", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code == http.StatusNoContent || response.Code == http.StatusInternalServerError {
+		t.Fatalf("path traversal response=%d %s", response.Code, response.Body.String())
+	}
+}

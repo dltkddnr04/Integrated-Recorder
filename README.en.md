@@ -28,6 +28,8 @@ Adapters declare input/settings schemas and may discover opaque resources or sus
 
 **Milestone 1 and the external adapter protocol milestone are complete.**
 
+Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, and thumbnail projections to backend APIs. First-run administrator setup uses `<DATA_DIR>/security/bootstrap-token`. If FFmpeg is available, separate remux exports and thumbnail generation are offered without changing the canonical recording.
+
 Currently supported:
 
 - external executable adapters, with a platform-agnostic Core and Owncast as the first adapter;
@@ -55,8 +57,8 @@ Not supported yet:
 - external audio rendition synchronization;
 - encrypted HLS and partial-only/delta LL-HLS;
 - DRM workflows;
-- authentication/authorization;
-- export/transcoding.
+- multi-user and role-based authorization;
+- transcoding or additional export formats.
 
 ## Run
 
@@ -91,6 +93,21 @@ The container uses a named `/data` volume and publishes the control API on host 
 | `POST` | `/api/resolve-workflows/{id}/continue` | Submit answers and resume a workflow |
 | `DELETE` | `/api/resolve-workflows/{id}` | Cancel a suspended workflow |
 | `GET` | `/api/recordings` | List recordings |
+| `GET` | `/api/v2/recordings` | Search, filter, sort, and cursor-page recordings |
+| `GET` | `/api/dashboard` | Real recording, storage, integrity, and adapter status |
+| `GET` / `PUT` | `/api/recordings/{id}/tags` | Manage tags |
+| `DELETE` | `/api/recordings/{id}` | Delete an inactive recording |
+| `POST` | `/api/recordings/{id}/integrity/verify` | Start asynchronous archive verification |
+| `POST` | `/api/integrity/jobs/{job_id}/cancel` | Cancel an active integrity verification |
+| `GET` | `/api/logs` | Query the bounded application request log |
+| `GET` | `/api/recordings/{id}/archive/index` | List canonical archive objects |
+| `GET` | `/api/adapters/{id}/resources` | List resources when the adapter advertises browse capability |
+| `POST` | `/api/adapters/{id}/restart`, `/enable`, `/disable` | Manage discovered adapter processes |
+| `POST` | `/api/recordings/{id}/exports` | Request MKV remux when FFmpeg is available |
+| `GET` | `/api/recordings/{id}/thumbnail` | Read a generated thumbnail projection |
+| `POST` | `/api/recordings/{id}/thumbnail/regenerate` | Regenerate a thumbnail when FFmpeg is available |
+| `GET` / `PUT` | `/api/settings` | Supported UI theme and integrity concurrency settings |
+| `POST` | `/api/auth/login`, `/logout`, `/bootstrap` | Single-administrator session authentication |
 | `GET` | `/api/recordings/{id}` | Recording details |
 | `POST` | `/api/recordings/{id}/stop` | Stop recording |
 | `GET` | `/api/recordings/{id}/play/master.m3u8` | Generated VOD master playlist |
@@ -120,10 +137,10 @@ go build ./...
 - [x] Resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] Broadcast metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
-- [ ] Full browser UI
+- [x] Management browser UI v2 and connected product API foundation
 - [ ] Additional platform adapters such as CHZZK, SOOP, and Twitch
 - [ ] Hot/cold storage lifecycle, including HDD/NAS/LTO
-- [ ] Optional export pipeline
+- [x] Optional remux-only export pipeline (when FFmpeg is available)
 
 ## Documentation
 

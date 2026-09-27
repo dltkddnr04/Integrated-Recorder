@@ -28,6 +28,8 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 
 **Milestone 1과 external adapter protocol milestone 완료.**
 
+관리 UI v2는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, resource 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, thumbnail projection을 backend API에 연결합니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우에만 별도의 remux export와 thumbnail 생성이 제공되며 canonical 녹화 데이터는 변경하지 않습니다.
+
 현재 지원:
 
 - Core와 분리된 실행 파일 adapter 구조. Core는 platform semantics를 알지 않으며 Owncast가 첫 adapter입니다.
@@ -55,8 +57,8 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 - external audio rendition synchronization
 - 암호화 HLS 및 partial-only/delta LL-HLS
 - DRM workflow
-- authentication/authorization
-- export/transcoding
+- 다중 사용자·역할 기반 authorization
+- transcoding 및 추가 export format
 
 ## 실행
 
@@ -91,6 +93,21 @@ docker compose up --build
 | `POST` | `/api/resolve-workflows/{id}/continue` | 답변 제출 및 workflow 재개 |
 | `DELETE` | `/api/resolve-workflows/{id}` | 대기 workflow 취소 |
 | `GET` | `/api/recordings` | 녹화 목록 |
+| `GET` | `/api/v2/recordings` | 검색·필터·정렬·커서 페이지네이션 녹화 목록 |
+| `GET` | `/api/dashboard` | 실제 녹화, 저장소, integrity, adapter 현황 |
+| `GET` / `PUT` | `/api/recordings/{id}/tags` | 태그 관리 |
+| `DELETE` | `/api/recordings/{id}` | 비활성 녹화 삭제 |
+| `POST` | `/api/recordings/{id}/integrity/verify` | 비동기 원본 무결성 확인 |
+| `POST` | `/api/integrity/jobs/{job_id}/cancel` | 실행 중인 무결성 확인 취소 |
+| `GET` | `/api/logs` | bounded application request-log 조회 |
+| `GET` | `/api/recordings/{id}/archive/index` | canonical archive object 목록 |
+| `GET` | `/api/adapters/{id}/resources` | adapter가 resource browse capability를 선언한 경우 목록 조회 |
+| `POST` | `/api/adapters/{id}/restart`, `/enable`, `/disable` | 발견된 adapter process 관리 |
+| `POST` | `/api/recordings/{id}/exports` | FFmpeg 설치 시 MKV remux job 요청 |
+| `GET` | `/api/recordings/{id}/thumbnail` | 생성된 thumbnail projection 읽기 |
+| `POST` | `/api/recordings/{id}/thumbnail/regenerate` | FFmpeg 설치 시 thumbnail 다시 생성 |
+| `GET` / `PUT` | `/api/settings` | 실제 지원되는 UI theme 및 integrity concurrency 설정 |
+| `POST` | `/api/auth/login`, `/logout`, `/bootstrap` | single-admin session 인증 |
 | `GET` | `/api/recordings/{id}` | 녹화 상세 |
 | `POST` | `/api/recordings/{id}/stop` | 녹화 중지 |
 | `GET` | `/api/recordings/{id}/play/master.m3u8` | 생성된 VOD master playlist |
@@ -120,10 +137,10 @@ go build ./...
 - [x] resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] 방송 metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
-- [ ] 전체 browser UI
+- [x] management browser UI v2 및 실제 product API 기초
 - [ ] CHZZK, SOOP, Twitch 등 추가 platform adapter
 - [ ] HDD/NAS/LTO를 포함한 hot/cold storage lifecycle
-- [ ] Optional export pipeline
+- [x] Optional remux-only export pipeline (FFmpeg가 있을 때)
 
 ## 문서
 

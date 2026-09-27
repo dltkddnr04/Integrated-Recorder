@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,10 +16,15 @@ import (
 
 	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
+	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
+	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
+	"github.com/dltkddnr04/integrated-recorder/internal/management"
 	"github.com/dltkddnr04/integrated-recorder/internal/network"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 )
 
 func main() {
@@ -68,9 +74,78 @@ func run() error {
 		log.Printf("storage recovery: recording=%s code=%s: %s", issue.ID, issue.Code, issue.Message)
 	}
 
-	httpServer := &http.Server{Addr: addr, Handler: server.New(manager, adapters, configs), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	products, err := management.Open(dataDir)
+	if err != nil {
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("initialize management projections: %w", err)
+	}
+	for _, id := range products.DisabledAdapters() {
+		if discovered, getErr := adapters.Get(id); getErr == nil && discovered.Descriptor != nil {
+			if setErr := adapters.SetEnabled(id, false); setErr != nil {
+				_ = manager.Close(context.Background())
+				adapters.Close()
+				return fmt.Errorf("apply adapter preference: %w", setErr)
+			}
+		}
+	}
+	settings, err := systemsettings.Open(dataDir)
+	if err != nil {
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("initialize system settings: %w", err)
+	}
+	integrityService, err := integrity.Open(dataDir, store, settings.IntegrityConcurrency())
+	if err != nil {
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("initialize integrity verification: %w", err)
+	}
+	exportService, err := derivative.Open(dataDir, store, os.Getenv("FFMPEG_PATH"), 2)
+	if err != nil {
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("initialize remux export: %w", err)
+	}
+
+	authDisabled := os.Getenv("AUTH_DISABLED") == "1"
+	if authDisabled && !isLoopbackAddress(addr) {
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("AUTH_DISABLED is allowed only with a loopback ADDR")
+	}
+	var authService *authn.Service
+	if !authDisabled {
+		authService, err = authn.Open(dataDir)
+		if err != nil {
+			_ = exportService.Close(context.Background())
+			_ = integrityService.Close(context.Background())
+			_ = manager.Close(context.Background())
+			adapters.Close()
+			return fmt.Errorf("initialize administrator authentication: %w", err)
+		}
+		if authService.NeedsBootstrap() {
+			log.Printf("first administrator setup: read %s inside DATA_DIR", authService.BootstrapTokenRelativePath())
+		}
+	}
+	forceSecureCookies := os.Getenv("COOKIE_SECURE") == "1"
+	startedAt := time.Now().UTC()
+
+	version := buildVersion
+	commit := buildCommit
+
+	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(), ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
+	httpServer := &http.Server{Addr: addr, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	retentionDone := make(chan struct{})
+	go func() {
+		defer close(retentionDone)
+		apiServer.RunRetention(shutdownCtx)
+	}()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.ListenAndServe() }()
 
@@ -92,10 +167,20 @@ func run() error {
 		_ = httpServer.Close()
 	}
 	cancelHTTP()
+	// The retention runner shares the signal context and must stop before its
+	// manager and projection dependencies are closed.
+	stop()
+	<-retentionDone
 
 	shutdownWorkers, cancelWorkers := context.WithTimeout(context.Background(), 15*time.Second)
+	if err = exportService.Close(shutdownWorkers); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("export shutdown: %w", err))
+	}
 	if err = manager.Close(shutdownWorkers); err != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("recording shutdown: %w", err))
+	}
+	if err = integrityService.Close(shutdownWorkers); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("integrity shutdown: %w", err))
 	}
 	cancelWorkers()
 	adapters.Close()
@@ -103,4 +188,21 @@ func run() error {
 		return runErr
 	}
 	return nil
+}
+
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
+)
+
+func isLoopbackAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
