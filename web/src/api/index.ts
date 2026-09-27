@@ -56,7 +56,6 @@ export const productAPI = {
   notifications: () => api<{ items: Notification[] }>('/api/notifications'),
   markRead: (id: string) => api<void>(`/api/notifications/${encodeURIComponent(id)}/read`, { method: 'POST' }),
   markAllRead: () => api<void>('/api/notifications/read-all', { method: 'POST' }),
-  syncNotifications: () => api<unknown>('/api/notifications/sync', { method: 'POST' }),
   audit: () => api<{ items: AuditEvent[] }>('/api/audit'),
   logs: (query: { level?: string; component?: string; q?: string; limit?: number; cursor?: string }) => api<{ items: LogEntry[]; next_cursor?: string }>(`/api/logs${queryString(query)}`),
   settings: () => api<SystemSettings>('/api/settings'),

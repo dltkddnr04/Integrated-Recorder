@@ -7,7 +7,8 @@ export class APIError extends Error {
 }
 
 let csrfToken = ''
-export function setCSRFToken(token: string | undefined) { csrfToken = token ?? '' }
+let unauthorizedEventSent = false
+export function setCSRFToken(token: string | undefined) { csrfToken = token ?? ''; if (token) unauthorizedEventSent = false }
 export function invalidateCSRFToken() { csrfToken = '' }
 
 type RequestOptions = Omit<RequestInit, 'body'> & { body?: unknown }
@@ -28,8 +29,14 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   const contentType = response.headers.get('content-type') ?? ''
   const data: unknown = contentType.includes('json') ? await response.json().catch(() => null) : await response.text().catch(() => '')
   if (!response.ok) {
-    if (response.status === 401 && path !== '/api/auth/session') window.dispatchEvent(new CustomEvent('ir:unauthorized'))
-    const detail = typeof data === 'object' && data !== null && 'error' in data ? String((data as { error: unknown }).error) : `요청 실패 (${response.status})`
+    const isCredentialSubmission = path === '/api/auth/login' || path === '/api/auth/bootstrap'
+    if (response.status === 401 && path !== '/api/auth/session' && !isCredentialSubmission && !unauthorizedEventSent) {
+      unauthorizedEventSent = true
+      invalidateCSRFToken()
+      window.dispatchEvent(new CustomEvent('ir:unauthorized'))
+    }
+    const payloadError = typeof data === 'object' && data !== null && 'error' in data ? (data as { error: unknown }).error : undefined
+    const detail = typeof payloadError === 'string' && payloadError.trim() ? payloadError : `요청 실패 (${response.status})`
     throw new APIError(response.status, detail, response.headers.get('X-Request-ID') ?? undefined)
   }
   if (typeof data === 'object' && data !== null && 'csrf_token' in data) {

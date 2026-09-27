@@ -27,4 +27,36 @@ describe('typed API client', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'conflict' }), { status: 409, headers: { 'content-type': 'application/json', 'X-Request-ID': 'req-1' } })))
     await expect(api('/api/example')).rejects.toMatchObject({ status: 409, message: 'conflict', requestID: 'req-1' })
   })
+
+  it('uses a CSRF token returned by bootstrap or login for the next mutation', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ authenticated: true, csrf_token: 'fresh-token' }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await api('/api/auth/login', { method: 'POST', body: { password: 'never persisted' } })
+    await api('/api/example', { method: 'PUT', body: { value: 1 } })
+    const [, mutation] = fetchMock.mock.calls[1] as [string, RequestInit]
+    expect(new Headers(mutation.headers).get('X-CSRF-Token')).toBe('fresh-token')
+  })
+
+  it('deduplicates concurrent protected 401 handling, clears stale CSRF, and leaves credential errors on the login screen', async () => {
+    setCSRFToken('stale-token')
+    const onUnauthorized = vi.fn()
+    window.addEventListener('ir:unauthorized', onUnauthorized)
+    const unauthorized = new Response(JSON.stringify({ error: 'expired' }), { status: 401, headers: { 'content-type': 'application/json' } })
+    const fetchMock = vi.fn().mockResolvedValue(unauthorized)
+    vi.stubGlobal('fetch', fetchMock)
+    await Promise.allSettled([api('/api/recordings'), api('/api/settings')])
+    expect(onUnauthorized).toHaveBeenCalledOnce()
+
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    await api('/api/example', { method: 'POST', body: {} })
+    const [, request] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+    expect(new Headers(request.headers).has('X-CSRF-Token')).toBe(false)
+
+    onUnauthorized.mockClear()
+    await Promise.allSettled([api('/api/auth/login', { method: 'POST', body: { password: 'wrong' } }), api('/api/auth/bootstrap', { method: 'POST', body: { token: 'wrong', password: 'secret' } })])
+    expect(onUnauthorized).not.toHaveBeenCalled()
+    window.removeEventListener('ir:unauthorized', onUnauthorized)
+  })
 })

@@ -19,5 +19,7 @@ describe('recording capture timeline', () => {
       'Segment · epoch 1 · sequence 1',
       'Gap · epoch 1 · 2–3',
     ])
+    const gap = screen.getByTitle('Gap · epoch 1 · 2–3')
+    expect(gap).toHaveStyle({ flexGrow: '2' })
   })
 })

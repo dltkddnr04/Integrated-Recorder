@@ -15,7 +15,9 @@ export type AdapterDescriptor = {
 }
 export type AdapterStatus = { id: string; name?: string; version?: string; protocol_version?: number; state: string; error?: string; generation?: number; restart_attempts?: number }
 export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }
-export type RecordingState = 'recording' | 'completed' | 'interrupted' | 'failed' | string
+export const recordingStates = ['recording', 'stopped', 'completed', 'interrupted'] as const
+export type RecordingState = typeof recordingStates[number]
+export function isRecordingState(value: unknown): value is RecordingState { return typeof value === 'string' && (recordingStates as readonly string[]).includes(value) }
 export type Segment = { sequence?: number; source_sequence?: number; source_epoch?: number; archive_ordinal?: number; duration?: number; storage_path?: string; payload_size?: number; sha256?: string; discontinuity?: boolean; init_segment_id?: string; program_date_time?: string }
 export type Gap = { track_id?: string; source_epoch?: number; from_sequence?: number; to_sequence?: number; duration_seconds?: number; reason?: string }
 export type Track = { id?: string; name?: string; type?: string; segments?: Segment[]; init_segments?: Segment[]; [key: string]: unknown }
@@ -26,22 +28,41 @@ export type RecordingSummary = {
   media_payload_size_bytes?: number; manifest_size_bytes?: number; init_payload_size_bytes?: number; init_segment_count?: number;
   manifest_snapshot_count?: number; gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus; tags?: string[]
 }
-export type RecordingDetail = RecordingSummary & {
-  tracks?: Record<string, Track>; gaps?: Gap[];
-  snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
-  source_uri_classification?: string; statistics?: RecordingSummary; last_error?: string
+export type RecordingListItem = {
+  id: string; title?: string; adapter_id: string; adapter_name?: string; state: RecordingState;
+  resource_type?: string; resource_id?: string; tags: string[]; created_at: string; started_at: string;
+  duration_seconds: number; archive_size_bytes: number; media_payload_size_bytes: number;
+  manifest_size_bytes: number; init_payload_size_bytes: number; segment_count: number;
+  init_segment_count: number; manifest_snapshot_count: number; gap_count: number;
+  gap_segment_count: number; gap_duration_seconds: number | null; integrity: IntegrityStatus
 }
-export type RecordingPage = { items: RecordingSummary[]; next_cursor?: string; total: number }
+export type RecordingDetail = {
+  format_version?: number; id: string; title?: string; adapter_id?: string;
+  adapter?: { id: string; name?: string; version: string; protocol_version: number; descriptor_fingerprint?: string };
+  resource?: ResourceRef & { display_name?: string }; source_uri_classification?: string;
+  source_url?: string; state: RecordingState; created_at: string; started_at: string; stopped_at?: string | null;
+  tracks?: Record<string, Track>; gaps?: Gap[];
+  manifest_snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
+  last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus
+}
 export type IntegrityStatus = 'unknown' | 'verifying' | 'verified' | 'degraded' | 'failed'
+export type RecordingStatistics = {
+  duration_seconds?: number; archive_size_bytes?: number; media_payload_size_bytes?: number;
+  manifest_size_bytes?: number; init_payload_size_bytes?: number; segment_count?: number;
+  init_segment_count?: number; manifest_snapshot_count?: number; gap_count?: number;
+  gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus
+}
+export type RecordingPage = { items: RecordingListItem[]; next_cursor?: string; total: number }
 export type IntegrityResult = { status: IntegrityStatus; last_verified_at?: string; objects_total?: number; objects_verified?: number; objects_missing?: number; objects_corrupt?: number; issues?: { code: string; path?: string }[] }
 export type IntegrityJob = { id: string; recording_id: string; state: 'queued' | 'running' | 'completed' | 'failed' | 'canceled'; created_at: string; started_at?: string; finished_at?: string; error_code?: string; result?: IntegrityResult }
 export type ExportJob = { id: string; recording_id: string; state: string; format?: string; output_name?: string; created_at?: string; finished_at?: string; error_code?: string }
 export type Notification = { id: string; type: string; at: string; read: boolean; object_id?: string }
 export type WorkflowProgress = {
   workflow_id: string; adapter_id: string; state: string; resource?: ResourceRef;
-  challenge?: { schema: Schema; prompt?: { type: string; title?: string; message?: string; fields?: SchemaField[]; data?: unknown }; persistable?: boolean };
+  challenge?: { schema: Schema; prompt?: WorkflowPrompt; persistable?: boolean };
   adapter?: { id: string; version: string; protocol_version: number }
 }
+export type WorkflowPrompt = { type: 'action' | 'prompt' | 'secret_prompt' | 'navigate' | 'display' | 'status' | 'complete' | 'error' | string; title?: string; message?: string; fields?: SchemaField[]; data?: unknown }
 export type WorkflowSummary = { workflow_id: string; adapter_id: string; state: string; resource?: ResourceRef; challenge?: { prompt_type?: string; field_count: number; has_secret_fields: boolean }; created_at: string; updated_at: string; expires_at: string; in_progress: boolean }
 export type WorkflowHistoryEvent = { id: string; workflow_id: string; adapter_id: string; state: string; at: string; resource?: ResourceRef; challenge?: { title?: string; message?: string; field_count: number; has_secret_fields: boolean } }
 export type ConfigView = { values: Record<string, unknown>; secrets: Record<string, { configured: boolean }> }

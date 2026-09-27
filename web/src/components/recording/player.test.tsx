@@ -16,6 +16,17 @@ vi.mock('hls.js', () => ({ default: class HlsMock {
 afterEach(() => vi.clearAllMocks())
 
 describe('RecordingPlayer lifecycle', () => {
+  it('does not request a VOD manifest while the recording is active', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const view = render(<RecordingPlayer recordingId="rec-live" active />)
+    expect(view.getByRole('status')).toHaveTextContent('녹화 중에는 VOD를 재생할 수 없습니다.')
+    expect(view.container.querySelector('video')).toBeNull()
+    expect(hlsState.loadSource).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+    view.unmount()
+    fetchMock.mockRestore()
+  })
+
   it('destroys hls.js and clears the media element when unmounted', async () => {
     const view = render(<RecordingPlayer recordingId="rec-1" />)
     await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-1/play/master.m3u8'))

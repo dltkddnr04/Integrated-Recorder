@@ -32,4 +32,13 @@ describe('schema semantics', () => {
     expect(validateSchema(withDefaults, { name: 'preset', count: Number.NaN }).count).toContain('유효한 숫자')
     expect(validateSchema(withDefaults, { name: 'preset', count: 1 })).toEqual({})
   })
+
+  it('rejects values outside declared select options using JSON value equality', () => {
+    const selectSchema: Schema = { fields: [
+      { key: 'mode', control: 'select', label: 'Mode', options: [{ value: { b: [2], a: 1 }, label: 'Declared' }] },
+      { key: 'formats', control: 'multi-select', label: 'Formats', options: [{ value: 'webm', label: 'WebM' }] },
+    ] }
+    expect(validateSchema(selectSchema, { mode: { a: 1, b: [2] }, formats: ['webm'] })).toEqual({})
+    expect(validateSchema(selectSchema, { mode: 'unknown', formats: ['webm', 'unexpected'] })).toEqual({ mode: '선택한 옵션이 올바르지 않습니다.', formats: '선택한 옵션이 올바르지 않습니다.' })
+  })
 })
