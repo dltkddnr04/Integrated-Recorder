@@ -1,4 +1,4 @@
-import{l as a,j as t,p as u,M as n,N as s}from"./index-BnLt2Bii.js";import{T as d,b as c}from"./query-state-CuLeyi-x.js";/**
+import{t as a,j as t,p as u,O as n,P as p}from"./index-BKmny9f9.js";import{T as d,b as c}from"./query-state-Dz73wvgM.js";/**
  * @license lucide-react v0.468.0 - ISC
  *
  * This source code is licensed under the ISC license.
@@ -8,7 +8,7 @@ import{l as a,j as t,p as u,M as n,N as s}from"./index-BnLt2Bii.js";import{T as 
  *
  * This source code is licensed under the ISC license.
  * See the LICENSE file in the root directory of this source tree.
- */const l=a("CircleX",[["circle",{cx:"12",cy:"12",r:"10",key:"1mglay"}],["path",{d:"m15 9-6 6",key:"1uzhvr"}],["path",{d:"m9 9 6 6",key:"z0biqf"}]]);/**
+ */const o=a("CircleX",[["circle",{cx:"12",cy:"12",r:"10",key:"1mglay"}],["path",{d:"m15 9-6 6",key:"1uzhvr"}],["path",{d:"m9 9 6 6",key:"z0biqf"}]]);/**
  * @license lucide-react v0.468.0 - ISC
  *
  * This source code is licensed under the ISC license.
@@ -18,4 +18,4 @@ import{l as a,j as t,p as u,M as n,N as s}from"./index-BnLt2Bii.js";import{T as 
  *
  * This source code is licensed under the ISC license.
  * See the LICENSE file in the root directory of this source tree.
- */const h=a("Square",[["rect",{width:"18",height:"18",x:"3",y:"3",rx:"2",key:"afitv7"}]]),p={recording:"green",completed:"blue",interrupted:"amber",failed:"red",verified:"green",degraded:"amber",unknown:"neutral",verifying:"blue",queued:"neutral",running:"blue",ready:"green",unavailable:"amber",rejected:"red",disabled:"neutral"},k={recording:y,completed:n,interrupted:d,failed:l,verified:n,degraded:d,verifying:c,unknown:i,queued:i,running:c,ready:n,unavailable:d,rejected:l,disabled:h};function b({state:r}){const e=(r==null?void 0:r.toLowerCase())??"unknown",o=k[e]??i;return t.jsxs(u,{tone:p[e]??"neutral",children:[t.jsx(o,{className:`h-3 w-3 ${e==="running"||e==="verifying"?"animate-spin":""}`}),s(e)]})}export{l as C,y as R,b as S};
+ */const l=a("Square",[["rect",{width:"18",height:"18",x:"3",y:"3",rx:"2",key:"afitv7"}]]),h={recording:"green",stopped:"neutral",completed:"blue",interrupted:"amber",failed:"red",verified:"green",degraded:"amber",unknown:"neutral",verifying:"blue",queued:"neutral",running:"blue",ready:"green",unavailable:"amber",rejected:"red",disabled:"neutral"},k={recording:y,stopped:l,completed:n,interrupted:d,failed:o,verified:n,degraded:d,verifying:c,unknown:i,queued:i,running:c,ready:n,unavailable:d,rejected:o,disabled:l},m={recording:"녹화 중",stopped:"중지됨",completed:"완료",interrupted:"중단됨"};function f({state:r}){const e=(r==null?void 0:r.toLowerCase())??"unknown",s=k[e]??i;return t.jsxs(u,{tone:h[e]??"neutral",children:[t.jsx(s,{className:`h-3 w-3 ${e==="running"||e==="verifying"?"animate-spin":""}`}),m[e]??p(e)]})}export{o as C,y as R,f as S};
