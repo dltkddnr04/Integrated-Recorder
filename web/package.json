@@ -9,7 +9,7 @@
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:e2e": "playwright test",
+    "test:e2e": "node e2e/run-playwright.mjs",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {

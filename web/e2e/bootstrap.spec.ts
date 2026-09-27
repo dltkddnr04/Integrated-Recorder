@@ -26,6 +26,10 @@ test('first-run setup sends bootstrap token and password through authenticated A
     recent_recordings: [], active_recordings: [],
   } }))
   await page.route('**/api/notifications', route => route.fulfill({ json: { items: [] } }))
+  await page.route('**/api/resolve-workflows', route => route.fulfill({ json: [] }))
+  await page.route('**/api/adapters', route => route.fulfill({ json: [] }))
+  await page.route('**/api/settings', route => route.fulfill({ json: { settings: { ui: { theme: 'light' }, integrity: { concurrency: 1 }, retention: { enabled: false, completed_after_days: 30 } }, restart_required: [] } }))
+  await page.route('**/api/system/storage', route => route.fulfill({ json: { filesystem_total_bytes: 0, filesystem_used_bytes: 0, filesystem_available_bytes: 0, recordings_bytes: 0, recording_count: 0, segment_count: 0, init_segment_count: 0, manifest_count: 0 } }))
   await page.goto('/login?mode=bootstrap')
   await expect(page.getByText('/data/bootstrap-token')).toBeVisible()
   await page.getByLabel('Bootstrap token').fill('one-time-token')
