@@ -398,6 +398,13 @@ func TestAuthMiddlewareProtectsProductMutationsAndRequiresCSRF(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewWithOptions(manager, nil, nil, Options{Management: products, Auth: auth})
+	spa := httptest.NewRecorder()
+	spaRequest := httptest.NewRequest(http.MethodGet, "/recordings/example-id", nil)
+	spaRequest.Header.Set("Accept", "text/html")
+	handler.ServeHTTP(spa, spaRequest)
+	if spa.Code != http.StatusOK || !strings.Contains(spa.Body.String(), `id="root"`) {
+		t.Fatalf("unauthenticated browser deep link should receive the login-capable SPA shell: %d", spa.Code)
+	}
 
 	unauthorized := httptest.NewRecorder()
 	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/dashboard", nil))

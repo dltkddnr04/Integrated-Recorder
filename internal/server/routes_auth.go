@@ -128,8 +128,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 func authRoutePublic(r *http.Request) bool {
-	if r.URL.Path == "/healthz" || r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/static/") || r.URL.Path == "/api/auth/session" {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/api/auth/session" || isSPARoute(r.URL.Path) || strings.HasPrefix(r.URL.Path, "/static/") {
+			return true
+		}
+	}
+	if r.Method == http.MethodPost && (r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/bootstrap") {
 		return true
 	}
-	return r.Method == http.MethodPost && (r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/bootstrap")
+	return false
 }

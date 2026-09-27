@@ -162,12 +162,22 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if !isSPARoute(r.URL.Path) {
 		http.NotFound(w, r)
 		return
 	}
+	if r.URL.Path != "/" && !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		http.NotFound(w, r)
+		return
+	}
+	page, err := staticFiles.ReadFile("static/ui/index.html")
+	if err != nil {
+		http.Error(w, "web application is not built", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, safeIndexHTML)
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(page)
 }
 
 type createRequest struct {
@@ -981,7 +991,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; connect-src 'self'; font-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; worker-src 'self' blob:; frame-ancestors 'none'; form-action 'self'")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Frame-Options", "DENY")

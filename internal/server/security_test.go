@@ -65,15 +65,19 @@ func TestManagementAssetsAreLocalAndSecurityHeadersArePresent(t *testing.T) {
 			t.Errorf("%s=%q, want it to contain %q", key, got, want)
 		}
 	}
-	if strings.Contains(page.Body.String(), "cdn.jsdelivr.net") || strings.Contains(page.Body.String(), "<script>") || !strings.Contains(page.Body.String(), "/static/app.js") {
+	csp := page.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'") {
+		t.Fatalf("CSP must allow component positioning styles without allowing inline scripts: %q", csp)
+	}
+	if strings.Contains(page.Body.String(), "cdn.jsdelivr.net") || strings.Contains(page.Body.String(), "<script>") || !strings.Contains(page.Body.String(), "/static/ui/assets/") {
 		t.Fatal("management page loads unpinned external or inline script")
 	}
-	for _, asset := range []string{"app.js", "app.css", "hls.min.js", "HLSJS-LICENSE.txt"} {
-		response := httptest.NewRecorder()
-		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/static/"+asset, nil))
-		if response.Code != http.StatusOK || response.Body.Len() == 0 {
-			t.Errorf("asset %s: status=%d size=%d", asset, response.Code, response.Body.Len())
-		}
+	deepRoute := httptest.NewRecorder()
+	deepRequest := httptest.NewRequest(http.MethodGet, "/recordings/recording-id", nil)
+	deepRequest.Header.Set("Accept", "text/html")
+	handler.ServeHTTP(deepRoute, deepRequest)
+	if deepRoute.Code != http.StatusOK || !strings.Contains(deepRoute.Body.String(), "/static/ui/assets/") {
+		t.Fatalf("direct SPA route did not serve application shell: %d", deepRoute.Code)
 	}
 }
 
