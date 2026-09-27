@@ -5,3 +5,7 @@
 /adapters/
 /adapter-binaries/*
 !/adapter-binaries/.gitkeep
+/web/node_modules/
+/web/coverage/
+/web/playwright-report/
+/web/test-results/

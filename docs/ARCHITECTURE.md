@@ -93,7 +93,7 @@ Single-administrator authentication is enabled by default. First-run setup uses 
 
 The optional `internal/derivative` service activates only when an FFmpeg executable is available. Export validates and privately copies source HLS payloads into a separate staging directory, creates a local playlist, and performs MKV `-c copy` remuxing for stopped/completed recordings. It passes a structured argument vector without a shell and disallows network protocols. Jobs, cancellation, timeouts, restart recovery, and downloads live outside the canonical archive; the recording directory and metadata are not changed. Thumbnail generation reads the first archived video frame into a bounded, private JPEG projection under `thumbnails/`; it uses verified local payload copies and never fetches the source URI. `GET /api/recordings/{id}/thumbnail` serves the projection and `POST .../thumbnail/regenerate` replaces it. A generation failure does not change the archive. When FFmpeg is missing, both export and thumbnail generation are unavailable and the UI shows the placeholder. Transcoding and additional containers are not implemented.
 
-Recording directories are mode `0700`; metadata, payload, and sidecar files use mode `0600`. File secret/state backends do not encrypt values at rest. The management API provides one administrator but no multi-user/role authorization. Local runs bind to loopback by default and Compose publishes only on `127.0.0.1`. Use TLS and Secure cookies behind a reverse proxy, and do not expose the control plane directly to untrusted networks. The page uses local pinned hls.js 1.5.17 (Apache-2.0) and restrictive CSP/security headers.
+Recording directories are mode `0700`; metadata, payload, and sidecar files use mode `0600`. File secret/state backends do not encrypt values at rest. The management API provides one administrator but no multi-user/role authorization. Local runs bind to loopback by default and Compose publishes only on `127.0.0.1`. Use TLS and Secure cookies behind a reverse proxy, and do not expose the control plane directly to untrusted networks. The page bundles hls.js 1.6.7 (Apache-2.0) and retains restrictive CSP/security headers. Scripts remain same-origin only; `style-src-attr` narrowly permits the inline style attributes Radix needs to position popovers and selects.
 
 ## Server lifecycle and Docker
 
@@ -106,3 +106,19 @@ The container runs as UID 10001. Compose uses a named `/data` volume and publish
 For a stopped, completed, or interrupted recording, Core creates a finite seekable HLS VOD manifest over stored source segments. Segment endpoints return stored bytes directly; playback does not concatenate or remux files. Browser codec support remains necessary.
 
 Not implemented: chat/metadata timeline, asynchronous adapter notification runtime, real platform authentication flows, additional platform adapters, workflow persistence across Core restart, encrypted HLS, external rendition synchronization, DASH, archive finalization/TAR, LTO, export transcoding/additional formats, multi-user/role authorization, adapter sandboxing, and adapter hot reload.
+
+## Web application
+
+The management UI is a React 19 + TypeScript SPA under `web/`. It uses Vite, Tailwind, shadcn-style Radix UI components, TanStack Query/Router/Table, Lucide, and hls.js. API requests and CSRF handling live in a shared client; TanStack Query owns server state. The browser uses same-origin `/api` endpoints, and the player bundles hls.js locally.
+
+For local development, run the Go API and Vite in separate terminals:
+
+```sh
+go run ./cmd/archiver
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+Production Go binaries embed Vite output under `internal/server/static/ui/`. `make build` builds the frontend before Go; the Dockerfile uses a separate Node build stage. Only allowlisted client routes receive the SPA entry on direct navigation. `/api/**` and `/static/**` are excluded from SPA fallback.
+
+On first start, the UI checks `/api/auth/session` and displays bootstrap or login. The bootstrap token is stored at `DATA_DIR/security/bootstrap-token` and is submitted with the password to `/api/auth/bootstrap`. After login, the shared API client automatically sends the session CSRF token on mutation requests.

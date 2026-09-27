@@ -25,7 +25,7 @@ Browser ── HTTP API / 생성 VOD ── Core
 - `cmd/adapters/owncast`, `internal/adapters/owncast` — 첫 번째 standalone adapter. Core는 Owncast package를 import하지 않음
 - `internal/hls` — 지원하는 HLS subset parser. `internal/acquire` — polling, refresh, retry, segment acquisition, sequence epoch, recording lifecycle
 - `internal/network` — public destination 검증 및 매 연결마다 검증한 주소에 고정하는 dial
-- `internal/domain` — adapter wire type과 분리된 archive type. `internal/storage` — 내구성 있는 payload와 self-describing metadata 기록. `internal/server` — API와 정적 관리 페이지
+- `internal/domain` — adapter wire type과 분리된 archive type. `internal/storage` — 내구성 있는 payload와 self-describing metadata 기록. `internal/server` — API와 embedded React SPA
 
 ## Adapter process와 protocol
 
@@ -93,7 +93,7 @@ Adapter resource browsing은 protocol capability `resource_browse`를 선언한 
 
 Optional `internal/derivative` service는 FFmpeg executable이 확인될 때에만 활성화됩니다. Export는 완료/중지 recording의 원본 HLS payload를 private staging directory에 검증 복사하고 local playlist를 만들어 MKV `-c copy` remux만 수행합니다. FFmpeg 인자는 shell을 통하지 않는 argument vector이고 network protocol은 허용되지 않습니다. Job, cancellation, timeout, restart recovery, download artifact는 canonical archive 외부에 저장됩니다. Thumbnail generation은 저장된 첫 video frame을 bounded private JPEG projection으로 생성하며, 검증한 local payload만 사용하고 source URI를 fetch하지 않습니다. `GET /api/recordings/{id}/thumbnail`은 projection을 반환하고 `POST .../thumbnail/regenerate`는 다시 생성합니다. 생성 실패는 canonical archive에 영향을 주지 않습니다. FFmpeg가 없으면 export와 thumbnail 생성이 unavailable이며 UI는 placeholder를 표시합니다. Transcoding과 다른 container는 구현하지 않았습니다.
 
-Recording directory는 `0700`, metadata/payload/sidecar 파일은 `0600`입니다. File secret/state backend는 at-rest encryption을 제공하지 않습니다. Management API는 single-admin 인증을 제공하지만 multi-user/role authorization은 없습니다. Local 실행은 loopback에 bind하고 Compose도 host의 `127.0.0.1`에만 port를 공개합니다. Reverse proxy 사용 시 TLS 및 cookie Secure 설정을 적용하고 untrusted network에 직접 노출하지 마세요. 관리 페이지는 로컬 pinned hls.js 1.5.17(Apache-2.0)과 restrictive CSP/security header를 사용합니다.
+Recording directory는 `0700`, metadata/payload/sidecar 파일은 `0600`입니다. File secret/state backend는 at-rest encryption을 제공하지 않습니다. Management API는 single-admin 인증을 제공하지만 multi-user/role authorization은 없습니다. Local 실행은 loopback에 bind하고 Compose도 host의 `127.0.0.1`에만 port를 공개합니다. Reverse proxy 사용 시 TLS 및 cookie Secure 설정을 적용하고 untrusted network에 직접 노출하지 마세요. 관리 페이지는 bundled hls.js 1.6.7(Apache-2.0)과 restrictive CSP/security header를 사용합니다. Script는 same-origin만 허용하며, Radix 팝업 위치 계산에 필요한 inline style attribute만 `style-src-attr`로 허용합니다.
 
 ## Server lifecycle과 Docker
 
@@ -106,3 +106,19 @@ Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 �
 중지/완료/interrupted recording의 저장 segment를 참조하는 finite HLS VOD manifest를 생성합니다. Segment endpoint는 저장된 원본 byte를 직접 반환하며 파일을 이어 붙이거나 remux하지 않습니다. 재생 가능한 codec인지 여부는 browser 지원에 달려 있습니다.
 
 미구현: chat/metadata timeline, 비동기 adapter notification runtime, 실제 platform authentication flow, 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export transcoding/추가 format, multi-user/role authorization, adapter sandbox, adapter hot reload.
+
+## Web application
+
+관리 UI는 `web/`의 React 19 + TypeScript SPA입니다. Vite, Tailwind, shadcn 스타일의 Radix UI components, TanStack Query/Router/Table, Lucide, hls.js를 사용합니다. API 호출과 CSRF 처리는 공통 client에 모이며, 서버 상태는 TanStack Query가 관리합니다. 브라우저는 같은 출처의 `/api`를 사용하고 VOD 재생에 필요한 hls.js는 bundle에 포함됩니다.
+
+개발 시 Go API와 Vite를 별도 터미널에서 실행합니다:
+
+```sh
+go run ./cmd/archiver
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+운영 binary에는 Vite build output이 `internal/server/static/ui/` 아래 embed됩니다. `make build`가 web asset build 후 Go build를 순서대로 실행하고, Dockerfile은 별도의 Node build stage에서 asset을 생성합니다. React client route는 allowlist된 경로에 한해서 직접 열 수 있으며 `/api/**`와 `/static/**`는 SPA fallback 대상이 아닙니다.
+
+첫 실행에서 UI는 `/api/auth/session`을 조회해 bootstrap 또는 login 화면을 표시합니다. Bootstrap token은 `DATA_DIR/security/bootstrap-token`에 있으며 password와 함께 `/api/auth/bootstrap`으로 제출됩니다. 로그인 후 mutation은 backend session의 CSRF token을 공통 API client가 자동 전송합니다.

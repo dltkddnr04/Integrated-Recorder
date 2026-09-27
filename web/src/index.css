@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color-scheme: light;
+  --background: 220 20% 98%; --foreground: 222 28% 12%; --card: 0 0% 100%; --card-foreground: 222 28% 12%;
+  --popover: 0 0% 100%; --popover-foreground: 222 28% 12%; --primary: 215 79% 48%; --primary-foreground: 0 0% 100%;
+  --secondary: 216 20% 95%; --secondary-foreground: 220 22% 20%; --muted: 216 20% 95%; --muted-foreground: 218 10% 46%;
+  --accent: 214 35% 94%; --accent-foreground: 215 79% 32%; --destructive: 0 70% 48%; --border: 218 18% 88%; --input: 218 18% 86%; --ring: 215 79% 48%; --radius: 0.7rem;
+}
+.dark {
+  color-scheme: dark;
+  --background: 222 25% 8%; --foreground: 215 20% 92%; --card: 222 22% 11%; --card-foreground: 215 20% 92%;
+  --popover: 222 22% 12%; --popover-foreground: 215 20% 92%; --primary: 212 90% 62%; --primary-foreground: 222 28% 9%;
+  --secondary: 220 16% 17%; --secondary-foreground: 215 20% 90%; --muted: 220 16% 16%; --muted-foreground: 218 12% 62%;
+  --accent: 218 20% 18%; --accent-foreground: 211 92% 72%; --destructive: 0 68% 58%; --border: 220 16% 21%; --input: 220 16% 24%; --ring: 212 90% 62%;
+}
+* { box-sizing: border-box; }
+.login-hero-glow { background-image: radial-gradient(circle at 80% 20%, #3185d8 0, transparent 35%), linear-gradient(145deg, transparent 35%, #172b42 100%); }
+.storage-progress { appearance: none; display: block; width: 100%; height: .5rem; overflow: hidden; border: 0; border-radius: 9999px; background: hsl(var(--muted)); }
+.storage-progress::-webkit-progress-bar { border-radius: 9999px; background: hsl(var(--muted)); }
+.storage-progress::-webkit-progress-value { border-radius: 9999px; background: hsl(var(--primary)); }
+.storage-progress::-moz-progress-bar { border-radius: 9999px; background: hsl(var(--primary)); }
+body { margin: 0; background: hsl(var(--background)); color: hsl(var(--foreground)); min-width: 320px; }
+button, input, textarea, select { font: inherit; }
+a { color: inherit; text-decoration: none; }
+::selection { background: hsl(var(--primary) / .18); }
+.focus-ring { @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background; }
+.page-enter { animation: page-in .18s ease-out both; }
+@keyframes page-in { from { opacity: .6; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }

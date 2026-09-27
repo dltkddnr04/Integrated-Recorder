@@ -124,10 +124,30 @@ curl -X POST http://localhost:8080/api/recordings \
 
 ## Development
 
+Web UI development requires Node.js 20 or newer. Run the Go API and Vite development server in separate terminals.
+
+```sh
+go run ./cmd/archiver
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+Build the React assets into the Go embed directory before building a production binary. `make build` runs the UI build followed by the Go build.
+
+```sh
+npm --prefix web run build
+go build ./...
+# or
+make build
+```
+
+For first-run administrator setup, read the token from `<DATA_DIR>/security/bootstrap-token`.
+
+Validation commands:
+
 ```sh
 go test -race -count=1 ./...
 go vet ./...
-go build ./...
 ```
 
 ## Roadmap
@@ -137,7 +157,7 @@ go build ./...
 - [x] Resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] Broadcast metadata + chat timeline
 - [ ] Finalized archive packaging + random-access index
-- [x] Management browser UI v2 and connected product API foundation
+- [x] React management SPA and connected product API foundation
 - [ ] Additional platform adapters such as CHZZK, SOOP, and Twitch
 - [ ] Hot/cold storage lifecycle, including HDD/NAS/LTO
 - [x] Optional remux-only export pipeline (when FFmpeg is available)

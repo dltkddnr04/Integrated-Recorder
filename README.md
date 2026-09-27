@@ -28,7 +28,7 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 
 **Milestone 1과 external adapter protocol milestone 완료.**
 
-관리 UI v2는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, resource 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, thumbnail projection을 backend API에 연결합니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우에만 별도의 remux export와 thumbnail 생성이 제공되며 canonical 녹화 데이터는 변경하지 않습니다.
+React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, resource 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, thumbnail projection을 backend API에 연결합니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우에만 별도의 remux export와 thumbnail 생성이 제공되며 canonical 녹화 데이터는 변경하지 않습니다.
 
 현재 지원:
 
@@ -124,10 +124,30 @@ curl -X POST http://localhost:8080/api/recordings \
 
 ## 개발
 
+Web UI 개발에는 Node.js 20 이상이 필요합니다. Go API와 Vite 개발 서버를 별도 터미널에서 실행합니다.
+
+```sh
+go run ./cmd/archiver
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+운영용 Go binary를 만들기 전에는 React UI asset을 embed 경로에 빌드합니다. `make build`는 UI build와 Go build를 순서대로 실행합니다.
+
+```sh
+npm --prefix web run build
+go build ./...
+# 또는
+make build
+```
+
+최초 관리자 설정 token은 `<DATA_DIR>/security/bootstrap-token`에서 확인합니다.
+
+검증 명령:
+
 ```sh
 go test -race -count=1 ./...
 go vet ./...
-go build ./...
 ```
 
 ## Roadmap
