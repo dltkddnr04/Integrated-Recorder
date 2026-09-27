@@ -40,14 +40,17 @@ type RefreshPreparer interface {
 type SourceValidator func(context.Context, string) error
 
 type entry struct {
-	mu          sync.Mutex
-	recording   *domain.Recording
-	cancel      context.CancelFunc
-	done        chan struct{}
-	media       adapterproto.MediaSource
-	adapterID   string
-	resource    *adapterproto.ResourceRef
-	terminalErr error
+	mu              sync.Mutex
+	recording       *domain.Recording
+	cancel          context.CancelFunc
+	done            chan struct{}
+	media           adapterproto.MediaSource
+	mediaGeneration uint64
+	refreshGate     chan struct{}
+	scheduler       *segmentScheduler
+	adapterID       string
+	resource        *adapterproto.ResourceRef
+	terminalErr     error
 }
 
 type Manager struct {
@@ -199,7 +202,7 @@ func (m *Manager) startResolved(ctx context.Context, adapterID string, media ada
 		return nil, errors.New("recording storage could not be initialized")
 	}
 	workerCtx, cancel := context.WithCancel(context.Background())
-	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), adapterID: adapterID, resource: cloneResourceRef(resource)}
+	e := &entry{recording: recording, cancel: cancel, done: make(chan struct{}), media: cloneMediaSource(media), refreshGate: make(chan struct{}, 1), adapterID: adapterID, resource: cloneResourceRef(resource)}
 	m.mu.Lock()
 	m.entries[id] = e
 	m.mu.Unlock()

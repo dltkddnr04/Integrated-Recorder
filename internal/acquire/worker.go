@@ -139,119 +139,145 @@ func fetchManifest(ctx context.Context, client *http.Client, uri string, headers
 }
 
 func (m *Manager) process(e *entry, ctx context.Context, playlist hls.MediaPlaylist) (bool, error) {
-	if len(playlist.Segments) == 0 {
-		if playlist.EndList {
-			if err := m.update(e, func(r *domain.Recording) error {
-				m.finalizePending(r, "stream ended with uncaptured media")
-				r.State = domain.StateCompleted
-				now := time.Now().UTC()
-				r.StoppedAt = &now
-				return nil
-			}); err != nil {
-				return true, err
-			}
-			return true, nil
+	return m.processWithScheduler(e, ctx, playlist, true)
+}
+
+func (m *Manager) processWithScheduler(e *entry, ctx context.Context, playlist hls.MediaPlaylist, waitForIdle bool) (bool, error) {
+	_, generation := currentMediaVersion(e)
+	return m.processWithSchedulerGeneration(e, ctx, playlist, waitForIdle, generation)
+}
+
+func (m *Manager) processWithSchedulerGeneration(e *entry, ctx context.Context, playlist hls.MediaPlaylist, waitForIdle bool, generation uint64) (bool, error) {
+	scheduler := activeScheduler(e)
+	owned := false
+	if scheduler == nil {
+		var err error
+		scheduler, err = newSegmentScheduler(ctx, m, e)
+		if err != nil {
+			return false, err
 		}
+		owned = true
+	}
+	if owned {
+		scheduler.mu.Lock()
+		scheduler.directMode = waitForIdle
+		scheduler.mu.Unlock()
+		defer scheduler.close()
+	}
+	if !scheduler.manifestGenerationCurrent(generation) {
 		return false, nil
 	}
-	if err := m.observePlaylist(e, playlist); err != nil {
-		return false, err
-	}
-	epoch := currentEpoch(e)
-	for index, source := range playlist.Segments {
-		if ctx.Err() != nil {
-			if err := m.markRemainingPending(e, epoch, playlist.Segments[index:], ctx.Err()); err != nil {
-				return false, err
-			}
-			return false, ctx.Err()
-		}
-		if source.Gap {
-			continue
-		}
-		if m.hasSequence(e, epoch, source.Sequence) {
-			continue
-		}
-		media := currentMedia(e)
-		initID := ""
-		if source.Init != nil {
-			id, err := m.acquireInit(ctx, e, *source.Init, epoch, source.DiscontinuitySequence, media)
-			if err != nil {
-				if m.shouldRefresh(media, err) {
-					return false, makeSegmentRefreshTrigger(epoch, source.Sequence, err)
-				}
-				if pendingErr := m.markPending(e, epoch, source.Sequence, err); pendingErr != nil {
-					return false, pendingErr
-				}
-				return false, nil
-			}
-			initID = id
-		}
-		ordinal, err := nextArchiveOrdinal(e)
-		if err != nil {
-			return false, err
-		}
-		firstInEpoch := epoch > 0 && !hasCapturedEpoch(e, epoch)
-		segment, err := m.acquireMedia(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media)
-		if err != nil {
-			if m.shouldRefresh(media, err) {
-				return false, makeSegmentRefreshTrigger(epoch, source.Sequence, err)
-			}
-			if pendingErr := m.markPending(e, epoch, source.Sequence, err); pendingErr != nil {
-				return false, pendingErr
-			}
+	if len(playlist.Segments) == 0 {
+		if !playlist.EndList {
 			return false, nil
 		}
-		if err = m.store.SaveSidecar(recordingID(e), segment.StoragePath, segment); err != nil {
+		if !scheduler.endList(generation) {
+			return false, nil
+		}
+		completed, err := scheduler.drainEndList(ctx, generation)
+		if err != nil {
 			return false, err
 		}
-		if err = m.update(e, func(r *domain.Recording) error {
-			t := r.Tracks["main"]
-			for _, existing := range t.Segments {
-				if existing.SourceEpoch == segment.SourceEpoch && existing.Sequence == segment.Sequence {
-					return nil
-				}
-			}
-			t.Segments = append(t.Segments, segment)
-			sort.Slice(t.Segments, func(i, j int) bool {
-				if t.Segments[i].ArchiveOrdinal != t.Segments[j].ArchiveOrdinal {
-					return t.Segments[i].ArchiveOrdinal < t.Segments[j].ArchiveOrdinal
-				}
-				if t.Segments[i].SourceEpoch != t.Segments[j].SourceEpoch {
-					return t.Segments[i].SourceEpoch < t.Segments[j].SourceEpoch
-				}
-				return t.Segments[i].Sequence < t.Segments[j].Sequence
-			})
-			t.NextArchiveOrdinal = segment.ArchiveOrdinal + 1
-			t.PendingSegments = removePending(t.PendingSegments, segment.SourceEpoch, segment.Sequence)
-			if segment.SourceEpoch == 0 {
-				t.PendingSequences = removeSequence(t.PendingSequences, segment.Sequence)
-			}
-			r.LastError = ""
-			return nil
-		}); err != nil {
-			return false, err
+		if !completed {
+			return false, nil
 		}
-	}
-	if playlist.EndList {
-		if err := m.update(e, func(r *domain.Recording) error {
+		updated, err := m.updateAtMediaGeneration(e, generation, func(r *domain.Recording) error {
 			m.finalizePending(r, "stream ended with uncaptured media")
 			r.State = domain.StateCompleted
 			now := time.Now().UTC()
 			r.StoppedAt = &now
 			return nil
-		}); err != nil {
+		})
+		if err != nil {
 			return true, err
 		}
+		if !updated {
+			return false, nil
+		}
 		return true, nil
+	}
+	updated, err := m.observePlaylistAtGeneration(e, playlist, generation)
+	if err != nil {
+		return false, err
+	}
+	if !updated || !scheduler.manifestGenerationCurrent(generation) {
+		return false, nil
+	}
+	epoch := currentEpoch(e)
+	if err := scheduler.observeAtGeneration(epoch, playlist, generation); err != nil {
+		return false, err
+	}
+	if !scheduler.manifestGenerationCurrent(generation) {
+		return false, nil
+	}
+	discovered, err := scheduler.discoverAtGeneration(ctx, epoch, playlist, generation)
+	if err != nil {
+		return false, err
+	}
+	if !discovered {
+		return false, nil
+	}
+	if playlist.EndList {
+		if !scheduler.endList(generation) {
+			return false, nil
+		}
+		completed, err := scheduler.drainEndList(ctx, generation)
+		if err != nil {
+			return false, err
+		}
+		if !completed {
+			return false, nil
+		}
+		updated, err := m.updateAtMediaGeneration(e, generation, func(r *domain.Recording) error {
+			m.finalizePending(r, "stream ended with uncaptured media")
+			r.State = domain.StateCompleted
+			now := time.Now().UTC()
+			r.StoppedAt = &now
+			return nil
+		})
+		if err != nil {
+			return true, err
+		}
+		if !updated {
+			return false, nil
+		}
+		return true, nil
+	}
+	if waitForIdle {
+		if err := scheduler.drain(ctx); err != nil {
+			return false, err
+		}
 	}
 	return false, nil
 }
 
 func (m *Manager) observePlaylist(e *entry, playlist hls.MediaPlaylist) error {
+	_, generation := currentMediaVersion(e)
+	_, err := m.observePlaylistAtGeneration(e, playlist, generation)
+	return err
+}
+
+func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlaylist, generation uint64) (bool, error) {
 	if len(playlist.Segments) == 0 {
-		return nil
+		return true, nil
 	}
-	return m.update(e, func(r *domain.Recording) error {
+	var protectedByEpoch map[uint64]map[uint64]bool
+	if scheduler := activeScheduler(e); scheduler != nil {
+		protectedByEpoch = scheduler.protectedByEpoch()
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.mediaGeneration != generation {
+		return false, nil
+	}
+	r := clone(e.recording)
+	if r == nil {
+		if e.terminalErr == nil {
+			e.terminalErr = errors.New("recording state persistence failed")
+		}
+		return false, errors.New("recording state could not be copied")
+	}
+	if err := func() error {
 		t := r.Tracks["main"]
 		if t == nil {
 			return fmt.Errorf("main track is missing")
@@ -295,7 +321,7 @@ func (m *Manager) observePlaylist(e *entry, playlist hls.MediaPlaylist) error {
 			}
 		}
 		if sequenceReset {
-			m.finalizePendingEpoch(r, t, t.SourceEpoch, "source sequence reset before pending media was captured")
+			m.finalizePendingEpochExcept(r, t, t.SourceEpoch, "source sequence reset before pending media was captured", protectedByEpoch[t.SourceEpoch])
 			if t.SourceEpoch == ^uint64(0) {
 				return errors.New("source sequence epoch overflow")
 			}
@@ -304,6 +330,9 @@ func (m *Manager) observePlaylist(e *entry, playlist hls.MediaPlaylist) error {
 		}
 		epoch := t.SourceEpoch
 		captured := capturedSequenceSet(t, epoch)
+		for sequence := range protectedByEpoch[epoch] {
+			captured[sequence] = true
+		}
 		for _, seg := range playlist.Segments {
 			if seg.Gap {
 				addMissingRanges(r, t, epoch, seg.Sequence, seg.Sequence, "source manifest marked segment as a gap", captured)
@@ -329,6 +358,9 @@ func (m *Manager) observePlaylist(e *entry, playlist hls.MediaPlaylist) error {
 				continue
 			}
 			if captured[item.Sequence] {
+				if protectedByEpoch[epoch][item.Sequence] {
+					pending = append(pending, item)
+				}
 				continue
 			}
 			if !present[item.Sequence] && maxSeq > item.Sequence {
@@ -342,6 +374,9 @@ func (m *Manager) observePlaylist(e *entry, playlist hls.MediaPlaylist) error {
 			legacyPending := t.PendingSequences[:0]
 			for _, seq := range t.PendingSequences {
 				if captured[seq] {
+					if protectedByEpoch[epoch][seq] {
+						legacyPending = append(legacyPending, seq)
+					}
 					continue
 				}
 				if !present[seq] && maxSeq > seq {
@@ -357,7 +392,43 @@ func (m *Manager) observePlaylist(e *entry, playlist hls.MediaPlaylist) error {
 		}
 		t.HasLastObservedSequence = true
 		return nil
-	})
+	}(); err != nil {
+		return false, err
+	}
+	if err := m.store.SaveRecording(r); err != nil {
+		if e.terminalErr == nil {
+			e.terminalErr = errors.New("recording metadata persistence failed")
+		}
+		return false, errors.New("recording metadata persistence failed")
+	}
+	e.recording = r
+	return true, nil
+}
+
+func (m *Manager) updateAtMediaGeneration(e *entry, generation uint64, fn func(*domain.Recording) error) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.mediaGeneration != generation {
+		return false, nil
+	}
+	next := clone(e.recording)
+	if next == nil {
+		if e.terminalErr == nil {
+			e.terminalErr = errors.New("recording state persistence failed")
+		}
+		return false, errors.New("recording state could not be copied")
+	}
+	if err := fn(next); err != nil {
+		return false, err
+	}
+	if err := m.store.SaveRecording(next); err != nil {
+		if e.terminalErr == nil {
+			e.terminalErr = errors.New("recording metadata persistence failed")
+		}
+		return false, errors.New("recording metadata persistence failed")
+	}
+	e.recording = next
+	return true, nil
 }
 
 // sourceURIIdentity compares the stable resource portion of a media URI.
@@ -388,11 +459,15 @@ func sourceURIIdentity(raw string) string {
 }
 
 func (m *Manager) acquireInit(ctx context.Context, e *entry, source hls.Map, epoch, discontinuitySequence uint64, media adapterproto.MediaSource) (string, error) {
-	key := source.URI
-	key += fmt.Sprintf("|epoch=%d|discontinuity=%d", epoch, discontinuitySequence)
-	if source.ByteRange != nil {
-		key += fmt.Sprintf("|%d@%d", source.ByteRange.Length, source.ByteRange.Offset)
-	}
+	return m.acquireInitUsing(ctx, e, source, epoch, discontinuitySequence, media, m.downloadObject)
+}
+
+func (m *Manager) acquireInitOnce(ctx context.Context, e *entry, source hls.Map, epoch, discontinuitySequence uint64, media adapterproto.MediaSource) (string, error) {
+	return m.acquireInitUsing(ctx, e, source, epoch, discontinuitySequence, media, m.downloadObjectOnce)
+}
+
+func (m *Manager) acquireInitUsing(ctx context.Context, e *entry, source hls.Map, epoch, discontinuitySequence uint64, media adapterproto.MediaSource, download func(context.Context, string, *domain.ByteRange, string, string, adapterproto.MediaSource) (storage.PayloadResult, error)) (string, error) {
+	key := initIdentity(source, epoch, discontinuitySequence)
 	digest := sha256.Sum256([]byte(key))
 	id := "init-" + hex.EncodeToString(digest[:8])
 	var existing *domain.Segment
@@ -410,7 +485,7 @@ func (m *Manager) acquireInit(ctx context.Context, e *entry, source hls.Map, epo
 		return id, nil
 	}
 	relative := "tracks/main/" + id + extensionFor(source.URI)
-	result, err := m.downloadObject(ctx, source.URI, source.ByteRange, recordingID, relative, media)
+	result, err := download(ctx, source.URI, source.ByteRange, recordingID, relative, media)
 	if err != nil {
 		return "", fmt.Errorf("init segment download: %w", err)
 	}
@@ -434,9 +509,17 @@ func (m *Manager) acquireInit(ctx context.Context, e *entry, source hls.Map, epo
 }
 
 func (m *Manager) acquireMedia(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource) (domain.Segment, error) {
+	return m.acquireMediaUsing(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media, m.downloadObject)
+}
+
+func (m *Manager) acquireMediaOnce(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource) (domain.Segment, error) {
+	return m.acquireMediaUsing(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media, m.downloadObjectOnce)
+}
+
+func (m *Manager) acquireMediaUsing(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource, download func(context.Context, string, *domain.ByteRange, string, string, adapterproto.MediaSource) (storage.PayloadResult, error)) (domain.Segment, error) {
 	recordingID := recordingID(e)
 	relative := fmt.Sprintf("tracks/main/%020d%s", ordinal, extensionFor(source.URI))
-	result, err := m.downloadObject(ctx, source.URI, source.ByteRange, recordingID, relative, media)
+	result, err := download(ctx, source.URI, source.ByteRange, recordingID, relative, media)
 	if err != nil {
 		return domain.Segment{}, err
 	}
@@ -445,11 +528,19 @@ func (m *Manager) acquireMedia(ctx context.Context, e *entry, source hls.MediaSe
 }
 
 func (m *Manager) downloadObject(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource) (storage.PayloadResult, error) {
+	return m.downloadObjectAttempts(ctx, uri, byteRange, recordingID, relative, media, segmentAttempts)
+}
+
+func (m *Manager) downloadObjectOnce(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource) (storage.PayloadResult, error) {
+	return m.downloadObjectAttempts(ctx, uri, byteRange, recordingID, relative, media, 1)
+}
+
+func (m *Manager) downloadObjectAttempts(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, attempts int) (storage.PayloadResult, error) {
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return storage.PayloadResult{}, fmt.Errorf("byte range is invalid or exceeds the %d byte payload limit", maxPayloadBytes)
 	}
 	var last *FetchError
-	for attempt := 0; attempt < segmentAttempts; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return storage.PayloadResult{}, err
 		}
@@ -501,7 +592,7 @@ func (m *Manager) downloadObject(ctx context.Context, uri string, byteRange *dom
 		} else {
 			last = newFetchError("segment", 0, true, false)
 		}
-		if last != nil && last.Retryable && attempt+1 < segmentAttempts {
+		if last != nil && last.Retryable && attempt+1 < attempts {
 			if err = retryWait(ctx, attempt); err != nil {
 				return storage.PayloadResult{}, err
 			}
@@ -535,7 +626,16 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 		e.cancel = nil
 		e.mu.Unlock()
 	}()
+	scheduler, schedulerErr := newSegmentScheduler(ctx, m, e)
+	if schedulerErr != nil {
+		m.fail(e, schedulerErr)
+		return
+	}
 	defer func() {
+		if closeErr := scheduler.close(); closeErr != nil {
+			m.fail(e, closeErr)
+			return
+		}
 		if ctx.Err() == nil {
 			return
 		}
@@ -554,10 +654,16 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 
 	selectedURL := media.ManifestURL
 	firstPlaylist := true
+	_, manifestGeneration := currentMediaVersion(e)
 	refreshCycles := 0
 	proactiveRefreshes := 0
 	for ctx.Err() == nil {
-		media = currentMedia(e)
+		media, generation := currentMediaVersion(e)
+		if generation != manifestGeneration {
+			selectedURL = media.ManifestURL
+			firstPlaylist = true
+			manifestGeneration = generation
+		}
 		if due, _ := proactiveRefreshDue(media, time.Now()); due {
 			if proactiveRefreshes >= maxRefreshCycles {
 				m.fail(e, errors.New("media refresh retry limit reached"))
@@ -572,6 +678,8 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			media = refreshed
 			selectedURL = media.ManifestURL
 			firstPlaylist = true
+			_, generation = currentMediaVersion(e)
+			manifestGeneration = generation
 			if stillDue, _ := proactiveRefreshDue(media, time.Now()); stillDue {
 				// The adapter did not move the source outside its own refresh
 				// window. Do not fetch a manifest it still declares due; retry
@@ -583,7 +691,23 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			proactiveRefreshes = 0
 		}
 
+		fetchGeneration := generation
 		body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
+		latestMedia, currentGeneration := currentMediaVersion(e)
+		if currentGeneration != fetchGeneration {
+			// Another segment worker refreshed the source while this manifest
+			// request was in flight. Neither a stale successful body nor its
+			// stale fetch error may affect snapshots, discovery, or refresh policy.
+			media = latestMedia
+			selectedURL = media.ManifestURL
+			firstPlaylist = true
+			manifestGeneration = currentGeneration
+			select {
+			case <-scheduler.manifestWake:
+			default:
+			}
+			continue
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -604,6 +728,7 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 					media = refreshed
 					selectedURL = media.ManifestURL
 					firstPlaylist = true
+					_, manifestGeneration = currentMediaVersion(e)
 					continue
 				}
 				m.fail(e, errors.New("media source refresh failed"))
@@ -648,7 +773,7 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			m.fail(e, err)
 			return
 		}
-		done, err := m.process(e, ctx, playlist)
+		done, err := m.processWithSchedulerGeneration(e, ctx, playlist, false, fetchGeneration)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -694,14 +819,54 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			return
 		}
 		refreshCycles = 0
-		if err = wait(ctx, pollDelay(playlist.TargetDuration)); err != nil {
+		timer := time.NewTimer(pollDelay(playlist.TargetDuration))
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
+		case <-scheduler.manifestWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
 		}
 	}
 }
 
 func (m *Manager) refreshMedia(ctx context.Context, e *entry, current adapterproto.MediaSource) (adapterproto.MediaSource, error) {
+	_, generation := currentMediaVersion(e)
+	refreshed, _, err := m.refreshMediaAtGeneration(ctx, e, current, generation)
+	return refreshed, err
+}
+
+func (m *Manager) refreshMediaAtGeneration(ctx context.Context, e *entry, current adapterproto.MediaSource, expectedGeneration uint64) (adapterproto.MediaSource, uint64, error) {
 	e.mu.Lock()
+	if e.refreshGate == nil {
+		e.refreshGate = make(chan struct{}, 1)
+	}
+	gate := e.refreshGate
+	e.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return adapterproto.MediaSource{}, 0, ctx.Err()
+	}
+	defer func() { <-gate }()
+	e.mu.Lock()
+	if e.mediaGeneration != expectedGeneration {
+		latest, generation := cloneMediaSource(e.media), e.mediaGeneration
+		e.mu.Unlock()
+		return latest, generation, nil
+	}
 	adapterID, resource := e.adapterID, cloneResourceRef(e.resource)
 	e.mu.Unlock()
 	var candidate adapterproto.MediaSource
@@ -712,16 +877,16 @@ func (m *Manager) refreshMedia(ctx context.Context, e *entry, current adapterpro
 	} else if refresher, ok := m.resolver.(Refresher); ok {
 		candidate, err = refresher.Refresh(ctx, adapterID, resource, cloneMediaSource(current))
 	} else {
-		return adapterproto.MediaSource{}, errors.New("adapter does not support refresh")
+		return adapterproto.MediaSource{}, expectedGeneration, errors.New("adapter does not support refresh")
 	}
 	if err != nil {
-		return adapterproto.MediaSource{}, errors.New("adapter refresh failed")
+		return adapterproto.MediaSource{}, expectedGeneration, errors.New("adapter refresh failed")
 	}
 	if err = adapterproto.ValidateMediaSource(candidate, []string{"hls"}); err != nil {
-		return adapterproto.MediaSource{}, errors.New("adapter returned invalid refreshed media source")
+		return adapterproto.MediaSource{}, expectedGeneration, errors.New("adapter returned invalid refreshed media source")
 	}
 	if err = m.validate(ctx, candidate.ManifestURL); err != nil {
-		return adapterproto.MediaSource{}, errors.New("refreshed media URL is invalid")
+		return adapterproto.MediaSource{}, expectedGeneration, errors.New("refreshed media URL is invalid")
 	}
 	// A later source may contain signed URLs even if an earlier source was
 	// classified public. Keep the recording-level API redaction conservative:
@@ -731,19 +896,25 @@ func (m *Manager) refreshMedia(ctx context.Context, e *entry, current adapterpro
 			r.SourceURIClassification = "sensitive"
 			return nil
 		}); err != nil {
-			return adapterproto.MediaSource{}, errors.New("recording URI classification could not be saved")
+			return adapterproto.MediaSource{}, expectedGeneration, errors.New("recording URI classification could not be saved")
 		}
 	}
 	if commit != nil {
 		if err = commit(); err != nil {
-			return adapterproto.MediaSource{}, errors.New("adapter refresh state could not be committed")
+			return adapterproto.MediaSource{}, expectedGeneration, errors.New("adapter refresh state could not be committed")
 		}
 	}
 	copy := cloneMediaSource(candidate)
 	e.mu.Lock()
 	e.media = copy
+	e.mediaGeneration++
+	generation := e.mediaGeneration
+	scheduler := e.scheduler
 	e.mu.Unlock()
-	return cloneMediaSource(copy), nil
+	if scheduler != nil {
+		scheduler.noteMediaGeneration(generation)
+	}
+	return cloneMediaSource(copy), generation, nil
 }
 
 func (m *Manager) shouldRefresh(media adapterproto.MediaSource, err error) bool {
@@ -797,9 +968,14 @@ func proactiveRefreshDue(media adapterproto.MediaSource, now time.Time) (bool, s
 }
 
 func currentMedia(e *entry) adapterproto.MediaSource {
+	media, _ := currentMediaVersion(e)
+	return media
+}
+
+func currentMediaVersion(e *entry) (adapterproto.MediaSource, uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return cloneMediaSource(e.media)
+	return cloneMediaSource(e.media), e.mediaGeneration
 }
 
 func currentEpoch(e *entry) uint64 {
@@ -1011,6 +1187,22 @@ func (m *Manager) markPending(e *entry, epoch, seq uint64, err error) error {
 	})
 }
 
+func (m *Manager) markGap(e *entry, epoch, sequence uint64, reason string) error {
+	return m.update(e, func(r *domain.Recording) error {
+		t := r.Tracks["main"]
+		if t == nil {
+			return errors.New("main track is missing")
+		}
+		captured := capturedSequenceSet(t, epoch)
+		addMissingRanges(r, t, epoch, sequence, sequence, reason, captured)
+		t.PendingSegments = removePending(t.PendingSegments, epoch, sequence)
+		if epoch == 0 {
+			t.PendingSequences = removeSequence(t.PendingSequences, sequence)
+		}
+		return nil
+	})
+}
+
 // markRemainingPending preserves the manifest's known media inventory when a
 // stop arrives between segment downloads. The worker's terminal update will
 // turn these entries into epoch-scoped gaps.
@@ -1069,6 +1261,10 @@ func (m *Manager) finalizePending(r *domain.Recording, reason string) {
 }
 
 func (m *Manager) finalizePendingEpoch(r *domain.Recording, t *domain.Track, epoch uint64, reason string) {
+	m.finalizePendingEpochExcept(r, t, epoch, reason, nil)
+}
+
+func (m *Manager) finalizePendingEpochExcept(r *domain.Recording, t *domain.Track, epoch uint64, reason string, protected map[uint64]bool) {
 	captured := capturedSequenceSet(t, epoch)
 	remaining := t.PendingSegments[:0]
 	for _, item := range t.PendingSegments {
@@ -1076,14 +1272,23 @@ func (m *Manager) finalizePendingEpoch(r *domain.Recording, t *domain.Track, epo
 			remaining = append(remaining, item)
 			continue
 		}
+		if protected[item.Sequence] {
+			remaining = append(remaining, item)
+			continue
+		}
 		addMissingRanges(r, t, epoch, item.Sequence, item.Sequence, reason, captured)
 	}
 	t.PendingSegments = remaining
 	if epoch == 0 {
+		legacy := t.PendingSequences[:0]
 		for _, seq := range t.PendingSequences {
+			if protected[seq] {
+				legacy = append(legacy, seq)
+				continue
+			}
 			addMissingRanges(r, t, epoch, seq, seq, reason, captured)
 		}
-		t.PendingSequences = nil
+		t.PendingSequences = legacy
 	}
 }
 
@@ -1145,8 +1350,12 @@ func addMissingRanges(r *domain.Recording, t *domain.Track, epoch, from, to uint
 	}
 }
 func gapCovers(r *domain.Recording, track string, seq uint64) bool {
+	return gapCoversEpoch(r, track, 0, seq)
+}
+
+func gapCoversEpoch(r *domain.Recording, track string, epoch, seq uint64) bool {
 	for _, g := range r.Gaps {
-		if g.TrackID == track && seq >= g.FromSequence && seq <= g.ToSequence {
+		if g.TrackID == track && g.SourceEpoch == epoch && seq >= g.FromSequence && seq <= g.ToSequence {
 			return true
 		}
 	}

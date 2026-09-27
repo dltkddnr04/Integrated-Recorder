@@ -232,10 +232,7 @@ func TestSegmentHTTPStatusRefreshReplacesSourceAndRetriesLatestPlaylist(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(4 * time.Second)
-	for time.Now().Before(deadline) && newSegment.Load() == 0 {
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForSegmentCount(t, manager, recording.ID, 1)
 	if newSegment.Load() == 0 {
 		t.Fatal("refreshed segment was not acquired")
 	}
@@ -259,6 +256,122 @@ func TestSegmentHTTPStatusRefreshReplacesSourceAndRetriesLatestPlaylist(t *testi
 	entry.mu.Unlock()
 	if current.ManifestURL != resolver.next.ManifestURL || current.Headers["Authorization"] != newHeader || current.SessionRef != "session-two" || string(current.Refresh) != string(resolver.next.Refresh) || current.SourceURIClassification() != "public" || current.RequestPolicy == nil {
 		t.Fatalf("refresh was not atomically applied: %#v", current)
+	}
+}
+
+func TestStaleManifestResponseIsDiscardedAfterSegmentRefresh(t *testing.T) {
+	oldPoll2Started := make(chan struct{})
+	releaseOldPoll2 := make(chan struct{})
+	var releaseOnce sync.Once
+	var oldManifests, oldSegments, staleSegments, newManifests, freshSegments atomic.Int32
+	var oldPoll2Once sync.Once
+	server := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old.m3u8":
+			if oldManifests.Add(1) == 1 {
+				_, _ = fmt.Fprint(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:4\n#EXTINF:1,initial\nold.ts\n")
+				return
+			}
+			oldPoll2Once.Do(func() { close(oldPoll2Started) })
+			select {
+			case <-r.Context().Done():
+				return
+			case <-releaseOldPoll2:
+			}
+			_, _ = fmt.Fprint(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:4\n#EXTINF:1,stale\nstale.ts\n")
+		case "/old.ts":
+			oldSegments.Add(1)
+			http.Error(w, "expired", http.StatusForbidden)
+		case "/new.m3u8":
+			newManifests.Add(1)
+			_, _ = fmt.Fprint(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:4\n#EXTINF:1,fresh\nfresh.ts\n")
+		case "/stale.ts":
+			staleSegments.Add(1)
+			_, _ = io.WriteString(w, "stale-payload")
+		case "/fresh.ts":
+			freshSegments.Add(1)
+			_, _ = io.WriteString(w, "fresh-payload")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer func() {
+		releaseOnce.Do(func() { close(releaseOldPoll2) })
+		server.Close()
+	}()
+
+	refreshCommitted := make(chan struct{})
+	var commitOnce sync.Once
+	resolver := &refreshingResolver{
+		initial: adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/old.m3u8", RefreshPolicy: &adapterproto.RefreshPolicy{OnHTTPStatus: []int{http.StatusForbidden}}},
+		next:    adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + "/new.m3u8"},
+	}
+	resolver.refresh = func(ctx context.Context, _ adapterproto.MediaSource) (adapterproto.MediaSource, error) {
+		select {
+		case <-ctx.Done():
+			return adapterproto.MediaSource{}, ctx.Err()
+		case <-oldPoll2Started:
+		}
+		commitOnce.Do(func() { close(refreshCommitted) })
+		return resolver.next, nil
+	}
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManager(store, server.Client(), resolver, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recording, err := manager.StartResolved(context.Background(), "fixture", resolver.initial, nil, "stale manifest", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, oldPoll2Started, "blocked old manifest request")
+	waitSignal(t, refreshCommitted, "segment refresh result")
+	waitForAwaitManifest(t, manager, recording.ID)
+	releaseOnce.Do(func() { close(releaseOldPoll2) })
+	waitForSegmentCount(t, manager, recording.ID, 1)
+	stopped, err := manager.Stop(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolver.calls.Load() != 1 || oldManifests.Load() != 2 || oldSegments.Load() != 1 || newManifests.Load() != 1 || freshSegments.Load() != 1 || staleSegments.Load() != 0 {
+		t.Fatalf("refresh=%d old manifests=%d old segments=%d fresh manifests=%d fresh segments=%d stale segments=%d", resolver.calls.Load(), oldManifests.Load(), oldSegments.Load(), newManifests.Load(), freshSegments.Load(), staleSegments.Load())
+	}
+	if len(stopped.Tracks["main"].Segments) != 1 || stopped.Tracks["main"].Segments[0].SourceURI != server.URL+"/fresh.ts" {
+		t.Fatalf("recorded stale or missing source segment: %#v", stopped.Tracks["main"].Segments)
+	}
+}
+
+func waitForAwaitManifest(t *testing.T, manager *Manager, id string) {
+	t.Helper()
+	e, ok := manager.entry(id)
+	if !ok {
+		t.Fatal("recording entry disappeared")
+	}
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		scheduler := activeScheduler(e)
+		if scheduler == nil {
+			t.Fatal("segment scheduler is not active")
+		}
+		scheduler.mu.Lock()
+		waiting := false
+		for _, task := range scheduler.tasks {
+			waiting = waiting || task.state == segmentTaskAwaitManifest
+		}
+		changed := scheduler.changed
+		scheduler.mu.Unlock()
+		if waiting {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("refreshed segment did not await the new manifest")
+		case <-changed:
+		}
 	}
 }
 
