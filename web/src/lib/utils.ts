@@ -18,7 +18,9 @@ export function formatDuration(seconds?: number | null) {
 export function formatDate(value?: string | null) {
   if (!value) return '—'
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '—' : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date)
+  return Number.isNaN(date.getTime()) ? '—' : new Intl.DateTimeFormat('ko-KR', {
+    year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(date)
 }
 export function humanize(value?: string) { return value?.replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase()) ?? 'Unknown' }
 export function resourceLabel(resource?: { resource_type: string; resource_id: string; display_name?: string }) {

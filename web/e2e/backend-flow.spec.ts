@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -16,6 +16,7 @@ type TagsWire = { tags: string[] }
 type ArchiveIndexWire = { entries: { path: string }[] }
 type RecordingPageWire = { items: RecordingListWire[] }
 type RecordingListWire = { id: string; adapter_id: string; adapter_name: string; state: string; tags: string[] }
+type CSPViolation = { effectiveDirective: string; violatedDirective: string; blockedURI: string; sourceFile: string }
 
 test.describe.configure({ mode: 'serial' })
 
@@ -23,23 +24,46 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   const bootstrapToken = readFileSync(join(dataDir, 'security', 'bootstrap-token'), 'utf8').trim()
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
   const requests: string[] = []
-  const cspConsoleErrors: string[] = []
+  const cspViolations: CSPViolation[] = []
+  const expectedAPIResponseFailures: { path: string; status: number }[] = []
+  const consoleErrors: string[] = []
+  const pageErrors: string[] = []
+  const staticAssetFailures: string[] = []
+  const unexpectedRequestFailures: string[] = []
   const iconStatuses: number[] = []
+  await page.exposeBinding('__recordCspViolation', (_source, violation: CSPViolation) => cspViolations.push(violation))
   await page.addInitScript(() => {
-    const target = window as typeof window & { __cspViolations?: string[] }
-    target.__cspViolations = []
     document.addEventListener('securitypolicyviolation', event => {
-      target.__cspViolations?.push(`${event.effectiveDirective}: ${event.blockedURI}`)
+      const recordViolation = (window as Window & { __recordCspViolation?: (violation: CSPViolation) => Promise<void> }).__recordCspViolation
+      if (recordViolation) void recordViolation({ effectiveDirective: event.effectiveDirective, violatedDirective: event.violatedDirective, blockedURI: event.blockedURI, sourceFile: event.sourceFile })
     })
   })
   page.on('console', message => {
-    if (message.type() === 'error' && message.text().includes('Content Security Policy')) cspConsoleErrors.push(message.text())
+    if (message.type() !== 'error') return
+    const status = Number(message.text().match(/status of (\d+)/)?.[1])
+    const expectedIndex = expectedAPIResponseFailures.findIndex(failure => failure.status === status)
+    if ([401, 404, 501].includes(status) && expectedIndex >= 0) {
+      expectedAPIResponseFailures.splice(expectedIndex, 1)
+      return
+    }
+    consoleErrors.push(message.text())
   })
+  page.on('pageerror', error => pageErrors.push(error.message))
   page.on('request', request => requests.push(new URL(request.url()).pathname))
-  page.on('response', response => {
-    if (new URL(response.url()).pathname === '/api/adapters/owncast/icon') iconStatuses.push(response.status())
+  page.on('requestfailed', request => {
+    const failure = request.failure()?.errorText ?? 'unknown failure'
+    if (failure !== 'net::ERR_ABORTED') unexpectedRequestFailures.push(`${request.url()}: ${failure}`)
   })
-  await page.goto('/login?mode=bootstrap')
+  page.on('response', response => {
+    const path = new URL(response.url()).pathname
+    if (path === '/api/adapters/owncast/icon') iconStatuses.push(response.status())
+    if (path.startsWith('/static/ui/') && response.status() >= 400) staticAssetFailures.push(`${path}: ${response.status()}`)
+    if (path.startsWith('/api/') && [401, 404, 501].includes(response.status())) expectedAPIResponseFailures.push({ path, status: response.status() })
+  })
+  const bootstrapPage = await page.goto('/login?mode=bootstrap')
+  const cspHeader = bootstrapPage?.headers()['content-security-policy'] ?? ''
+  expect(cspHeader).toContain("script-src 'self'")
+  expect(cspHeader).not.toContain("script-src 'unsafe-inline'")
   await assertResponsive(page)
   await page.setViewportSize({ width: 1440, height: 900 })
   await expect(page.getByLabel('초기화 토큰')).toBeVisible()
@@ -55,11 +79,30 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/owncast', '/workflows', '/settings']) {
     await page.goto(route)
     await assertResponsive(page)
+    await assertNoCSPViolations(cspViolations)
   }
   await page.goto('/recordings')
-  await page.getByRole('combobox').first().click()
-  await page.keyboard.press('Escape')
-  await expect.poll(() => page.evaluate(() => (window as typeof window & { __cspViolations?: string[] }).__cspViolations ?? [])).toEqual([])
+  const recordingState = page.getByRole('combobox', { name: '상태 필터' })
+  const recordingAdapter = page.getByRole('combobox', { name: '어댑터 필터' })
+  await exerciseNativeSelect(recordingState)
+  await exerciseNativeSelect(recordingAdapter)
+  await page.goto('/settings')
+  await expect(page.getByText('커밋', { exact: true })).toBeVisible()
+  const settingsSelects = page.locator('#settings-panel-preferences select')
+  await expect(settingsSelects).toHaveCount(2)
+  const themeSelect = settingsSelects.nth(0)
+  const originalTheme = await themeSelect.inputValue()
+  await themeSelect.selectOption(originalTheme === 'dark' ? 'light' : 'dark')
+  await themeSelect.selectOption(originalTheme)
+  await exerciseNativeSelect(themeSelect)
+  const concurrencySelect = settingsSelects.nth(1)
+  const originalConcurrency = await concurrencySelect.inputValue()
+  const alternateConcurrency = originalConcurrency === '1' ? '2' : '1'
+  await concurrencySelect.selectOption(alternateConcurrency)
+  await concurrencySelect.selectOption(originalConcurrency)
+  await exerciseNativeSelect(concurrencySelect)
+  await exerciseTopbarPopovers(page)
+  await assertNoCSPViolations(cspViolations)
   await page.goto('/new')
   await expectOwncastLogo(page)
   await page.getByRole('button', { name: /Owncast/ }).click()
@@ -125,8 +168,12 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
 
   await page.getByRole('button', { name: '삭제' }).click()
   await expect(page.getByRole('alertdialog')).toContainText('되돌릴 수 없습니다')
-  await expect.poll(() => page.evaluate(() => (window as typeof window & { __cspViolations?: string[] }).__cspViolations ?? [])).toEqual([])
-  expect(cspConsoleErrors).toEqual([])
+  await assertNoCSPViolations(cspViolations)
+  expect(consoleErrors).toEqual([])
+  expect(pageErrors).toEqual([])
+  expect(staticAssetFailures).toEqual([])
+  expect(unexpectedRequestFailures).toEqual([])
+  expect(expectedAPIResponseFailures).toEqual([])
   await page.getByRole('alertdialog').getByRole('button', { name: '보관 데이터 삭제' }).click()
   await expect(page).toHaveURL(/\/recordings(?:\?.*)?$/)
   expect(iconStatuses).toContain(200)
@@ -142,12 +189,51 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   for (const path of ['/foo', '/recordings/a/b', '/api/unknown', '/static/unknown']) {
     expect((await page.request.get(path, { headers: { accept: 'text/html' } })).status(), `${path} must not be consumed by SPA fallback`).toBe(404)
   }
+  await assertNoCSPViolations(cspViolations)
+  expect(consoleErrors).toEqual([])
+  expect(pageErrors).toEqual([])
+  expect(staticAssetFailures).toEqual([])
+  expect(unexpectedRequestFailures).toEqual([])
+  expect(expectedAPIResponseFailures).toEqual([])
 })
 
 async function expectOwncastLogo(page: Page) {
   const image = page.locator('img[src="/api/adapters/owncast/icon"]').first()
   await expect(image).toBeVisible()
   await expect.poll(() => image.evaluate(element => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+}
+
+async function assertNoCSPViolations(violations: CSPViolation[]) {
+  await expect.poll(() => violations).toEqual([])
+}
+
+async function exerciseNativeSelect(select: Locator) {
+  await expect(select).toBeVisible()
+  const originalValue = await select.inputValue()
+  await select.click()
+  await select.press('ArrowDown')
+  await select.press('Escape')
+  if (await select.inputValue() !== originalValue) await select.selectOption(originalValue)
+}
+
+async function exerciseTopbarPopovers(page: Page) {
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport)
+    for (const trigger of [page.getByRole('button', { name: /알림/ }), page.getByRole('button', { name: /IR/ }).last()]) {
+      await trigger.click()
+      const content = page.getByRole('dialog').last()
+      await expect(content).toBeVisible()
+      const bounds = await content.boundingBox()
+      expect(bounds).not.toBeNull()
+      expect(bounds!.x).toBeGreaterThanOrEqual(0)
+      expect(bounds!.y).toBeGreaterThanOrEqual(0)
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width + 1)
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height + 1)
+      await page.keyboard.press('Escape')
+      await expect(content).toBeHidden()
+    }
+  }
+  await page.setViewportSize({ width: 1440, height: 900 })
 }
 
 test('actual workflow adapter: challenge, secret, action URL, continue, cancel, and history', async ({ page }) => {
@@ -175,6 +261,12 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await assertResponsive(page)
   await page.getByLabel('Fixture answer').fill('continue')
   await page.getByLabel('Fixture secret').fill(ephemeralSecret)
+  const persistSecret = page.getByRole('checkbox', { name: /다음에도 저장/ })
+  await expect(persistSecret).toBeVisible()
+  await persistSecret.check()
+  await expect(persistSecret).toBeChecked()
+  await persistSecret.uncheck()
+  await expect(persistSecret).not.toBeChecked()
   await page.getByRole('button', { name: '계속 진행' }).click()
   await expect.poll(() => continuationBody).not.toBe('')
   const submitted = JSON.parse(continuationBody) as { secrets?: Record<string, string>; persist_fields?: string[] }
