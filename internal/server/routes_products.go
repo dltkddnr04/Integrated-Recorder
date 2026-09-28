@@ -273,6 +273,7 @@ type dashboardResponse struct {
 	ExportAvailable       bool               `json:"export_available"`
 	RecentRecordings      []recordingSummary `json:"recent_recordings"`
 	ActiveRecordingItems  []recordingSummary `json:"active_recordings"`
+	Watches               map[string]int     `json:"watches,omitempty"`
 }
 
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -296,6 +297,9 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		Adapters:            map[string]int{"total": 0, "ready": 0, "unavailable": 0, "failed": 0, "rejected": 0},
 		ExportAvailable:     s.derivatives != nil && s.derivatives.Available(),
 		RecentRecordings:    []recordingSummary{}, ActiveRecordingItems: []recordingSummary{},
+	}
+	if s.watches != nil {
+		result.Watches = s.watches.Summary()
 	}
 	for _, item := range items {
 		result.SegmentsTotal += item.SegmentCount()

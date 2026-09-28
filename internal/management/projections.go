@@ -97,6 +97,8 @@ var auditTypes = map[string]struct{}{
 	"recording_deleted": {}, "config_changed": {}, "adapter_restarted": {}, "adapter_enabled": {},
 	"adapter_disabled": {}, "integrity_requested": {}, "export_requested": {},
 	"recording_tags_updated": {},
+	"watch_created":          {}, "watch_updated": {}, "watch_enabled": {}, "watch_disabled": {},
+	"watch_deleted": {}, "manual_watch_check": {},
 }
 
 var notificationTypes = map[string]struct{}{

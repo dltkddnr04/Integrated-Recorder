@@ -18,8 +18,9 @@ Browser ── HTTP API / generated VOD ── Core
                                           └─ self-describing recording directories
 ```
 
-- `internal/adapterproto` defines language-neutral Protocol v1 envelopes, descriptor/schema validation, resources, workflows, media sources, refresh policy, and adapter-owned state messages.
+- `internal/adapterproto` defines language-neutral Protocol v1 envelopes, descriptor/schema validation, resources, workflows, media sources, refresh policy, adapter-owned state, and optional Watch check messages.
 - `internal/adapterhost` discovers only explicitly configured adapter directories, supervises long-lived processes, validates descriptors/resources, resolves settings, and manages workflow sessions.
+- `internal/watch` stores durable management state, runs bounded polling, deduplicates sessions, and starts/reconciles automatic Recordings.
 - `internal/pluginconfig` stores user configuration/secrets separately from adapter-owned opaque state/state secrets. Interfaces are backend-neutral; the current implementation uses files.
 - `internal/interaction` bounds and expires generic interaction progress messages.
 - `cmd/adapters/owncast` and `internal/adapters/owncast` build the first standalone adapter. Core does not import the Owncast package.
@@ -35,7 +36,7 @@ IPC is bounded newline-delimited JSON. V1 keeps its original untyped request/res
 
 The host serializes calls to each process. Timeout, cancellation after a request is written, malformed/oversized output, unexpected EOF, request-ID mismatch, protocol mismatch, or process exit makes that process unusable. The next operation may restart it lazily after bounded backoff. Every restart performs `describe`; adapter ID, version, protocol version, and the canonical descriptor fingerprint must match the original discovery descriptor. There is no background restart loop. Shutdown sends the generic shutdown request and then terminates the child within a bounded period.
 
-V1 implements `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, and `shutdown` where the descriptor advertises the relevant generic capability. Other operation names remain reserved or return a structured unsupported error. Unknown optional capability strings with valid syntax are retained and ignored by older Core versions; protocol-version mismatch remains fatal.
+V1 implements `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, and `shutdown` where the descriptor advertises the relevant generic capability. Adapters declaring `watch` may answer `watch.check` with `offline` or `live`; network or malformed-response errors are not offline observations. A result may include media for the existing `StartResolved` path; otherwise Core may use one interaction-free stateless `resolve`. This optional extension keeps protocol version 1 and leaves old adapters unchanged. Other operation names remain reserved or return a structured unsupported error. Unknown optional capability strings with valid syntax are retained and ignored by older Core versions; protocol-version mismatch remains fatal.
 
 Descriptors may include optional `branding.icon` presentation metadata. The current format accepts only `image/png`: its base64 JSON payload is limited to 64 KiB, each dimension is at most 512 pixels, and the complete image must decode as PNG. SVG and external URLs are rejected. Branding does not change adapter semantics and is excluded from the descriptor fingerprint. Adapter API views expose an authenticated `/api/adapters/{id}/icon` URL instead of repeating image bytes in polled list responses.
 
@@ -89,6 +90,12 @@ Preview projections are stored separately at `<DATA_DIR>/previews/<recording-id>
 
 Posters, the latest live preview, recording-list images, storyboards, and future seek UI all select from this same index. The default terminal poster is the ready frame nearest 25% of playback time. The default storyboard samples up to 48 unique frames uniformly across playback time, but sample count and grid columns are presentation settings rather than extraction profile. Changing sample count, poster position, or grid layout never decodes video again. The browser retains native `<video controls>` and storyboard selection seeks to the corresponding VOD playback time. `GET /api/recordings/{id}/previews` returns bounded sample/summary metadata and `/previews/{archive_ordinal}` returns one image. The existing thumbnail API remains a compatibility view of the index poster.
 
+## Durable Watch and automatic recording
+
+A Watch is durable management intent to record future sessions from one adapter-defined source. A Recording is one captured session and remains independent: deleting a Watch does not delete or stop its recordings, and deleting a Recording does not remove its Watch. Watch definitions/runtime live under `<DATA_DIR>/management/watches/`; input secrets use separate private files and the public API returns configured flags only. Core stores only a SHA-256 digest of adapter `session_ref`; raw session references are not returned or logged. A separate bounded/queryable projection links recording IDs to Watch/session/part metadata without changing `recording.json`.
+
+Enabled Watches are checked by a bounded queue and fixed worker pool. Normal offline observations follow the configured interval; failures use exponential backoff and bounded jitter. Manual and scheduled checks coalesce per Watch. Errors never become offline states. A live result starts acquisition through the existing `Manager.StartResolved` path and each Watch can own at most one active Recording. While that Recording is active, Watch polling pauses. Terminal recordings wake Watch monitoring; the runtime suppresses duplicates for completed or manually stopped sessions and allows a new part after interruption. Disabling/deleting a Watch does not stop an active Recording.
+
 ## Management API and projections
 
 `internal/recordquery` filters, searches, sorts, cursor-pages, and computes size/segment/gap statistics from canonical recording snapshots. `/api/v2/recordings` and the dashboard read those snapshots without mutating them. Gap duration is `null` when the archive lacks enough timing data. List/dashboard projections include only a small preview summary, never the full frame index, and do not make a separate status request per recording. Tags, workflow history, recording event projections, audit, notifications, and adapter enable preferences live in a separate bounded JSON store under `internal/management`; canonical recordings remain understandable without it.
@@ -113,7 +120,7 @@ Recording directories are mode `0700`; metadata, payload, and sidecar files use 
 
 ## Server lifecycle and Docker
 
-On SIGINT/SIGTERM, Core stops accepting HTTP work, cancels all recording workers before waiting for any worker, durably records their terminal states, then shuts down adapter processes. Shutdown is bounded. Compose allows 45 seconds for graceful termination, longer than the configured HTTP and recording-worker shutdown deadlines. A real crash still causes active recordings to reload as interrupted.
+On SIGINT/SIGTERM, Core stops accepting HTTP work, stops and joins the Watch scheduler, cancels all recording workers before waiting for any worker, durably records their terminal states, then shuts down adapter processes. Shutdown is bounded. Compose allows 45 seconds for graceful termination, longer than the configured HTTP, Watch, and recording-worker shutdown deadlines. A real crash still causes active recordings to reload as interrupted; enabled Watches are reconciled and staggered after restart.
 
 The container runs as UID 10001. Compose uses a named `/data` volume and publishes the control port on host loopback. The runtime image includes the `ffmpeg` package from Alpine v3.21's community repository and the Owncast adapter in `/adapters`. Alpine package metadata lists the ffmpeg license expression as `GPL-2.0-or-later AND LGPL-2.1-or-later`; FFmpeg upstream documents how GPL-enabled optional components affect FFmpeg licensing. This is a package metadata notice, not legal advice or a statement changing Integrated Recorder's own license. Check the exact package/build included in an image before redistribution. References: [Alpine v3.21 ffmpeg package metadata](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html). Mount additional executable adapters read-only at `./adapter-binaries` (container path `/external-adapters`). Set their executable bit before starting Compose. Core must restart to discover additions; there is no hot reload. Even when authentication is explicitly disabled, only loopback binds are allowed.
 
@@ -121,7 +128,7 @@ The container runs as UID 10001. Compose uses a named `/data` volume and publish
 
 For a stopped, completed, or interrupted recording, Core creates a finite seekable HLS VOD manifest over stored source segments. Segment endpoints return stored bytes directly; playback does not concatenate or remux files. Browser codec support remains necessary.
 
-Not implemented: chat/metadata timeline, asynchronous adapter notification runtime, real platform authentication flows, additional platform adapters, workflow persistence across Core restart, encrypted HLS, external rendition synchronization, DASH, archive finalization/TAR, LTO, export transcoding/additional formats, multi-user/role authorization, adapter sandboxing, and adapter hot reload.
+Not implemented: chat/metadata timeline, asynchronous adapter notification runtime, real platform authentication flows, additional platform adapters beyond Owncast, workflow persistence across Core restart, encrypted HLS, external rendition synchronization, DASH, archive finalization/TAR, LTO, export transcoding/additional formats, multi-user/role authorization, adapter sandboxing, and adapter hot reload. Watch checks are polling-based; webhook/push notifications are not implemented.
 
 ## Web application
 

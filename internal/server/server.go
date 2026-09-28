@@ -31,6 +31,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+	"github.com/dltkddnr04/integrated-recorder/internal/watch"
 )
 
 type Server struct {
@@ -41,6 +42,7 @@ type Server struct {
 	integrity                   *integrity.Service
 	derivatives                 *derivative.Service
 	previews                    *preview.Service
+	watches                     *watch.Service
 	auth                        *authn.Service
 	settings                    *systemsettings.Store
 	logs                        *applog.Store
@@ -64,6 +66,7 @@ type Options struct {
 	Integrity                   *integrity.Service
 	Derivatives                 *derivative.Service
 	Previews                    *preview.Service
+	Watches                     *watch.Service
 	Auth                        *authn.Service
 	Settings                    *systemsettings.Store
 	Logs                        *applog.Store
@@ -109,7 +112,7 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	if logs == nil {
 		logs = applog.NewStore()
 	}
-	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, auth: options.Auth, settings: options.Settings, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
+	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
@@ -133,6 +136,7 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	s.mux.Handle("GET /api/logs", NewLogHandler(s.logs))
 	s.mux.HandleFunc("GET /api/recordings/{id}", s.get)
 	s.mux.HandleFunc("POST /api/recordings/{id}/stop", s.stop)
+	s.registerWatchRoutes()
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/live/master.m3u8", s.liveMasterPlaylist)
@@ -759,6 +763,8 @@ func (s *Server) stop(w http.ResponseWriter, r *http.Request) {
 		kind, message = "recording_completed", "recording completed"
 	} else if recording.State == domain.StateInterrupted {
 		kind, message = "recording_interrupted", "recording interrupted"
+	} else if recording.State == domain.StateStopped && s.watches != nil {
+		s.watches.NotifyRecordingStopped(recording.ID)
 	}
 	if recording.StoppedAt != nil {
 		s.appendRecordingEvent(recording.ID, kind, *recording.StoppedAt, 0, message)

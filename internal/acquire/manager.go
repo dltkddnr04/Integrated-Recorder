@@ -161,7 +161,11 @@ func (m *Manager) Start(ctx context.Context, adapterID string, input json.RawMes
 	if err != nil {
 		return nil, fmt.Errorf("adapter resolution failed")
 	}
-	return m.startResolved(ctx, adapterID, media, resource, title, nil)
+	id, err := newID()
+	if err != nil {
+		return nil, err
+	}
+	return m.startResolved(ctx, id, adapterID, media, resource, title, nil)
 }
 
 // StartResolved creates a recording from a media source already resolved by
@@ -171,7 +175,27 @@ func (m *Manager) StartResolved(ctx context.Context, adapterID string, media ada
 		return nil, err
 	}
 	defer m.starts.Done()
-	return m.startResolved(ctx, adapterID, media, resource, title, provenance)
+	id, err := newID()
+	if err != nil {
+		return nil, err
+	}
+	return m.startResolved(ctx, id, adapterID, media, resource, title, provenance)
+}
+
+// StartResolvedWithID creates a resolved recording with a caller-allocated,
+// validated recording ID. This allows a management projection to persist an
+// exact cross-reference before canonical creation without adding management
+// data to the archive. The acquisition path is otherwise identical to
+// StartResolved.
+func (m *Manager) StartResolvedWithID(ctx context.Context, id, adapterID string, media adapterproto.MediaSource, resource *adapterproto.ResourceRef, title string, provenance *adapterproto.AdapterProvenance) (*domain.Recording, error) {
+	if !validRecordingID(id) {
+		return nil, fmt.Errorf("recording id is invalid")
+	}
+	if err := m.beginStart(); err != nil {
+		return nil, err
+	}
+	defer m.starts.Done()
+	return m.startResolved(ctx, id, adapterID, media, resource, title, provenance)
 }
 
 func (m *Manager) beginStart() error {
@@ -184,7 +208,7 @@ func (m *Manager) beginStart() error {
 	return nil
 }
 
-func (m *Manager) startResolved(ctx context.Context, adapterID string, media adapterproto.MediaSource, resource *adapterproto.ResourceRef, title string, provenance *adapterproto.AdapterProvenance) (*domain.Recording, error) {
+func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media adapterproto.MediaSource, resource *adapterproto.ResourceRef, title string, provenance *adapterproto.AdapterProvenance) (*domain.Recording, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -200,10 +224,6 @@ func (m *Manager) startResolved(ctx context.Context, adapterID string, media ada
 	}
 	if err = m.validate(ctx, media.ManifestURL); err != nil {
 		return nil, fmt.Errorf("invalid resolved media URL")
-	}
-	id, err := newID()
-	if err != nil {
-		return nil, err
 	}
 	now := time.Now().UTC()
 	classification := media.SourceURIClassification()
@@ -539,6 +559,13 @@ func newID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+func validRecordingID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	decoded, err := hex.DecodeString(id)
+	return err == nil && len(decoded) == 16 && id == strings.ToLower(id)
 }
 func closedChannel() chan struct{} { ch := make(chan struct{}); close(ch); return ch }
 

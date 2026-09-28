@@ -26,6 +26,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+	"github.com/dltkddnr04/integrated-recorder/internal/watch"
 )
 
 func main() {
@@ -117,6 +118,32 @@ func run() error {
 		adapters.Close()
 		return fmt.Errorf("initialize preview projections: %w", err)
 	}
+	watchService, err := watch.New(dataDir, adapters, manager, watch.Options{
+		Preview: func(recordingID, mode string) error {
+			_, setErr := previewService.SetMode(recordingID, preview.Mode(mode))
+			return setErr
+		},
+		CurrentPreview: func(recordingID string) *watch.PreviewSummary {
+			recording, getErr := manager.Get(recordingID)
+			if getErr != nil {
+				return nil
+			}
+			summary := previewService.Summary(recording)
+			return &watch.PreviewSummary{
+				Mode: string(summary.Mode), State: string(summary.State), Available: summary.Available,
+				FrameCount: summary.FrameCount, ImageArchiveOrdinal: summary.ImageArchiveOrdinal,
+				LatestArchiveOrdinal: summary.LatestArchiveOrdinal, UpdatedAt: summary.UpdatedAt,
+			}
+		},
+	})
+	if err != nil {
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("initialize automatic recording watches: %w", err)
+	}
 
 	authDisabled := os.Getenv("AUTH_DISABLED") == "1"
 	if authDisabled && !isLoopbackAddress(addr) {
@@ -148,7 +175,7 @@ func run() error {
 	version := buildVersion
 	commit := buildCommit
 
-	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(), ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
+	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(), ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
 	httpServer := &http.Server{Addr: addr, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -159,6 +186,8 @@ func run() error {
 	}()
 	previewDone := make(chan error, 1)
 	go func() { previewDone <- previewService.Run(shutdownCtx) }()
+	watchDone := make(chan error, 1)
+	go func() { watchDone <- watchService.Run(shutdownCtx) }()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.ListenAndServe() }()
 
@@ -189,6 +218,12 @@ func run() error {
 	}
 
 	shutdownWorkers, cancelWorkers := context.WithTimeout(context.Background(), 15*time.Second)
+	if err = watchService.Close(shutdownWorkers); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("watch scheduler shutdown: %w", err))
+	}
+	if err = <-watchDone; err != nil && !errors.Is(err, context.Canceled) {
+		runErr = errors.Join(runErr, fmt.Errorf("watch scheduler: %w", err))
+	}
 	if err = previewService.Close(shutdownWorkers); err != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("preview shutdown: %w", err))
 	}

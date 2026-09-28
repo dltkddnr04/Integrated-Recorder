@@ -19,6 +19,7 @@ Integrated Recorder follows the source manifest, stores original media segments 
 - **Browser controlled:** the API and web interface are the intended control surface.
 - **Rebuildable projections:** VOD playlists, preview indexes, exports, and future UI data should be reproducible from the archive.
 - **FFmpeg is for derivatives only:** it is not required for acquisition or canonical archival. It is used only for optional projections such as preview frames and remux exports.
+- **Register once for automatic recording:** when an adapter declares the `watch` capability, a durable Watch monitors it and creates a separate Recording for each detected broadcast session.
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
@@ -28,7 +29,7 @@ Adapters declare input/settings schemas and may discover opaque resources or sus
 
 **Milestone 1 and the external adapter protocol milestone are complete.**
 
-Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, and the Preview Frame Index to backend APIs. First-run administrator setup uses `<DATA_DIR>/security/bootstrap-token`. If FFmpeg is available, segment preview generation and separate remux exports are offered without changing the canonical recording.
+Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, the Preview Frame Index, and automatic recording Watches to backend APIs. A Watch is a durable recording intent; each detected broadcast becomes a separate Recording. Automatic recording is shown only for adapters that declare the `watch` capability. First-run administrator setup uses `<DATA_DIR>/security/bootstrap-token`. If FFmpeg is available, segment preview generation and separate remux exports are offered without changing the canonical recording.
 
 Scene previews are an opt-in derivative per recording and default to disabled. A background service produces at most one reusable frame for each committed primary-track segment. It first tries the target segment alone (including the required fMP4 init object); only after decode failure does it stage bounded prior-segment context. Posters, storyboards, and future navigation views reuse the stored frames, and slow or failed FFmpeg work never blocks acquisition.
 

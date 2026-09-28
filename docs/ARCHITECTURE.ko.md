@@ -18,8 +18,9 @@ Browser ── HTTP API / 생성 VOD ── Core
                                     └─ self-describing recording directory
 ```
 
-- `internal/adapterproto` — 언어 중립 Protocol v1 envelope, descriptor/schema validation, resource, workflow, media source, refresh policy, adapter-owned state 메시지
+- `internal/adapterproto` — 언어 중립 Protocol v1 envelope, descriptor/schema validation, resource, workflow, media source, refresh policy, adapter-owned state, 선택형 Watch 감지 메시지
 - `internal/adapterhost` — 명시된 adapter directory 탐색, 장기 실행 process 관리, descriptor/resource 검증, 설정 해석, workflow session 관리
+- `internal/watch` — 별도 durable management 저장소, bounded polling scheduler, session 중복 방지, 자동 Recording 시작/복귀
 - `internal/pluginconfig` — 사용자 설정/secret과 adapter-owned opaque state/state secret을 분리 저장. interface는 backend-neutral하며 현재 구현은 file backend
 - `internal/interaction` — 제한과 만료가 적용되는 generic interaction progress message
 - `cmd/adapters/owncast`, `internal/adapters/owncast` — 첫 번째 standalone adapter. Core는 Owncast package를 import하지 않음
@@ -35,7 +36,7 @@ IPC는 크기가 제한된 newline-delimited JSON입니다. v1 기존 request/re
 
 각 process의 호출은 직렬화됩니다. timeout, request 전송 후 cancellation, malformed/oversized output, 예상하지 않은 EOF, request ID 불일치, protocol 불일치, process exit는 해당 process를 unusable 상태로 만듭니다. 다음 operation에서 bounded backoff를 거쳐 필요할 때 lazy restart합니다. 매 restart마다 `describe`를 다시 호출하며 최초 discovery의 adapter ID, version, protocol version, canonical descriptor fingerprint가 모두 같아야 수락합니다. 무한 background restart loop는 없습니다. 종료 때 generic shutdown request를 보내고 제한 시간 안에 자식 process를 종료합니다.
 
-v1은 descriptor가 관련 capability를 선언한 경우 `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, `shutdown`을 구현합니다. 나머지 operation 이름은 예약되어 있거나 구조화된 unsupported error를 반환합니다. 문법에 맞는 알 수 없는 optional capability는 보존하고 무시할 수 있지만 protocol version 불일치는 거부합니다.
+v1은 descriptor가 관련 capability를 선언한 경우 `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, `shutdown`을 구현합니다. `watch` capability를 선언한 adapter는 `watch.check`로 `offline` 또는 `live` 관측을 반환할 수 있습니다. 네트워크 오류나 잘못된 응답은 offline이 아닙니다. `media`를 함께 반환하면 기존 `StartResolved` 경로로 바로 시작하며, 생략한 경우에만 상호작용을 만들지 않는 stateless `resolve`를 사용합니다. 이 확장은 optional이므로 protocol version은 계속 v1이고 기존 adapter는 변경 없이 작동합니다. 나머지 operation 이름은 예약되어 있거나 구조화된 unsupported error를 반환합니다. 문법에 맞는 알 수 없는 optional capability는 보존하고 무시할 수 있지만 protocol version 불일치는 거부합니다.
 
 Descriptor에는 optional `branding.icon` presentation metadata를 선언할 수 있습니다. 현재 형식은 `image/png`뿐이며 base64 JSON payload는 64 KiB 이하, 각 변은 512 pixel 이하이고 완전한 PNG로 디코딩되어야 합니다. SVG와 외부 URL은 허용하지 않습니다. Branding은 adapter 의미를 바꾸지 않으므로 semantic descriptor fingerprint에서 제외됩니다. Adapter API는 반복되는 목록 응답에 원본 바이트를 포함하지 않고 인증된 `/api/adapters/{id}/icon` URL만 반환합니다.
 
@@ -89,6 +90,12 @@ Preview projection은 `<DATA_DIR>/previews/<recording-id>/`에 보관하며 cano
 
 Poster, live 최신 미리보기, 녹화 목록 이미지, storyboard 및 향후 seek UI는 모두 같은 Preview Frame Index에서 frame을 선택합니다. Terminal recording의 기본 poster는 전체 playback timeline의 약 25% 지점에 가장 가까운 ready frame입니다. 기본 storyboard는 최대 48개의 고유 frame을 재생 시간 전체에 걸쳐 균등 sampling하여 표시하지만 이 개수와 화면 grid 열 수는 presentation 설정일 뿐 extraction profile이 아닙니다. Sampling 수·poster 위치·grid 배치를 바꿔도 video를 다시 decode하지 않습니다. Browser는 기존 native `<video controls>`를 유지하고 storyboard frame 선택은 해당 VOD playback time으로 seek합니다. `GET /api/recordings/{id}/previews`는 제한된 sample/summary metadata, `/previews/{archive_ordinal}`은 개별 image를 제공합니다. 기존 thumbnail API는 index의 poster를 돌려주는 compatibility view로 유지됩니다.
 
+## Durable Watch와 자동 녹화
+
+Watch는 “이 adapter-defined source의 앞으로 시작할 방송을 계속 기록한다”는 지속적인 management 의도이고 Recording은 단일 방송 회차의 archive입니다. Watch 정의와 실행 상태는 `<DATA_DIR>/management/watches/`에, Watch 입력의 secret 필드는 분리된 private 파일에 저장합니다. 공개 API에는 configured 여부만 반환합니다. Adapter가 반환한 `session_ref`는 Core 안에서만 SHA-256 digest로 바꿔 저장하며 원문은 API, event, log 또는 canonical archive에 기록하지 않습니다. `recording_id → watch_id/session digest/part` 관계도 archive 바깥 projection입니다. Watch 또는 Recording 삭제는 서로의 수명을 암묵적으로 바꾸지 않습니다.
+
+Watch scheduler는 enabled Watch를 bounded queue와 고정 worker pool에서 확인합니다. 정상 offline 확인은 Watch polling 간격을 따르고 오류는 지수 backoff를 사용합니다. 작은 jitter로 startup/polling herd를 줄이고 수동·예약 확인은 Watch별 single-flight로 합칩니다. 확인 실패는 offline으로 표현하지 않습니다. `live` 이후 자동 시작은 기존 `Manager.StartResolved`를 사용하며 Watch 하나당 active Recording을 하나로 제한합니다. Active Recording 중에는 불필요한 live check를 멈추고, Recording이 끝나면 다시 확인합니다. 같은 session의 완료/수동 중지 결과를 dedupe/suppression 상태로 보존하고, interrupted 결과는 같은 session의 다음 part로 복구할 수 있습니다. Watch를 끄거나 삭제해도 연결된 active Recording을 중지하지 않습니다.
+
 ## Management API와 projection
 
 `internal/recordquery`는 canonical recording snapshot에서 필터, 검색, 정렬, stable cursor pagination, 크기·segment·gap statistics를 계산합니다. `/api/v2/recordings`와 dashboard는 매 요청마다 archive를 다시 해석하지만 기록을 수정하지 않습니다. 계산 근거가 없는 gap duration은 `null`입니다. List/dashboard에는 작은 preview summary만 포함하고 frame index 전체를 포함하거나 recording마다 별도 status query를 요청하지 않습니다. 태그, workflow history, recording event projection, audit, notification, adapter enable preference는 `internal/management`의 별도 제한된 JSON store에 기록합니다. 이 데이터가 없어도 canonical recording을 해석할 수 있습니다.
@@ -113,7 +120,7 @@ Recording directory는 `0700`, metadata/payload/sidecar 파일은 `0600`입니�
 
 ## Server lifecycle과 Docker
 
-SIGINT/SIGTERM에서 Core는 신규 HTTP 요청을 받지 않은 뒤 모든 recording worker를 먼저 취소하고 종료 및 durable terminal state 저장을 기다린 다음 adapter process를 종료합니다. Shutdown에는 제한 시간이 있습니다. Compose는 worker 종료 제한 시간보다 긴 45초 grace period를 사용합니다. 실제 crash에서는 active recording이 재시작 후 `interrupted`로 표시됩니다.
+SIGINT/SIGTERM에서 Core는 신규 HTTP 요청을 받지 않은 뒤 Watch scheduler를 중단하고 join한 다음 모든 recording worker를 먼저 취소하고 종료 및 durable terminal state 저장을 기다린 다음 adapter process를 종료합니다. Shutdown에는 제한 시간이 있습니다. Compose는 HTTP, Watch, worker 종료 제한 시간보다 긴 45초 grace period를 사용합니다. 실제 crash에서는 active recording이 재시작 후 `interrupted`로 표시되고 enabled Watch는 stagger/jitter를 두고 다시 조정됩니다.
 
 Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 쓰며 control port는 host loopback에 공개합니다. Runtime image에는 Alpine v3.21 community repository의 `ffmpeg` package와 Owncast adapter가 포함됩니다. Alpine package metadata에서 해당 package의 license expression은 `GPL-2.0-or-later AND LGPL-2.1-or-later`입니다. FFmpeg upstream은 GPL 적용 optional component가 포함된 build의 licensing effect를 별도로 설명합니다. 이는 법률 자문이나 Integrated Recorder 자체 라이선스 변경을 뜻하지 않습니다. 배포자는 실제 image에 들어간 package/build 정보를 확인해야 합니다. 참고: [Alpine v3.21 ffmpeg package metadata](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html). 추가 executable adapter는 `./adapter-binaries`에 두고 `/external-adapters`에 read-only mount합니다. Compose 실행 전 executable bit를 설정해야 합니다. Core restart 후 새 binary를 발견하며 hot reload는 없습니다. Authentication을 명시적으로 disable한 배포도 loopback bind 외에는 허용하지 않습니다.
 
@@ -121,7 +128,7 @@ Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 �
 
 중지/완료/interrupted recording의 저장 segment를 참조하는 finite HLS VOD manifest를 생성합니다. Segment endpoint는 저장된 원본 byte를 직접 반환하며 파일을 이어 붙이거나 remux하지 않습니다. 재생 가능한 codec인지 여부는 browser 지원에 달려 있습니다.
 
-미구현: chat/metadata timeline, 비동기 adapter notification runtime, 실제 platform authentication flow, 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export transcoding/추가 format, multi-user/role authorization, adapter sandbox, adapter hot reload.
+미구현: chat/metadata timeline, 비동기 adapter notification runtime, 실제 platform authentication flow, Owncast 외 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export transcoding/추가 format, multi-user/role authorization, adapter sandbox, adapter hot reload. Watch 감지는 polling 기반이며 webhook/push 알림은 구현하지 않았습니다.
 
 ## Web application
 

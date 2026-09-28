@@ -19,6 +19,7 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 - **Browser controlled:** API와 Web UI가 공식 제어 경로가 됩니다.
 - **재생성 가능한 projection:** VOD playlist, preview index, export, 향후 UI 데이터는 archive에서 다시 만들 수 있어야 합니다.
 - **FFmpeg는 파생 작업 전용:** 녹화 수집과 원본 보관에는 필요하지 않습니다. 장면 미리보기와 리먹스 내보내기 같은 선택적 파생 기능에만 사용합니다.
+- **한 번 등록하는 자동 녹화:** `watch` 감지를 지원하는 어댑터에서는 Watch를 한 번 등록해 두고, 이후 방송 회차를 서버가 감지해 각각 별도의 Recording으로 보존합니다.
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
@@ -28,7 +29,7 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 
 **Milestone 1과 external adapter protocol milestone 완료.**
 
-React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, resource 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, Preview Frame Index를 backend API에 연결합니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우 장면 미리보기 프레임 생성과 별도의 remux export를 제공하며 canonical 녹화 데이터는 변경하지 않습니다.
+React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, 리소스 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, Preview Frame Index, 자동 녹화 Watch를 backend API에 연결합니다. Watch는 지속적인 녹화 의도이고 방송 한 회차마다 별도의 Recording을 만듭니다. `watch` capability가 없는 어댑터에는 자동 녹화 등록을 표시하지 않습니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우 장면 미리보기 프레임 생성과 별도의 remux export를 제공하며 canonical 녹화 데이터는 변경하지 않습니다.
 
 장면 미리보기는 녹화별 opt-in 파생 기능이며 기본값은 꺼져 있습니다. 각 확정된 primary track 세그먼트에는 최대 한 개의 재사용 가능한 프레임을 비동기로 생성합니다. 먼저 대상 세그먼트만 시도하고(필요한 fMP4 init object 포함), 실패할 때만 제한된 이전 세그먼트 context로 재시도합니다. FFmpeg가 느리거나 실패해도 녹화는 계속되며, 포스터·스토리보드·향후 탐색 UI는 저장된 프레임을 재사용합니다.
 

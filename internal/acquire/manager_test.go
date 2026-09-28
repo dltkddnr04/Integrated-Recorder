@@ -328,6 +328,46 @@ func TestCanceledResolvedRequestDoesNotPublishRecording(t *testing.T) {
 	}
 }
 
+func TestStartResolvedWithIDUsesExactCallerID(t *testing.T) {
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/live.m3u8":
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\n/segment.ts\n#EXT-X-ENDLIST\n")
+		case "/segment.ts":
+			_, _ = w.Write([]byte{0, 1, 2, 3})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer source.Close()
+
+	store, err := storage.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := acquire.NewManager(store, source.Client(), nil, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	const recordingID = "0123456789abcdef0123456789abcdef"
+	recording, err := manager.StartResolvedWithID(context.Background(), recordingID, "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: source.URL + "/live.m3u8"}, nil, "watch recording", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recording.ID != recordingID {
+		t.Fatalf("recording id = %q, want preallocated id %q", recording.ID, recordingID)
+	}
+	if _, err := manager.StartResolvedWithID(context.Background(), "../escape", "fixture", adapterproto.MediaSource{Type: "hls", ManifestURL: source.URL + "/live.m3u8"}, nil, "invalid", nil); err == nil {
+		t.Fatal("invalid caller-provided recording id was accepted")
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if items := manager.List(); len(items) != 1 || items[0].ID != recordingID {
+		t.Fatalf("recordings after close = %#v", items)
+	}
+}
+
 func TestExternalAdapterSubprocessAcquireReloadAndVOD(t *testing.T) {
 	const headerName = "X-Generic-Session"
 	const headerValue = "test-only-sensitive-value"

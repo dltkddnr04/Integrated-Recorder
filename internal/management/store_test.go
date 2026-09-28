@@ -232,6 +232,22 @@ func TestAuditAndNotificationSemantics(t *testing.T) {
 	}
 }
 
+func TestWatchAuditActionsAreExplicitlyAllowlisted(t *testing.T) {
+	store, _ := openTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	actions := []string{"watch_created", "watch_updated", "watch_enabled", "watch_disabled", "watch_deleted", "manual_watch_check"}
+	for i, action := range actions {
+		if err := store.AppendAudit(AuditEvent{
+			ID: fmt.Sprintf("watch-audit-%d", i), Type: action, At: now.Add(time.Duration(i) * time.Second), ObjectID: "watch-0123456789abcdef0123456789abcdef",
+		}); err != nil {
+			t.Fatalf("watch audit action %q rejected: %v", action, err)
+		}
+	}
+	if err := store.AppendAudit(AuditEvent{ID: "unknown-watch-audit", Type: "watch_secret_read", At: now.Add(time.Minute), ObjectID: "watch-0123456789abcdef0123456789abcdef"}); err == nil {
+		t.Fatal("unknown watch_* audit action was accepted")
+	}
+}
+
 func TestForgetRecordingRemovesOnlyManagementProjectionsAndIsIdempotent(t *testing.T) {
 	store, root := openTestStore(t)
 	if err := store.SetTags(testRecordingID, []string{"keep? no", "archive"}); err != nil {
