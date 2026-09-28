@@ -35,7 +35,7 @@ describe('authentication screens', () => {
     mocks.search = { mode: 'bootstrap' }
     mocks.session.mockResolvedValue({ auth_enabled: true, authenticated: false, needs_bootstrap: true, bootstrap_token_path: '/data/bootstrap-token' })
     renderLogin()
-    fireEvent.change(await screen.findByLabelText('Bootstrap token'), { target: { value: 'one-time-token' } })
+    fireEvent.change(await screen.findByLabelText('초기화 토큰'), { target: { value: 'one-time-token' } })
     fireEvent.change(screen.getByLabelText('관리자 비밀번호'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.change(screen.getByLabelText('비밀번호 확인'), { target: { value: 'a-strong-passphrase' } })
     fireEvent.click(screen.getByRole('button', { name: '서버 초기화' }))

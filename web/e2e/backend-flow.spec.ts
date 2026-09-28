@@ -23,27 +23,48 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   const bootstrapToken = readFileSync(join(dataDir, 'security', 'bootstrap-token'), 'utf8').trim()
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
   const requests: string[] = []
+  const cspConsoleErrors: string[] = []
+  const iconStatuses: number[] = []
+  await page.addInitScript(() => {
+    const target = window as typeof window & { __cspViolations?: string[] }
+    target.__cspViolations = []
+    document.addEventListener('securitypolicyviolation', event => {
+      target.__cspViolations?.push(`${event.effectiveDirective}: ${event.blockedURI}`)
+    })
+  })
+  page.on('console', message => {
+    if (message.type() === 'error' && message.text().includes('Content Security Policy')) cspConsoleErrors.push(message.text())
+  })
   page.on('request', request => requests.push(new URL(request.url()).pathname))
+  page.on('response', response => {
+    if (new URL(response.url()).pathname === '/api/adapters/owncast/icon') iconStatuses.push(response.status())
+  })
   await page.goto('/login?mode=bootstrap')
   await assertResponsive(page)
   await page.setViewportSize({ width: 1440, height: 900 })
-  await expect(page.getByLabel('Bootstrap token')).toBeVisible()
-  await page.getByLabel('Bootstrap token').fill(bootstrapToken)
+  await expect(page.getByLabel('초기화 토큰')).toBeVisible()
+  await page.getByLabel('초기화 토큰').fill(bootstrapToken)
   await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
   await page.getByLabel('비밀번호 확인').fill('browser-e2e-strong-password')
   await page.getByRole('button', { name: '서버 초기화' }).click()
   await expect(page).toHaveURL('/')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
+  await expectOwncastLogo(page)
   expect(requests.some(path => path.includes('bootstrap-token'))).toBe(false)
 
   for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/owncast', '/workflows', '/settings']) {
     await page.goto(route)
     await assertResponsive(page)
   }
+  await page.goto('/recordings')
+  await page.getByRole('combobox').first().click()
+  await page.keyboard.press('Escape')
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __cspViolations?: string[] }).__cspViolations ?? [])).toEqual([])
   await page.goto('/new')
+  await expectOwncastLogo(page)
   await page.getByRole('button', { name: /Owncast/ }).click()
   await page.getByRole('button', { name: /입력 설정/ }).click()
-  await page.getByLabel('Owncast instance URL').fill(sourceURL)
+  await page.getByLabel('Owncast 인스턴스 URL').fill(sourceURL)
   await page.getByLabel('녹화 제목').fill('Browser E2E Owncast capture')
   await page.getByRole('button', { name: '입력 확인' }).click()
   await page.getByRole('button', { name: '녹화 시작' }).click()
@@ -75,14 +96,14 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   expect(integrity.objects_total).toBeGreaterThan(0)
   expect(integrity.objects_corrupt).toBe(0)
 
-  await page.getByRole('tab', { name: 'Archive index' }).click()
+  await page.getByRole('tab', { name: '보관 데이터 목록' }).click()
   await expect(page.getByText('recording.json', { exact: true })).toBeVisible()
   const archive = await getJSON<ArchiveIndexWire>(page, `/api/recordings/${recordingID}/archive/index`)
   expect(archive.entries.some((entry: { path: string }) => entry.path.endsWith('.ts'))).toBe(true)
 
   const exportResponse = await page.request.get(`/api/recordings/${recordingID}/exports`)
   expect(exportResponse.status()).toBe(501)
-  await expect(page.getByText('이 서버에서 export를 사용할 수 없습니다.')).toBeVisible()
+  await expect(page.getByText('이 서버에서 내보내기를 사용할 수 없습니다.')).toBeVisible()
 
   const pageWire = await getJSON<RecordingPageWire>(page, '/api/v2/recordings?state=stopped&limit=25')
   const listItem = pageWire.items.find(item => item.id === recordingID)
@@ -90,18 +111,26 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   expect('adapter' in listItem).toBe(false)
   expect('resource' in listItem).toBe(false)
   await page.goto('/recordings?state=stopped')
+  await expectOwncastLogo(page)
   await expect(page.getByRole('link', { name: 'Browser E2E Owncast capture' }).first()).toBeVisible()
-  await expect(page.getByText('중지됨', { exact: true }).first()).toBeVisible()
-  await expect(page.getByText('Owncast', { exact: true }).first()).toBeVisible()
+  await expect(page.getByRole('row').filter({ hasText: 'Browser E2E Owncast capture' }).getByText('중지됨', { exact: true })).toBeVisible()
+  await expect(
+    page.getByRole('row').filter({ hasText: 'Browser E2E Owncast capture' }).getByText('Owncast', { exact: true }),
+  ).toBeVisible()
   await page.getByRole('link', { name: /Browser E2E Owncast capture/ }).click()
   await expect(page).toHaveURL(new RegExp(`/recordings/${recordingID}$`))
+  await expectOwncastLogo(page)
 
   await assertResponsive(page)
 
   await page.getByRole('button', { name: '삭제' }).click()
   await expect(page.getByRole('alertdialog')).toContainText('되돌릴 수 없습니다')
-  await page.getByRole('alertdialog').getByRole('button', { name: 'Archive 삭제' }).click()
+  await expect.poll(() => page.evaluate(() => (window as typeof window & { __cspViolations?: string[] }).__cspViolations ?? [])).toEqual([])
+  expect(cspConsoleErrors).toEqual([])
+  await page.getByRole('alertdialog').getByRole('button', { name: '보관 데이터 삭제' }).click()
   await expect(page).toHaveURL(/\/recordings(?:\?.*)?$/)
+  expect(iconStatuses).toContain(200)
+  expect(iconStatuses.every(status => status === 200 || status === 304)).toBe(true)
   await expect(page.getByText('Browser E2E Owncast capture')).toHaveCount(0)
   expect((await page.request.get(`/api/recordings/${recordingID}`)).status()).toBe(404)
 
@@ -114,6 +143,12 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
     expect((await page.request.get(path, { headers: { accept: 'text/html' } })).status(), `${path} must not be consumed by SPA fallback`).toBe(404)
   }
 })
+
+async function expectOwncastLogo(page: Page) {
+  const image = page.locator('img[src="/api/adapters/owncast/icon"]').first()
+  await expect(image).toBeVisible()
+  await expect.poll(() => image.evaluate(element => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+}
 
 test('actual workflow adapter: challenge, secret, action URL, continue, cancel, and history', async ({ page }) => {
   const manifestURL = `${readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()}/hls/stream.m3u8`
@@ -167,7 +202,7 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
   await page.getByRole('button', { name: '취소' }).click()
   await page.getByRole('alertdialog').getByRole('button', { name: '워크플로 취소' }).click()
   await expect(page).toHaveURL('/workflows')
-  await expect(page.getByText(/canceled/i)).toBeVisible()
+  await expect(page.getByText(/Workflow Fixture · 취소됨/)).toBeVisible()
 })
 
 async function login(page: Page) {
@@ -176,7 +211,7 @@ async function login(page: Page) {
   if (session.needs_bootstrap) {
     const bootstrapToken = readFileSync(join(dataDir!, 'security', 'bootstrap-token'), 'utf8').trim()
     await page.goto('/login?mode=bootstrap')
-    await page.getByLabel('Bootstrap token').fill(bootstrapToken)
+    await page.getByLabel('초기화 토큰').fill(bootstrapToken)
     await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
     await page.getByLabel('비밀번호 확인').fill('browser-e2e-strong-password')
     await page.getByRole('button', { name: '서버 초기화' }).click()

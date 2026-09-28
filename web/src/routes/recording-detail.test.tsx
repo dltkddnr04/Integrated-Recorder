@@ -12,14 +12,14 @@ describe('recording capture timeline', () => {
       gaps={[{ track_id: 'main', source_epoch: 1, from_sequence: 2, to_sequence: 3 }]}
     />)
 
-    expect(screen.getByLabelText(/Track main capture timeline/)).toBeTruthy()
-    const markers = screen.getAllByTitle(/^(Segment|Gap)/).map(marker => marker.getAttribute('title'))
+    expect(screen.getByLabelText(/트랙 main 수집 타임라인/)).toBeTruthy()
+    const markers = screen.getAllByTitle(/^(세그먼트|누락)/).map(marker => marker.getAttribute('title'))
     expect(markers).toEqual([
-      'Segment · epoch 0 · sequence 99',
-      'Segment · epoch 1 · sequence 1',
-      'Gap · epoch 1 · 2–3',
+      '세그먼트 · 세대 0 · 순번 99',
+      '세그먼트 · 세대 1 · 순번 1',
+      '누락 · 세대 1 · 순번 2–3',
     ])
-    const gap = screen.getByTitle('Gap · epoch 1 · 2–3')
+    const gap = screen.getByTitle('누락 · 세대 1 · 순번 2–3')
     expect(gap).toHaveStyle({ flexGrow: '2' })
   })
 })

@@ -11,7 +11,7 @@ export type SchemaField = {
 export type Schema = { fields: SchemaField[] }
 export type AdapterDescriptor = {
   id: string; name: string; version: string; protocol_version: number; capabilities?: string[];
-  input_schema: Schema; configuration_schema: Schema; resource_types?: { type: string; parent_types?: string[]; configuration_schema?: Schema }[]; media_types: string[]
+  branding?: { icon_url?: string }; input_schema: Schema; configuration_schema: Schema; resource_types?: { type: string; parent_types?: string[]; configuration_schema?: Schema }[]; media_types: string[]
 }
 export type AdapterStatus = { id: string; name?: string; version?: string; protocol_version?: number; state: string; error?: string; generation?: number; restart_attempts?: number }
 export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }

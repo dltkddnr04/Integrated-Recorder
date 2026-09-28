@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { RecordingListIdentity } from './list-identity'
 import type { RecordingListItem } from '@/types/api'
 
@@ -14,7 +15,7 @@ const realListWireShape: RecordingListItem = {
 
 describe('recording list flat API contract', () => {
   it('renders adapter_name and top-level resource metadata from the list DTO', () => {
-    render(<RecordingListIdentity item={realListWireShape} />)
+    render(<QueryClientProvider client={new QueryClient()}><RecordingListIdentity item={realListWireShape} /></QueryClientProvider>)
     expect(screen.getByText('Owncast')).toBeTruthy()
     expect(screen.getByText('channel / demo')).toBeTruthy()
   })

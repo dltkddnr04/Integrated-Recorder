@@ -9,7 +9,7 @@ describe('export row action semantics', () => {
   it('cancels active jobs without presenting archive deletion copy', () => {
     const action = vi.fn()
     render(<ExportRow item={job('running')} onDelete={action} deleting={false} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Export 작업 취소' }))
+    fireEvent.click(screen.getByRole('button', { name: '내보내기 작업 취소' }))
     expect(action).toHaveBeenCalledOnce()
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
   })
@@ -17,9 +17,9 @@ describe('export row action semantics', () => {
   it('requires confirmation to delete a terminal export projection', () => {
     const action = vi.fn()
     render(<ExportRow item={job('failed')} onDelete={action} deleting={false} />)
-    fireEvent.click(screen.getByRole('button', { name: 'export 항목 삭제' }))
-    expect(screen.getByRole('alertdialog')).toHaveTextContent('Canonical recording archive에는 영향이 없습니다.')
-    fireEvent.click(screen.getByRole('button', { name: 'Export 삭제' }))
+    fireEvent.click(screen.getByRole('button', { name: '내보내기 항목 삭제' }))
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('원본 녹화 보관 데이터에는 영향이 없습니다.')
+    fireEvent.click(screen.getByRole('button', { name: '내보내기 삭제' }))
     expect(action).toHaveBeenCalledOnce()
   })
 })

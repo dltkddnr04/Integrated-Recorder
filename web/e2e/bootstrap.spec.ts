@@ -32,7 +32,7 @@ test('first-run setup sends bootstrap token and password through authenticated A
   await page.route('**/api/system/storage', route => route.fulfill({ json: { filesystem_total_bytes: 0, filesystem_used_bytes: 0, filesystem_available_bytes: 0, recordings_bytes: 0, recording_count: 0, segment_count: 0, init_segment_count: 0, manifest_count: 0 } }))
   await page.goto('/login?mode=bootstrap')
   await expect(page.getByText('/data/bootstrap-token')).toBeVisible()
-  await page.getByLabel('Bootstrap token').fill('one-time-token')
+  await page.getByLabel('초기화 토큰').fill('one-time-token')
   await page.getByLabel('관리자 비밀번호').fill('a-strong-passphrase')
   await page.getByLabel('비밀번호 확인').fill('a-strong-passphrase')
   await page.getByRole('button', { name: '서버 초기화' }).click()

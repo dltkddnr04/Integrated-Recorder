@@ -1,9 +1,25 @@
-import * as SelectPrimitive from '@radix-ui/react-select'
-import { Check, ChevronDown } from 'lucide-react'
-import type { ReactNode } from 'react'
+import type { ReactNode, SelectHTMLAttributes } from 'react'
+import { ChevronDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-export function Select({ value, onValueChange, children, placeholder = '선택', disabled, id, 'aria-describedby': ariaDescribedBy, 'aria-invalid': ariaInvalid }: { value?: string; onValueChange: (value: string) => void; children: ReactNode; placeholder?: string; disabled?: boolean; id?: string; 'aria-describedby'?: string; 'aria-invalid'?: boolean }) {
-  return <SelectPrimitive.Root value={value} onValueChange={onValueChange} disabled={disabled}><SelectPrimitive.Trigger id={id} aria-describedby={ariaDescribedBy} aria-invalid={ariaInvalid} className="focus-ring flex h-9 w-full items-center justify-between rounded-md border border-input bg-background px-3 text-sm disabled:opacity-50"><SelectPrimitive.Value placeholder={placeholder} /><SelectPrimitive.Icon><ChevronDown className="h-4 w-4 text-muted-foreground" /></SelectPrimitive.Icon></SelectPrimitive.Trigger><SelectPrimitive.Portal><SelectPrimitive.Content position="popper" className="z-[70] max-h-72 min-w-[var(--radix-select-trigger-width)] overflow-y-auto rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg"><SelectPrimitive.Viewport>{children}</SelectPrimitive.Viewport></SelectPrimitive.Content></SelectPrimitive.Portal></SelectPrimitive.Root>
+type SelectProps = Omit<SelectHTMLAttributes<HTMLSelectElement>, 'value' | 'onChange' | 'children'> & {
+  value?: string
+  onValueChange: (value: string) => void
+  children: ReactNode
+  placeholder?: string
 }
-export function SelectItem({ value, children }: { value: string; children: ReactNode }) { return <SelectPrimitive.Item value={value} className={cn('relative flex cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent data-[disabled]:pointer-events-none data-[disabled]:opacity-50')}><span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center"><SelectPrimitive.ItemIndicator><Check className="h-4 w-4" /></SelectPrimitive.ItemIndicator></span><SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText></SelectPrimitive.Item> }
+
+/** Native select avoids inline styles injected by Radix under the strict app CSP. */
+export function Select({ value, onValueChange, children, placeholder = '선택', disabled, id, className, 'aria-describedby': ariaDescribedBy, 'aria-invalid': ariaInvalid, ...props }: SelectProps) {
+  return <span className="relative block min-w-0">
+    <select {...props} id={id} value={value ?? ''} onChange={event => onValueChange(event.currentTarget.value)} disabled={disabled} aria-describedby={ariaDescribedBy} aria-invalid={ariaInvalid} className={cn('focus-ring h-9 w-full appearance-none rounded-md border border-input bg-background py-1.5 pl-3 pr-9 text-sm text-foreground disabled:cursor-not-allowed disabled:opacity-50', className)}>
+      {value === undefined && <option value="">{placeholder}</option>}
+      {children}
+    </select>
+    <ChevronDown aria-hidden="true" className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+  </span>
+}
+
+export function SelectItem({ value, children }: { value: string; children: ReactNode }) {
+  return <option value={value}>{children}</option>
+}

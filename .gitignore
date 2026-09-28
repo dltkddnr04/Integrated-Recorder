@@ -9,3 +9,5 @@
 /web/coverage/
 /web/playwright-report/
 /web/test-results/
+/artifacts/ui-screenshots*/
+/artifacts/integrated-recorder-ui-screenshots.zip
