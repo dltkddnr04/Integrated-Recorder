@@ -16,15 +16,41 @@ vi.mock('hls.js', () => ({ default: class HlsMock {
 afterEach(() => vi.clearAllMocks())
 
 describe('RecordingPlayer lifecycle', () => {
-  it('does not request a VOD manifest while the recording is active', async () => {
+  it('waits for the first committed segment without requesting a manifest', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
-    const view = render(<RecordingPlayer recordingId="rec-live" active />)
-    expect(view.getByRole('status')).toHaveTextContent('녹화 중에는 VOD를 재생할 수 없습니다.')
+    const view = render(<RecordingPlayer recordingId="rec-live" active hasCommittedSegments={false} />)
+    expect(view.getByRole('status')).toHaveTextContent('첫 세그먼트를 기다리는 중입니다.')
     expect(view.container.querySelector('video')).toBeNull()
     expect(hlsState.loadSource).not.toHaveBeenCalled()
     expect(fetchMock).not.toHaveBeenCalled()
     view.unmount()
     fetchMock.mockRestore()
+  })
+
+  it('loads the live archive HLS endpoint once committed media exists', async () => {
+    const view = render(<RecordingPlayer recordingId="rec-live" active hasCommittedSegments />)
+    await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-live/play/live/master.m3u8'))
+    const video = view.container.querySelector('video')!
+    expect(video.controls).toBe(true)
+    expect(video).toHaveAttribute('aria-label', '녹화 중 실시간 HLS 재생')
+    vi.spyOn(video, 'pause').mockImplementation(() => undefined)
+    vi.spyOn(video, 'load').mockImplementation(() => undefined)
+    view.unmount()
+  })
+
+  it('switches from live archive HLS to terminal VOD and cleans up the previous source', async () => {
+    const view = render(<RecordingPlayer recordingId="rec-live" active hasCommittedSegments />)
+    await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-live/play/live/master.m3u8'))
+    const video = view.container.querySelector('video')!
+    const pause = vi.spyOn(video, 'pause').mockImplementation(() => undefined)
+    const load = vi.spyOn(video, 'load').mockImplementation(() => undefined)
+    view.rerender(<RecordingPlayer recordingId="rec-live" active={false} />)
+    await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-live/play/master.m3u8'))
+    expect(hlsState.destroy).toHaveBeenCalledTimes(1)
+    expect(pause).toHaveBeenCalled()
+    expect(load).toHaveBeenCalled()
+    expect(video.controls).toBe(true)
+    view.unmount()
   })
 
   it('destroys hls.js and clears the media element when unmounted', async () => {

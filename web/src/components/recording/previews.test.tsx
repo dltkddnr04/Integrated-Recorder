@@ -1,6 +1,6 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { PreviewFrameGrid, PreviewThumbnail } from './previews'
+import { LivePreviewViewport, PreviewFrameGrid, PreviewThumbnail } from './previews'
 import { formatPreviewClock, seekToPreview, uniquePreviewFrames } from '@/lib/previews'
 import type { PreviewFrame, PreviewSummary } from '@/types/api'
 
@@ -49,5 +49,53 @@ describe('Preview Frame Index presentation', () => {
   it('keeps overlays compact and safe for invalid timestamps', () => {
     expect(formatPreviewClock(5076)).toBe('01:24:36')
     expect(formatPreviewClock(Number.NaN)).toBe('—')
+  })
+
+  it('keeps the previous live frame visible until the next frame loads, then cross-fades', async () => {
+    const summary = (ordinal: number): PreviewSummary => ({
+      mode: 'segment', state: 'partial', available: true, frame_count: ordinal,
+      image_archive_ordinal: ordinal, latest_archive_ordinal: ordinal, updated_at: `2026-09-28T00:00:0${ordinal}Z`,
+    })
+    const view = render(<LivePreviewViewport recordingId="rec-live" summary={summary(1)} adapterId="fixture" />)
+    const firstPending = await waitFor(() => {
+      const image = view.container.querySelector<HTMLImageElement>('[data-preview-pending="true"]')
+      expect(image).not.toBeNull()
+      return image!
+    })
+    fireEvent.load(firstPending)
+    await waitFor(() => expect(view.container.querySelector('img:not([data-preview-pending])')?.getAttribute('src')).toContain('/previews/1'))
+
+    view.rerender(<LivePreviewViewport recordingId="rec-live" summary={summary(2)} adapterId="fixture" />)
+    const nextPending = await waitFor(() => {
+      const image = view.container.querySelector<HTMLImageElement>('[data-preview-pending="true"]')
+      expect(image?.getAttribute('src')).toContain('/previews/2')
+      return image!
+    })
+    expect(view.container.querySelector('img:not([data-preview-pending])')?.getAttribute('src')).toContain('/previews/1')
+    fireEvent.load(nextPending)
+    await waitFor(() => expect(view.container.querySelector('.live-preview-fade-in')?.getAttribute('src')).toContain('/previews/2'))
+    expect(view.container.querySelector('.live-preview-fade-out')?.getAttribute('src')).toContain('/previews/1')
+    view.unmount()
+  })
+
+  it('does not reload or cross-fade the same frame when only the preview index timestamp changes', async () => {
+    const summary = (updatedAt: string): PreviewSummary => ({
+      mode: 'segment', state: 'partial', available: true, frame_count: 2,
+      image_archive_ordinal: 2, latest_archive_ordinal: 4, updated_at: updatedAt,
+    })
+    const view = render(<LivePreviewViewport recordingId="rec-live" summary={summary('v1')} adapterId="fixture" />)
+    const initial = await waitFor(() => {
+      const image = view.container.querySelector<HTMLImageElement>('[data-preview-pending="true"]')
+      expect(image).not.toBeNull()
+      return image!
+    })
+    expect(initial).toHaveAttribute('src', '/api/recordings/rec-live/previews/2?v=2')
+    fireEvent.load(initial)
+    await waitFor(() => expect(view.container.querySelector('img:not([data-preview-pending])')).toHaveAttribute('src', '/api/recordings/rec-live/previews/2?v=2'))
+
+    view.rerender(<LivePreviewViewport recordingId="rec-live" summary={summary('v2')} adapterId="fixture" />)
+    expect(view.container.querySelector('[data-preview-pending="true"]')).toBeNull()
+    expect(view.container.querySelector('.live-preview-fade-in')).toBeNull()
+    view.unmount()
   })
 })

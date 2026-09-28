@@ -135,6 +135,8 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	s.mux.HandleFunc("POST /api/recordings/{id}/stop", s.stop)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/master.m3u8", s.masterPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/tracks/{track}/playlist.m3u8", s.trackPlaylist)
+	s.mux.HandleFunc("GET /api/recordings/{id}/play/live/master.m3u8", s.liveMasterPlaylist)
+	s.mux.HandleFunc("GET /api/recordings/{id}/play/live/tracks/{track}/playlist.m3u8", s.liveTrackPlaylist)
 	s.mux.HandleFunc("GET /api/recordings/{id}/play/segments/{segmentID}", s.segment)
 	var handler http.Handler = s.mux
 	if s.auth != nil {
@@ -866,6 +868,190 @@ func (s *Server) trackPlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	builder.WriteString("#EXT-X-ENDLIST\n")
 	writePlaylist(w, builder.String())
+}
+
+// liveMasterPlaylist builds a same-origin HLS entry point for the canonical
+// media that has already been committed for an active recording. It never
+// exposes the adapter's source playlist or its URLs.
+func (s *Server) liveMasterPlaylist(w http.ResponseWriter, r *http.Request) {
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
+	recording, ok := s.liveRecording(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	track := recording.Tracks["main"]
+	if track == nil {
+		http.NotFound(w, r)
+		return
+	}
+	segments := livePlaylistWindow(track.Segments)
+	if len(segments) == 0 {
+		writeError(w, http.StatusConflict, "recording has no captured media segments yet")
+		return
+	}
+	if !s.livePayloadsAvailable(recording, track, segments) {
+		writeError(w, http.StatusServiceUnavailable, "recording media payload is unavailable")
+		return
+	}
+	bandwidth := track.Bandwidth
+	if bandwidth <= 0 {
+		bandwidth = 1_000_000
+	}
+	playlist := fmt.Sprintf("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=%d\n/api/recordings/%s/play/live/tracks/main/playlist.m3u8\n", bandwidth, recording.ID)
+	writePlaylist(w, playlist)
+}
+
+const livePlaylistSegmentLimit = 12
+
+func livePlaylistWindow(source []domain.Segment) []domain.Segment {
+	segments := livePlaylistWindowWithoutLimit(source)
+	return livePlaylistWindowFromSorted(segments)
+}
+
+func livePlaylistWindowFromSorted(segments []domain.Segment) []domain.Segment {
+	if len(segments) > livePlaylistSegmentLimit {
+		segments = segments[len(segments)-livePlaylistSegmentLimit:]
+	}
+	return segments
+}
+
+func (s *Server) liveTrackPlaylist(w http.ResponseWriter, r *http.Request) {
+	lock := s.productLock(r.PathValue("id"))
+	lock.RLock()
+	defer lock.RUnlock()
+	recording, ok := s.liveRecording(w, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	trackID := r.PathValue("track")
+	track := recording.Tracks[trackID]
+	if track == nil {
+		http.NotFound(w, r)
+		return
+	}
+	allSegments := livePlaylistWindowWithoutLimit(track.Segments)
+	segments := livePlaylistWindowFromSorted(allSegments)
+	if len(segments) == 0 {
+		writeError(w, http.StatusConflict, "recording has no captured media segments yet")
+		return
+	}
+	if !s.livePayloadsAvailable(recording, track, segments) {
+		writeError(w, http.StatusServiceUnavailable, "recording media payload is unavailable")
+		return
+	}
+
+	maxDuration := 0.0
+	for _, segment := range segments {
+		if segment.Duration > maxDuration {
+			maxDuration = segment.Duration
+		}
+	}
+	target := int(math.Ceil(maxDuration))
+	if target < 1 {
+		target = 1
+	}
+	windowStart := len(allSegments) - len(segments)
+	discontinuitySequence := uint64(0)
+	for index := 0; index < windowStart; index++ {
+		if liveDiscontinuityBefore(recording, trackID, allSegments, index) {
+			discontinuitySequence++
+		}
+	}
+	mediaSequence := segments[0].Sequence
+	if segments[0].ArchiveOrdinal > 0 {
+		mediaSequence = segments[0].ArchiveOrdinal - 1
+	}
+
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:%d\n", target, mediaSequence)
+	if discontinuitySequence > 0 {
+		fmt.Fprintf(&builder, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discontinuitySequence)
+	}
+	previousInit := ""
+	for index, segment := range segments {
+		fullIndex := windowStart + index
+		if liveDiscontinuityBefore(recording, trackID, allSegments, fullIndex) {
+			fmt.Fprintln(&builder, "#EXT-X-DISCONTINUITY")
+		}
+		if segment.InitSegmentID != "" && segment.InitSegmentID != previousInit {
+			init, ok := findInit(track, segment.InitSegmentID)
+			if !ok {
+				writeError(w, http.StatusInternalServerError, "recording references a missing init segment")
+				return
+			}
+			uri := fmt.Sprintf("/api/recordings/%s/play/segments/%s", recording.ID, init.ID)
+			fmt.Fprintf(&builder, "#EXT-X-MAP:URI=%s\n", strconv.Quote(uri))
+			previousInit = segment.InitSegmentID
+		}
+		if segment.ProgramDateTime != nil {
+			fmt.Fprintf(&builder, "#EXT-X-PROGRAM-DATE-TIME:%s\n", segment.ProgramDateTime.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"))
+		}
+		fmt.Fprintf(&builder, "#EXTINF:%s,\n/api/recordings/%s/play/segments/%s\n", strconv.FormatFloat(segment.Duration, 'f', -1, 64), recording.ID, segment.ID)
+	}
+	writePlaylist(w, builder.String())
+}
+
+// livePlaylistWindowWithoutLimit returns a sorted snapshot for calculating
+// discontinuities before the selected sliding window.
+func livePlaylistWindowWithoutLimit(source []domain.Segment) []domain.Segment {
+	segments := append([]domain.Segment(nil), source...)
+	sort.Slice(segments, func(i, j int) bool { return segmentBefore(segments[i], segments[j]) })
+	return segments
+}
+
+func liveDiscontinuityBefore(recording *domain.Recording, trackID string, segments []domain.Segment, index int) bool {
+	if index < 0 || index >= len(segments) {
+		return false
+	}
+	segment := segments[index]
+	if segment.Discontinuity {
+		return true
+	}
+	if index == 0 {
+		return false
+	}
+	previous := segments[index-1]
+	return previous.SourceEpoch != segment.SourceEpoch ||
+		previous.DiscontinuitySequence != segment.DiscontinuitySequence ||
+		hasGapBetweenEpoch(recording.Gaps, trackID, previous.SourceEpoch, previous.Sequence, segment.Sequence)
+}
+
+func (s *Server) livePayloadsAvailable(recording *domain.Recording, track *domain.Track, segments []domain.Segment) bool {
+	store := s.manager.Store()
+	for _, segment := range segments {
+		file, err := store.OpenPayload(recording.ID, segment.StoragePath)
+		if err != nil {
+			return false
+		}
+		_ = file.Close()
+		if segment.InitSegmentID != "" {
+			init, ok := findInit(track, segment.InitSegmentID)
+			if !ok {
+				return false
+			}
+			file, err := store.OpenPayload(recording.ID, init.StoragePath)
+			if err != nil {
+				return false
+			}
+			_ = file.Close()
+		}
+	}
+	return true
+}
+
+func (s *Server) liveRecording(w http.ResponseWriter, id string) (*domain.Recording, bool) {
+	recording, err := s.manager.Get(id)
+	if err != nil {
+		writeStorageError(w, err)
+		return nil, false
+	}
+	if recording.State != domain.StateRecording {
+		writeError(w, http.StatusConflict, "live HLS playback is available only while recording")
+		return nil, false
+	}
+	return recording, true
 }
 
 func (s *Server) playableTrackPayloadsAvailable(recording *domain.Recording, track *domain.Track) bool {

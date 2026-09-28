@@ -126,7 +126,12 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   const recordingID = page.url().split('/').at(-1)!
 
   await expect.poll(async () => segmentCount(await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`))).toBeGreaterThan(0)
-  await expect(page.getByText('녹화 중에는 VOD를 재생할 수 없습니다.')).toBeVisible()
+  await expect(page.getByRole('group', { name: '녹화 중 표시 방식' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '실시간 HLS' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.locator('#vod-player video')).toBeVisible()
+  const livePlaylist = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/play/live/tracks/main/playlist.m3u8`)
+  expect(livePlaylist.status()).toBe(200)
+  expect(await livePlaylist.text()).not.toContain('#EXT-X-ENDLIST')
   await page.getByRole('button', { name: '중지', exact: true }).click()
   await page.getByRole('alertdialog').getByRole('button', { name: '중지', exact: true }).click()
   await expect.poll(async () => (await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`)).state).toBe('stopped')
@@ -291,7 +296,8 @@ test('actual Go backend: opt-in segment previews, live/recent frames, storyboard
   await expect(page).toHaveURL(/\/recordings\/[^/]+$/)
   const recordingID = page.url().split('/').at(-1)!
   expect(JSON.parse(startBody)).toMatchObject({ preview_mode: 'segment' })
-  await expect(page.getByRole('heading', { name: '장면 미리보기' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '현재 미리보기' })).toBeVisible()
+  await page.getByRole('button', { name: '현재 미리보기' }).click()
 
   let summary: PreviewWire | undefined
   await expect.poll(async () => {
@@ -318,10 +324,10 @@ test('actual Go backend: opt-in segment previews, live/recent frames, storyboard
     latestOrdinal = recording.preview?.image_archive_ordinal ?? 0
     return latestOrdinal
   }, { timeout: 15_000 }).toBeGreaterThan(0)
-  const liveImage = page.locator(`section[aria-labelledby="preview-heading"] img[src^="/api/recordings/${recordingID}/previews/"]`).first()
+  const liveImage = page.locator(`#vod-player img[src^="/api/recordings/${recordingID}/previews/"]`).last()
   await expect.poll(() => liveImage.evaluate(image => ({ complete: (image as HTMLImageElement).complete, width: (image as HTMLImageElement).naturalWidth }))).toMatchObject({ complete: true })
   await expect.poll(() => liveImage.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
-  await scrollPreviewSectionIntoView(page)
+  await page.locator('#vod-player').scrollIntoViewIfNeeded()
   await page.screenshot({ path: join(screenshots, '01-live-recording-detail.png') })
 
   await page.goto('/recordings')
