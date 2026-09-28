@@ -2,10 +2,15 @@ package adapterhost
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -119,6 +124,11 @@ func runHelperAdapter() int {
 				capabilities = []string{adapterproto.CapabilityResolveWorkflow}
 			}
 			descriptor := adapterproto.Descriptor{ID: os.Getenv("IR_ADAPTER_ID"), Name: "Test adapter", Version: version, ProtocolVersion: protocolVersion, Capabilities: capabilities, InputSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "manifest_url", Control: "text", Label: "Manifest URL", Required: true}}}, ConfigurationSchema: configurationSchema, ResourceTypes: resourceTypes, MediaTypes: []string{"hls"}}
+			if encoded := os.Getenv("IR_ADAPTER_BRANDING"); encoded != "" {
+				if icon, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil {
+					descriptor.Branding = &adapterproto.Branding{Icon: &adapterproto.BrandIcon{MediaType: "image/png", Data: icon}}
+				}
+			}
 			response, _ = adapterproto.Success(request.ID, descriptor)
 		case adapterproto.MethodResourceList, adapterproto.MethodResourceSearch:
 			marker := os.Getenv("IR_ADAPTER_MARKER")
@@ -1075,6 +1085,95 @@ func TestCanceledBeforeRequestWriteKeepsAdapterUsable(t *testing.T) {
 	if err != nil || media.ManifestURL == "" {
 		t.Fatalf("healthy process was lost after pre-cancel: %#v %v", media, err)
 	}
+}
+
+func TestDescriptorFingerprintExcludesBrandingAndRetainsLegacyHash(t *testing.T) {
+	base := adapterproto.Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: adapterproto.Version, Capabilities: []string{adapterproto.CapabilityResolve}, MediaTypes: []string{"hls"}}
+	const legacyHash = "6e7cb88d988a89940e243877949f833436d3b5a4fc23ee80e505f460e2be5564"
+	if got := descriptorFingerprint(base); got != legacyHash {
+		t.Fatalf("unbranded fingerprint changed: got %s want legacy %s", got, legacyHash)
+	}
+	branded := base
+	branded.Branding = &adapterproto.Branding{Icon: &adapterproto.BrandIcon{MediaType: "image/png", Data: hostTestPNG(t, color.NRGBA{R: 1, A: 255})}}
+	if got := descriptorFingerprint(branded); got != legacyHash {
+		t.Fatalf("branding changed semantic fingerprint: got %s want %s", got, legacyHash)
+	}
+
+	semanticChanges := map[string]func(*adapterproto.Descriptor){
+		"id":       func(d *adapterproto.Descriptor) { d.ID = "other-adapter" },
+		"name":     func(d *adapterproto.Descriptor) { d.Name = "Other" },
+		"version":  func(d *adapterproto.Descriptor) { d.Version = "2" },
+		"protocol": func(d *adapterproto.Descriptor) { d.ProtocolVersion++ },
+		"schema": func(d *adapterproto.Descriptor) {
+			d.ConfigurationSchema.Fields = []adapterproto.Field{{Key: "value", Control: "text", Label: "Value"}}
+		},
+		"capability": func(d *adapterproto.Descriptor) {
+			d.Capabilities = append(d.Capabilities, adapterproto.CapabilityMetadata)
+		},
+		"resource":   func(d *adapterproto.Descriptor) { d.ResourceTypes = []adapterproto.ResourceType{{Type: "opaque"}} },
+		"media type": func(d *adapterproto.Descriptor) { d.MediaTypes = append(d.MediaTypes, "dash") },
+	}
+	for name, mutate := range semanticChanges {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			if descriptorFingerprint(changed) == legacyHash {
+				t.Fatal("semantic descriptor change did not change fingerprint")
+			}
+		})
+	}
+}
+
+func TestManualRestartAcceptsBrandingOnlyChangeAndAdoptsNewIcon(t *testing.T) {
+	dir := t.TempDir()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstIcon := hostTestPNG(t, color.NRGBA{R: 10, G: 20, B: 30, A: 255})
+	secondIcon := hostTestPNG(t, color.NRGBA{R: 200, G: 150, B: 100, A: 255})
+	marker := filepath.Join(dir, "started")
+	script := "#!/bin/sh\nif [ ! -f " + shellQuote(marker) + " ]; then : > " + shellQuote(marker) + "; IR_ADAPTER_HELPER=1 IR_ADAPTER_MODE=normal IR_ADAPTER_ID=brand-restart IR_ADAPTER_BRANDING=" + shellQuote(base64.StdEncoding.EncodeToString(firstIcon)) + " exec " + shellQuote(binary) + "; fi\nIR_ADAPTER_HELPER=1 IR_ADAPTER_MODE=normal IR_ADAPTER_ID=brand-restart IR_ADAPTER_BRANDING=" + shellQuote(base64.StdEncoding.EncodeToString(secondIcon)) + " exec " + shellQuote(binary) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, binaryPrefix+"brand-restart"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	before, err := host.Get("brand-restart")
+	if err != nil || before.Descriptor == nil || before.Descriptor.Branding == nil || !bytes.Equal(before.Descriptor.Branding.Icon.Data, firstIcon) {
+		t.Fatalf("initial descriptor=%#v err=%v", before.Descriptor, err)
+	}
+	if _, err := host.Restart(context.Background(), "brand-restart"); err != nil {
+		t.Fatalf("branding-only restart rejected: %v", err)
+	}
+	after, err := host.Get("brand-restart")
+	if err != nil || after.Descriptor == nil || after.Descriptor.Branding == nil || after.Descriptor.Branding.Icon == nil || !bytes.Equal(after.Descriptor.Branding.Icon.Data, secondIcon) {
+		t.Fatalf("restarted descriptor did not adopt current branding: %#v err=%v", after.Descriptor, err)
+	}
+	listed := host.List()
+	if len(listed) != 1 || listed[0].Descriptor == nil || listed[0].Descriptor.Branding == nil || listed[0].Descriptor.Branding.Icon == nil || !bytes.Equal(listed[0].Descriptor.Branding.Icon.Data, secondIcon) {
+		t.Fatalf("list did not return current branding: %#v", listed)
+	}
+	// Returned branding is a copy; callers cannot mutate the host's live view.
+	after.Descriptor.Branding.Icon.Data[0] ^= 0xff
+	current, _ := host.Get("brand-restart")
+	if current.Descriptor == nil || current.Descriptor.Branding == nil || current.Descriptor.Branding.Icon == nil || !bytes.Equal(current.Descriptor.Branding.Icon.Data, secondIcon) {
+		t.Fatal("caller mutation changed the host descriptor")
+	}
+}
+
+func hostTestPNG(t *testing.T, pixel color.NRGBA) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.SetNRGBA(0, 0, pixel)
+	var output bytes.Buffer
+	if err := png.Encode(&output, img); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
 }
 
 func TestCanceledRequestUnblocksLargeStdinWrite(t *testing.T) {

@@ -52,6 +52,11 @@ func runServerTestAdapter() int {
 				ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "legacy_secret", Control: "secret", Label: "Secret"}, {Key: "label", Control: "text", Label: "Label"}}},
 				MediaTypes:          []string{"hls"},
 			}
+			if encoded := os.Getenv("IR_SERVER_ADAPTER_ICON"); encoded != "" {
+				if icon, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil {
+					descriptor.Branding = &adapterproto.Branding{Icon: &adapterproto.BrandIcon{MediaType: "image/png", Data: icon}}
+				}
+			}
 			response, _ = adapterproto.Success(request.ID, descriptor)
 		case adapterproto.MethodShutdown:
 			response, _ = adapterproto.Success(request.ID, map[string]bool{"stopped": true})

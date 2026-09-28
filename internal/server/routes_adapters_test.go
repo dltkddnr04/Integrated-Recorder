@@ -1,7 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,8 +15,140 @@ import (
 	"testing"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
+	"github.com/dltkddnr04/integrated-recorder/internal/authn"
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
 )
+
+func TestAdapterBrandingAPIUsesAuthenticatedIconProjection(t *testing.T) {
+	dir := t.TempDir()
+	icon := serverTestPNG(t)
+	writeServerBrandedTestAdapter(t, dir, icon)
+	host, err := adapterhost.Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	products, err := management.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewWithOptions(nil, host, nil, Options{Management: products})
+	rawIcon := base64.StdEncoding.EncodeToString(icon)
+	iconURL := `"icon_url":"/api/adapters/schema-test/icon"`
+	assertSanitized := func(name string, response *httptest.ResponseRecorder) {
+		t.Helper()
+		body := response.Body.String()
+		if response.Code != http.StatusOK || !strings.Contains(body, iconURL) || strings.Contains(body, rawIcon) || strings.Contains(body, `"data"`) {
+			t.Fatalf("%s response was not sanitized: status=%d body=%s", name, response.Code, body)
+		}
+	}
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/adapters", nil))
+	assertSanitized("list", list)
+	get := httptest.NewRecorder()
+	handler.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test", nil))
+	assertSanitized("get", get)
+	for _, action := range []string{"restart", "disable", "enable"} {
+		request := httptest.NewRequest(http.MethodPost, "/api/adapters/schema-test/"+action, strings.NewReader(""))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		assertSanitized(action, response)
+	}
+
+	iconResponse := httptest.NewRecorder()
+	handler.ServeHTTP(iconResponse, httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test/icon", nil))
+	if iconResponse.Code != http.StatusOK || iconResponse.Header().Get("Content-Type") != "image/png" || iconResponse.Header().Get("X-Content-Type-Options") != "nosniff" || !strings.HasPrefix(iconResponse.Header().Get("Cache-Control"), "private,") || !bytes.Equal(iconResponse.Body.Bytes(), icon) {
+		t.Fatalf("icon response status=%d headers=%v body=%x", iconResponse.Code, iconResponse.Header(), iconResponse.Body.Bytes())
+	}
+	etag := iconResponse.Header().Get("ETag")
+	if !strings.HasPrefix(etag, `"`) || etag == `""` {
+		t.Fatalf("invalid icon ETag %q", etag)
+	}
+	conditional := httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test/icon", nil)
+	conditional.Header.Set("If-None-Match", etag)
+	notModified := httptest.NewRecorder()
+	handler.ServeHTTP(notModified, conditional)
+	if notModified.Code != http.StatusNotModified || notModified.Body.Len() != 0 {
+		t.Fatalf("conditional icon response=%d body=%q", notModified.Code, notModified.Body.String())
+	}
+
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/adapters/unknown/icon", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing icon status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	root := t.TempDir()
+	auth, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := os.ReadFile(filepath.Join(root, "security", "bootstrap-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const password = "correct horse battery staple"
+	if err := auth.Bootstrap(strings.TrimSpace(string(bootstrap)), password); err != nil {
+		t.Fatal(err)
+	}
+	authenticatedHandler := NewWithOptions(nil, host, nil, Options{Auth: auth})
+	unauthorized := httptest.NewRecorder()
+	authenticatedHandler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test/icon", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated icon request status=%d", unauthorized.Code)
+	}
+	session, err := auth.Login(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizedRequest := httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test/icon", nil)
+	authorizedRequest.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: session.Token})
+	authorized := httptest.NewRecorder()
+	authenticatedHandler.ServeHTTP(authorized, authorizedRequest)
+	if authorized.Code != http.StatusOK || !bytes.Equal(authorized.Body.Bytes(), icon) {
+		t.Fatalf("authenticated icon request status=%d body=%x", authorized.Code, authorized.Body.Bytes())
+	}
+}
+
+func TestAdapterIconWithoutBrandingReturnsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	writeServerTestAdapter(t, dir)
+	host, err := adapterhost.Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	response := httptest.NewRecorder()
+	New(nil, host, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/adapters/schema-test/icon", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("unbranded icon status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func serverTestPNG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 3, 2))
+	img.SetNRGBA(0, 0, color.NRGBA{R: 50, G: 100, B: 150, A: 255})
+	var output bytes.Buffer
+	if err := png.Encode(&output, img); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func writeServerBrandedTestAdapter(t *testing.T, dir string, icon []byte) {
+	t.Helper()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(icon)
+	script := "#!/bin/sh\nIR_SERVER_ADAPTER_ICON=" + encoded + " IR_SERVER_ADAPTER_HELPER=1 exec '" + strings.ReplaceAll(binary, "'", "'\\''") + "'\n"
+	if err := os.WriteFile(filepath.Join(dir, "integrated-recorder-adapter-schema-test"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestAdapterControlRoutesPersistAndReturnRuntimeState(t *testing.T) {
 	dir := t.TempDir()

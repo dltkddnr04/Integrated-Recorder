@@ -4,6 +4,7 @@ package owncast
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,8 +16,17 @@ import (
 
 const StreamPath = "/hls/stream.m3u8"
 
+//go:embed assets/owncast-logo.png
+var owncastLogo []byte
+
 func Describe() adapterproto.Descriptor {
-	return adapterproto.Descriptor{ID: "owncast", Name: "Owncast", Version: "0.1.0", ProtocolVersion: adapterproto.Version, Capabilities: []string{"resolve"}, InputSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Owncast instance URL", Description: "Base URL of an instance.", Required: true}}}, ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}}, ResourceTypes: []adapterproto.ResourceType{}, MediaTypes: []string{"hls"}}
+	return adapterproto.Descriptor{
+		ID: "owncast", Name: "Owncast", Version: "0.1.0", ProtocolVersion: adapterproto.Version,
+		Capabilities:        []string{"resolve"},
+		InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Owncast 인스턴스 URL", Description: "Owncast 인스턴스의 기본 URL입니다.", Required: true}}},
+		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}}, ResourceTypes: []adapterproto.ResourceType{}, MediaTypes: []string{"hls"},
+		Branding: &adapterproto.Branding{Icon: &adapterproto.BrandIcon{MediaType: "image/png", Data: append([]byte(nil), owncastLogo...)}},
+	}
 }
 
 func Resolve(input json.RawMessage) (adapterproto.MediaSource, error) {

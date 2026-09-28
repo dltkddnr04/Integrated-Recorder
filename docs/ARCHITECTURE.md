@@ -37,6 +37,10 @@ The host serializes calls to each process. Timeout, cancellation after a request
 
 V1 implements `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, and `shutdown` where the descriptor advertises the relevant generic capability. Other operation names remain reserved or return a structured unsupported error. Unknown optional capability strings with valid syntax are retained and ignored by older Core versions; protocol-version mismatch remains fatal.
 
+Descriptors may include optional `branding.icon` presentation metadata. The current format accepts only `image/png`: its base64 JSON payload is limited to 64 KiB, each dimension is at most 512 pixels, and the complete image must decode as PNG. SVG and external URLs are rejected. Branding does not change adapter semantics and is excluded from the descriptor fingerprint. Adapter API views expose an authenticated `/api/adapters/{id}/icon` URL instead of repeating image bytes in polled list responses.
+
+The built-in Owncast adapter includes the official logo. Its source, modifications, and separate CC BY-NC 4.0 terms are recorded in `internal/adapters/owncast/assets/ATTRIBUTION.txt`. Commercial use requires separate permission; the logo is not Integrated Recorder branding.
+
 ## Resources, configuration, and workflows
 
 An adapter descriptor declares opaque resource types and allowed parent-type edges. Core validates each resource reference and every edge against that declaration for API hints, config scopes, workflow discoveries, and persistence targets. Core does not interpret the type names. The active chain is bounded in depth and cannot contain a cycle.

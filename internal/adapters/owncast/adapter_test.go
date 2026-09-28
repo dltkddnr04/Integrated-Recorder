@@ -33,4 +33,7 @@ func TestDescribeSchemaIsGenericAndValid(t *testing.T) {
 	if d.ID != "owncast" || d.ProtocolVersion != adapterproto.Version || len(d.InputSchema.Fields) != 1 || d.InputSchema.Fields[0].Key != "source_url" || len(d.ConfigurationSchema.Fields) != 0 {
 		t.Fatalf("descriptor = %#v", d)
 	}
+	if d.Branding == nil || d.Branding.Icon == nil || d.Branding.Icon.MediaType != "image/png" || len(d.Branding.Icon.Data) == 0 {
+		t.Fatalf("Owncast descriptor branding = %#v", d.Branding)
+	}
 }

@@ -2,11 +2,97 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 )
+
+type adapterAPIView struct {
+	Descriptor *adapterDescriptorAPIView `json:"descriptor,omitempty"`
+	Status     adapterhost.Status        `json:"status"`
+}
+
+type adapterDescriptorAPIView struct {
+	ID                  string                      `json:"id"`
+	Name                string                      `json:"name"`
+	Version             string                      `json:"version"`
+	ProtocolVersion     int                         `json:"protocol_version"`
+	Capabilities        []string                    `json:"capabilities,omitempty"`
+	InputSchema         adapterproto.Schema         `json:"input_schema"`
+	ConfigurationSchema adapterproto.Schema         `json:"configuration_schema"`
+	ResourceTypes       []adapterproto.ResourceType `json:"resource_types,omitempty"`
+	MediaTypes          []string                    `json:"media_types"`
+	Branding            *adapterBrandingAPIView     `json:"branding,omitempty"`
+}
+
+type adapterBrandingAPIView struct {
+	IconURL string `json:"icon_url,omitempty"`
+}
+
+// projectAdapter keeps the existing status/descriptor API shape while
+// replacing protocol-owned image bytes with a same-origin authenticated URL.
+func projectAdapter(adapter adapterhost.Adapter) adapterAPIView {
+	view := adapterAPIView{Status: adapter.Status}
+	if descriptor := adapter.Descriptor; descriptor != nil {
+		view.Descriptor = &adapterDescriptorAPIView{
+			ID: descriptor.ID, Name: descriptor.Name, Version: descriptor.Version,
+			ProtocolVersion: descriptor.ProtocolVersion, Capabilities: descriptor.Capabilities,
+			InputSchema: descriptor.InputSchema, ConfigurationSchema: descriptor.ConfigurationSchema,
+			ResourceTypes: descriptor.ResourceTypes, MediaTypes: descriptor.MediaTypes,
+		}
+		if descriptor.Branding != nil && descriptor.Branding.Icon != nil && len(descriptor.Branding.Icon.Data) > 0 {
+			view.Descriptor.Branding = &adapterBrandingAPIView{IconURL: "/api/adapters/" + url.PathEscape(adapter.Status.ID) + "/icon"}
+		}
+	}
+	return view
+}
+
+func (s *Server) adapterIcon(w http.ResponseWriter, r *http.Request) {
+	if s.adapters == nil {
+		writeError(w, http.StatusNotFound, "adapter icon not found")
+		return
+	}
+	adapter, err := s.adapters.Get(r.PathValue("id"))
+	if err != nil || adapter.Descriptor == nil || adapter.Descriptor.Branding == nil || adapter.Descriptor.Branding.Icon == nil {
+		writeError(w, http.StatusNotFound, "adapter icon not found")
+		return
+	}
+	icon := adapter.Descriptor.Branding.Icon
+	if icon.MediaType != "image/png" || len(icon.Data) == 0 {
+		writeError(w, http.StatusNotFound, "adapter icon not found")
+		return
+	}
+	digest := sha256.Sum256(icon.Data)
+	etag := `"` + hex.EncodeToString(digest[:]) + `"`
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=300, must-revalidate")
+	w.Header().Set("ETag", etag)
+	if matchesETag(r.Header.Values("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(icon.Data)
+}
+
+func matchesETag(values []string, current string) bool {
+	for _, value := range values {
+		for _, candidate := range strings.Split(value, ",") {
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "*" || candidate == current || strings.TrimPrefix(candidate, "W/") == current {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // registerAdapterControlRoutes adds the local control actions for already
 // discovered adapter binaries. Installation remains an administrator-managed
@@ -37,7 +123,7 @@ func (s *Server) adapterRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	auditErr := s.appendAudit("adapter_restarted", adapter.Status.ID)
 	setAdapterAuditHeader(w, s.products != nil, auditErr, true)
-	writeJSON(w, http.StatusOK, adapter)
+	writeJSON(w, http.StatusOK, projectAdapter(adapter))
 }
 
 func (s *Server) adapterEnable(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +175,7 @@ func (s *Server) adapterSetEnabled(w http.ResponseWriter, r *http.Request, enabl
 		writeError(w, http.StatusServiceUnavailable, "adapter status is unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, adapter)
+	writeJSON(w, http.StatusOK, projectAdapter(adapter))
 }
 
 func setAdapterAuditHeader(w http.ResponseWriter, available bool, err error, attempted bool) {

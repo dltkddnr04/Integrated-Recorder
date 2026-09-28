@@ -37,6 +37,10 @@ IPC는 크기가 제한된 newline-delimited JSON입니다. v1 기존 request/re
 
 v1은 descriptor가 관련 capability를 선언한 경우 `describe`, legacy `resolve`, `resolve.begin`, `resolve.continue`, `refresh`, `shutdown`을 구현합니다. 나머지 operation 이름은 예약되어 있거나 구조화된 unsupported error를 반환합니다. 문법에 맞는 알 수 없는 optional capability는 보존하고 무시할 수 있지만 protocol version 불일치는 거부합니다.
 
+Descriptor에는 optional `branding.icon` presentation metadata를 선언할 수 있습니다. 현재 형식은 `image/png`뿐이며 base64 JSON payload는 64 KiB 이하, 각 변은 512 pixel 이하이고 완전한 PNG로 디코딩되어야 합니다. SVG와 외부 URL은 허용하지 않습니다. Branding은 adapter 의미를 바꾸지 않으므로 semantic descriptor fingerprint에서 제외됩니다. Adapter API는 반복되는 목록 응답에 원본 바이트를 포함하지 않고 인증된 `/api/adapters/{id}/icon` URL만 반환합니다.
+
+기본 Owncast adapter는 공식 로고를 포함합니다. 로고 출처, 변형 내역, 별도 CC BY-NC 4.0 조건은 `internal/adapters/owncast/assets/ATTRIBUTION.txt`에 기록되어 있습니다. 상업적 이용에는 별도 허가가 필요하며, Integrated Recorder의 자체 브랜드로 사용하지 않습니다.
+
 ## Resource, 설정, workflow
 
 Adapter descriptor는 opaque resource type과 허용된 parent type 관계를 선언합니다. Core는 API hint, config scope, workflow discovery, persistence target에 대해 resource 참조와 모든 parent edge를 이 선언에 따라 검증합니다. type 이름의 의미는 해석하지 않습니다. chain 길이는 제한되고 cycle은 허용되지 않습니다.

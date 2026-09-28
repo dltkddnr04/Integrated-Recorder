@@ -118,6 +118,7 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	s.mux.HandleFunc("POST /api/resolve-workflows/{id}/continue", s.workflowContinue)
 	s.mux.HandleFunc("GET /api/adapters", s.adapterList)
 	s.mux.HandleFunc("GET /api/adapters/{id}", s.adapterGet)
+	s.mux.HandleFunc("GET /api/adapters/{id}/icon", s.adapterIcon)
 	s.mux.HandleFunc("GET /api/adapters/{id}/schema", s.adapterSchema)
 	s.mux.HandleFunc("GET /api/adapters/{id}/config", s.configGet)
 	s.mux.HandleFunc("PUT /api/adapters/{id}/config", s.configPut)
@@ -355,10 +356,15 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) adapterList(w http.ResponseWriter, r *http.Request) {
 	if s.adapters == nil {
-		writeJSON(w, http.StatusOK, []adapterhost.Adapter{})
+		writeJSON(w, http.StatusOK, []adapterAPIView{})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.adapters.List())
+	adapters := s.adapters.List()
+	views := make([]adapterAPIView, 0, len(adapters))
+	for _, adapter := range adapters {
+		views = append(views, projectAdapter(adapter))
+	}
+	writeJSON(w, http.StatusOK, views)
 }
 func (s *Server) adapterGet(w http.ResponseWriter, r *http.Request) {
 	if s.adapters == nil {
@@ -370,7 +376,7 @@ func (s *Server) adapterGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "adapter not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, adapter)
+	writeJSON(w, http.StatusOK, projectAdapter(adapter))
 }
 func (s *Server) adapterSchema(w http.ResponseWriter, r *http.Request) {
 	if s.adapters == nil {

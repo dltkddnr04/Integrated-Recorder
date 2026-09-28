@@ -256,6 +256,10 @@ func describeProcess(ctx context.Context, p *process) (adapterproto.Descriptor, 
 }
 
 func descriptorFingerprint(d adapterproto.Descriptor) string {
+	// Branding is presentation metadata and may change independently from an
+	// adapter's protocol semantics. Keep the historical descriptor hash byte
+	// for byte identical when branding is absent.
+	d.Branding = nil
 	data, _ := json.Marshal(d)
 	var value any
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
@@ -287,7 +291,7 @@ func (h *Host) List() []Adapter {
 		e.stateMu.Lock()
 		item := Adapter{Status: e.status}
 		if e.descriptor != nil {
-			d := *e.descriptor
+			d := cloneDescriptor(*e.descriptor)
 			item.Descriptor = &d
 		}
 		e.stateMu.Unlock()
@@ -317,10 +321,23 @@ func (h *Host) Get(id string) (Adapter, error) {
 	defer e.stateMu.Unlock()
 	out := Adapter{Status: e.status}
 	if e.descriptor != nil {
-		d := *e.descriptor
+		d := cloneDescriptor(*e.descriptor)
 		out.Descriptor = &d
 	}
 	return out, nil
+}
+
+func cloneDescriptor(descriptor adapterproto.Descriptor) adapterproto.Descriptor {
+	if descriptor.Branding != nil {
+		branding := *descriptor.Branding
+		if branding.Icon != nil {
+			icon := *branding.Icon
+			icon.Data = append([]byte(nil), icon.Data...)
+			branding.Icon = &icon
+		}
+		descriptor.Branding = &branding
+	}
+	return descriptor
 }
 
 func (h *Host) Descriptor(id string) (adapterproto.Descriptor, error) {
@@ -640,10 +657,10 @@ func (h *Host) ensureProcess(ctx context.Context, e *entry) (*process, error) {
 	e.stateMu.Unlock()
 	p, err := startProcess(e.path)
 	descriptorMismatch := false
+	var restartedDescriptor adapterproto.Descriptor
 	if err == nil {
-		var d adapterproto.Descriptor
-		d, err = describeProcess(ctx, p)
-		if err == nil && (d.ID != e.descriptor.ID || d.Version != e.descriptor.Version || d.ProtocolVersion != e.descriptor.ProtocolVersion || descriptorFingerprint(d) != e.baseFingerprint) {
+		restartedDescriptor, err = describeProcess(ctx, p)
+		if err == nil && (restartedDescriptor.ID != e.descriptor.ID || restartedDescriptor.Version != e.descriptor.Version || restartedDescriptor.ProtocolVersion != e.descriptor.ProtocolVersion || descriptorFingerprint(restartedDescriptor) != e.baseFingerprint) {
 			descriptorMismatch = true
 			err = fmt.Errorf("adapter descriptor fingerprint changed")
 		} else if errors.Is(err, adapterproto.ErrUnsupportedProtocolVersion) || errors.Is(err, errAdapterDescriptorInvalid) {
@@ -677,6 +694,8 @@ func (h *Host) ensureProcess(ctx context.Context, e *entry) (*process, error) {
 	}
 	e.stateMu.Lock()
 	e.process = p
+	descriptorCopy := cloneDescriptor(restartedDescriptor)
+	e.descriptor = &descriptorCopy
 	e.nextRestart = time.Time{}
 	e.status.State = "ready"
 	e.status.Error = ""

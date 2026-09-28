@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"net/url"
 	"strings"
 	"testing"
@@ -239,6 +242,60 @@ func TestDescriptorSchemaValidation(t *testing.T) {
 	if err := d.Validate(); err == nil {
 		t.Fatal("duplicate schema key accepted")
 	}
+}
+
+func TestDescriptorBrandingPNGValidation(t *testing.T) {
+	base := Descriptor{ID: "adapter", Name: "Adapter", Version: "1", ProtocolVersion: Version, Capabilities: []string{CapabilityResolve}, InputSchema: Schema{Fields: []Field{}}, ConfigurationSchema: Schema{Fields: []Field{}}, MediaTypes: []string{"hls"}}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("descriptor without branding rejected: %v", err)
+	}
+	base.Branding = &Branding{Icon: &BrandIcon{MediaType: "image/png", Data: testPNG(t, 1, 1, false)}}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid PNG branding rejected: %v", err)
+	}
+
+	tests := map[string]BrandIcon{
+		"unsupported media type": {MediaType: "image/svg+xml", Data: testPNG(t, 1, 1, false)},
+		"empty data":             {MediaType: "image/png"},
+		"malformed png":          {MediaType: "image/png", Data: []byte("not a png")},
+		"oversized encoded data": {MediaType: "image/png", Data: testPNG(t, 512, 512, true)},
+		"dimensions too large":   {MediaType: "image/png", Data: testPNG(t, 513, 1, false)},
+	}
+	for name, icon := range tests {
+		t.Run(name, func(t *testing.T) {
+			descriptor := base
+			descriptor.Branding = &Branding{Icon: &icon}
+			if err := descriptor.Validate(); err == nil {
+				t.Fatal("invalid branding was accepted")
+			}
+		})
+	}
+}
+
+func testPNG(t *testing.T, width, height int, uncompressed bool) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			if uncompressed {
+				// Deterministic pseudo-random pixels make a valid PNG larger than
+				// the descriptor byte limit without relying on external fixtures.
+				v := uint32(x+1)*0x9e3779b9 ^ uint32(y+1)*0x85ebca6b
+				img.SetNRGBA(x, y, color.NRGBA{R: byte(v), G: byte(v >> 8), B: byte(v >> 16), A: 255})
+			} else {
+				img.SetNRGBA(x, y, color.NRGBA{R: 30, G: 80, B: 140, A: 255})
+			}
+		}
+	}
+	var buf bytes.Buffer
+	encoder := png.Encoder{}
+	if uncompressed {
+		encoder.CompressionLevel = png.NoCompression
+	}
+	if err := encoder.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func TestResourceReferencesAreOpaqueButBounded(t *testing.T) {

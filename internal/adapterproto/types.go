@@ -1,8 +1,10 @@
 package adapterproto
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"math"
 	"math/big"
 	"net/url"
@@ -23,7 +25,27 @@ type Descriptor struct {
 	ConfigurationSchema Schema         `json:"configuration_schema"`
 	ResourceTypes       []ResourceType `json:"resource_types,omitempty"`
 	MediaTypes          []string       `json:"media_types"`
+	Branding            *Branding      `json:"branding,omitempty"`
 }
+
+// Branding carries optional, adapter-owned presentation assets. Branding is
+// descriptive metadata only and does not change protocol-v1 semantics.
+type Branding struct {
+	Icon *BrandIcon `json:"icon,omitempty"`
+}
+
+// BrandIcon is a bounded raster image supplied inline by the adapter. The
+// current protocol permits PNG only so consumers never need to sanitize SVG
+// or follow adapter-provided URLs.
+type BrandIcon struct {
+	MediaType string `json:"media_type"`
+	Data      []byte `json:"data"`
+}
+
+const (
+	maxBrandIconBytes     = 64 << 10
+	maxBrandIconDimension = 512
+)
 
 type Schema struct {
 	Fields []Field `json:"fields"`
@@ -415,6 +437,9 @@ func (d Descriptor) Validate() error {
 	if d.ProtocolVersion != Version {
 		return fmt.Errorf("unsupported protocol version %d", d.ProtocolVersion)
 	}
+	if err := validateBranding(d.Branding); err != nil {
+		return err
+	}
 	if err := d.InputSchema.Validate(); err != nil {
 		return fmt.Errorf("input schema: %w", err)
 	}
@@ -499,6 +524,30 @@ func (d Descriptor) Validate() error {
 			return fmt.Errorf("media type is malformed or duplicated")
 		}
 		seenMedia[mt] = true
+	}
+	return nil
+}
+
+func validateBranding(branding *Branding) error {
+	if branding == nil || branding.Icon == nil {
+		return nil
+	}
+	icon := branding.Icon
+	if icon.MediaType != "image/png" {
+		return fmt.Errorf("adapter branding icon media type is unsupported")
+	}
+	if len(icon.Data) == 0 || len(icon.Data) > maxBrandIconBytes {
+		return fmt.Errorf("adapter branding icon size is invalid")
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(icon.Data))
+	if err != nil {
+		return fmt.Errorf("adapter branding icon is invalid PNG")
+	}
+	if config.Width < 1 || config.Height < 1 || config.Width > maxBrandIconDimension || config.Height > maxBrandIconDimension {
+		return fmt.Errorf("adapter branding icon dimensions are invalid")
+	}
+	if _, err = png.Decode(bytes.NewReader(icon.Data)); err != nil {
+		return fmt.Errorf("adapter branding icon is invalid PNG")
 	}
 	return nil
 }
