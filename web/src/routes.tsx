@@ -12,6 +12,9 @@ const AdapterDetailPage = lazy(() => import('@/routes/adapter-detail').then(modu
 const WorkflowsPage = lazy(() => import('@/routes/workflows').then(module => ({ default: module.WorkflowsPage })))
 const WorkflowDetailPage = lazy(() => import('@/routes/workflow-detail').then(module => ({ default: module.WorkflowDetailPage })))
 const SettingsPage = lazy(() => import('@/routes/settings').then(module => ({ default: module.SettingsPage })))
+const WatchesPage = lazy(() => import('@/routes/watches').then(module => ({ default: module.WatchesPage })))
+const WatchNewPage = lazy(() => import('@/routes/watch-new').then(module => ({ default: module.WatchNewPage })))
+const WatchDetailPage = lazy(() => import('@/routes/watch-detail').then(module => ({ default: module.WatchDetailPage })))
 const LoginPage = lazy(() => import('@/routes/login').then(module => ({ default: module.LoginPage })))
 import { NotFoundPage } from '@/routes/not-found'
 import { isRecordingState } from '@/types/api'
@@ -49,7 +52,10 @@ const adapterRoute = createRoute({ getParentRoute: () => rootRoute, path: '/adap
 const workflowsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/workflows', component: WorkflowsPage })
 const workflowRoute = createRoute({ getParentRoute: () => rootRoute, path: '/workflows/$workflowId', component: WorkflowDetailPage })
 const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/settings', component: SettingsPage })
+const watchesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches', component: WatchesPage })
+const watchNewRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches/new', component: WatchNewPage })
+const watchDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches/$watchId', component: WatchDetailPage })
 
-const routeTree = rootRoute.addChildren([loginRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([loginRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, settingsRoute])
 export const router = createRouter({ routeTree, context: { queryClient: undefined! }, defaultPreload: 'intent', defaultPreloadStaleTime: 0 })
 declare module '@tanstack/react-router' { interface Register { router: typeof router } }

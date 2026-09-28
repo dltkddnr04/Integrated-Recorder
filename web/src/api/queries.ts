@@ -1,5 +1,5 @@
 import { queryOptions } from '@tanstack/react-query'
-import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, workflowsAPI, type PreviewQuery, type RecordingQuery } from './index'
+import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery } from './index'
 
 export const qk = {
   session: ['auth', 'session'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
@@ -11,6 +11,8 @@ export const qk = {
   adapters: ['adapters'] as const, adapter: (id: string) => ['adapter', id] as const, schema: (id: string, resource?: unknown) => ['adapter', id, 'schema', resource] as const,
   config: (id: string, resource?: unknown) => ['adapter', id, 'config', resource] as const, resources: (id: string, query: unknown) => ['adapter', id, 'resources', query] as const,
   workflows: ['workflows'] as const, workflow: (id: string) => ['workflow', id] as const, workflowHistory: ['workflow-history'] as const,
+  watches: ['watches'] as const, watch: (id: string) => ['watch', id] as const,
+  watchRecordings: (id: string) => ['watch', id, 'recordings'] as const, watchEvents: (id: string) => ['watch', id, 'events'] as const,
   notifications: ['notifications'] as const, audit: ['audit'] as const, logs: (query: unknown) => ['logs', query] as const,
 }
 export const sessionQuery = queryOptions({ queryKey: qk.session, queryFn: authAPI.session, retry: false, staleTime: 10_000 })
@@ -18,6 +20,27 @@ export const adaptersQuery = queryOptions({ queryKey: qk.adapters, queryFn: adap
 export const dashboardQuery = queryOptions({ queryKey: qk.dashboard, queryFn: dashboardAPI.get, staleTime: 10_000, refetchInterval: 15_000, refetchIntervalInBackground: false })
 export const notificationsQuery = queryOptions({ queryKey: qk.notifications, queryFn: productAPI.notifications, staleTime: 15_000, refetchInterval: 30_000, refetchIntervalInBackground: false })
 export const workflowsQuery = queryOptions({ queryKey: qk.workflows, queryFn: workflowsAPI.list, staleTime: 5_000, refetchInterval: query => query.state.data?.some(workflow => workflow.in_progress) ? 8_000 : false, refetchIntervalInBackground: false })
+const watchIsActive = (state: string) => state === 'checking' || state === 'starting' || state === 'recording' || state === 'backoff'
+export function watchListPollInterval(items: readonly { state: string }[] | undefined): number {
+  return items?.some(watch => watchIsActive(watch.state)) ? 4_000 : 15_000
+}
+export function watchDetailPollInterval(watch: { state: string; enabled: boolean } | undefined): number | false {
+  if (!watch) return false
+  if (watchIsActive(watch.state)) return 4_000
+  return watch.enabled ? 10_000 : false
+}
+export const watchesQuery = queryOptions({
+  queryKey: qk.watches, queryFn: watchesAPI.list, staleTime: 2_000,
+  refetchInterval: query => watchListPollInterval(query.state.data?.items),
+  refetchIntervalInBackground: false,
+})
+export const watchQuery = (id: string) => queryOptions({
+  queryKey: qk.watch(id), queryFn: () => watchesAPI.get(id), staleTime: 2_000,
+  refetchInterval: query => watchDetailPollInterval(query.state.data),
+  refetchIntervalInBackground: false,
+})
+export const watchRecordingsQuery = (id: string) => queryOptions({ queryKey: qk.watchRecordings(id), queryFn: () => watchesAPI.recordings(id), staleTime: 10_000 })
+export const watchEventsQuery = (id: string) => queryOptions({ queryKey: qk.watchEvents(id), queryFn: () => watchesAPI.events(id), staleTime: 10_000 })
 export const recordingQuery = (id: string) => queryOptions({ queryKey: qk.recording(id), queryFn: () => recordingsAPI.get(id) })
 export const previewsQuery = (id: string, query: PreviewQuery, active = false) => queryOptions({
   queryKey: qk.previews(id, query), queryFn: () => recordingsAPI.previews(id, query), staleTime: 0,

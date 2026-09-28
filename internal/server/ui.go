@@ -6,10 +6,10 @@ import "strings"
 // Unknown paths must remain ordinary 404s instead of receiving index.html.
 func isSPARoute(path string) bool {
 	switch path {
-	case "/", "/login", "/recordings", "/new", "/adapters", "/workflows", "/settings":
+	case "/", "/login", "/recordings", "/new", "/adapters", "/workflows", "/settings", "/watches", "/watches/new":
 		return true
 	}
-	for _, prefix := range []string{"/recordings/", "/adapters/", "/workflows/"} {
+	for _, prefix := range []string{"/recordings/", "/adapters/", "/workflows/", "/watches/"} {
 		if !strings.HasPrefix(path, prefix) {
 			continue
 		}

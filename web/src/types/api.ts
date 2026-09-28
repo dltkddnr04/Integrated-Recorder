@@ -15,6 +15,16 @@ export type AdapterDescriptor = {
 }
 export type AdapterStatus = { id: string; name?: string; version?: string; protocol_version?: number; state: string; error?: string; generation?: number; restart_attempts?: number }
 export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }
+export type WatchState = 'disabled' | 'offline' | 'checking' | 'starting' | 'recording' | 'backoff' | 'attention_required' | 'suppressed'
+export type WatchView = {
+  id: string; adapter_id: string; adapter_name?: string; resource?: ResourceRef & { display_name?: string };
+  input?: Record<string, unknown> | null; title?: string; enabled: boolean; preview_mode: PreviewMode;
+  check_interval_seconds: number; state: WatchState; created_at: string; updated_at: string;
+  last_checked_at?: string; next_check_at?: string; current_recording_id?: string;
+  current_recording_state?: RecordingState; current_recording_preview?: PreviewSummary;
+  input_secret_configured: Record<string, boolean>; last_error_code?: string
+}
+export type WatchEvent = { id: string; type: string; at: string; state?: WatchState; recording_id?: string; error_code?: string }
 export const recordingStates = ['recording', 'stopped', 'completed', 'interrupted'] as const
 export type RecordingState = typeof recordingStates[number]
 export function isRecordingState(value: unknown): value is RecordingState { return typeof value === 'string' && (recordingStates as readonly string[]).includes(value) }
@@ -89,7 +99,8 @@ export type AdapterConfig = {
 export type Dashboard = {
   active_recordings_count: number; completed_last_24h: number; interrupted_last_24h: number; recordings_total: number;
   segments_total: number; gaps_total: number; archive_bytes: number; filesystem_total_bytes: number; filesystem_free_bytes: number; filesystem_used_bytes: number;
-  integrity: Record<string, number>; adapters: Record<string, number>; export_available: boolean; recent_recordings: RecordingSummary[]; active_recordings: RecordingSummary[]
+  integrity: Record<string, number>; adapters: Record<string, number>; export_available: boolean; recent_recordings: RecordingSummary[]; active_recordings: RecordingSummary[];
+  watches?: { total: number; enabled: number; recording: number; offline: number; backoff: number; attention_required: number }
 }
 export type StorageInfo = { archive_root: string; filesystem_total_bytes: number; filesystem_used_bytes: number; filesystem_available_bytes: number; recordings_bytes: number; recording_count: number; segment_count: number; init_segment_count: number; manifest_count: number }
 export type SystemInfo = { version: string; commit: string; go_version: string; goos: string; goarch: string; started_at: string; uptime_seconds: number; export_available: boolean }

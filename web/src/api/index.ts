@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingPage, Resource, ResourceRef, Schema, SearchResult, StorageInfo, SystemInfo, SystemSettings, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingPage, RecordingSummary, Resource, ResourceRef, Schema, SearchResult, StorageInfo, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -52,6 +52,23 @@ export const workflowsAPI = {
   continue: (id: string, body: { values?: Record<string, unknown>; secrets?: Record<string, string>; persist_fields?: string[] }) => api<WorkflowProgress | RecordingDetail>(`/api/resolve-workflows/${encodeURIComponent(id)}/continue`, { method: 'POST', body }),
   cancel: (id: string) => api<void>(`/api/resolve-workflows/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   history: () => api<{ items: WorkflowHistoryEvent[] }>('/api/workflow-history'),
+}
+export type WatchMutationBody = {
+  adapter_id: string; input: Record<string, unknown>; input_secrets: Record<string, string>;
+  resource?: ResourceRef; clear_resource?: boolean; title?: string; preview_mode?: 'disabled' | 'segment';
+  check_interval_seconds?: number; clear_input_secrets?: string[]
+}
+export const watchesAPI = {
+  list: () => api<{ items: WatchView[] }>('/api/watches'),
+  get: (id: string) => api<WatchView>(`/api/watches/${encodeURIComponent(id)}`),
+  create: (body: WatchMutationBody) => api<WatchView>('/api/watches', { method: 'POST', body }),
+  update: (id: string, body: WatchMutationBody) => api<WatchView>(`/api/watches/${encodeURIComponent(id)}`, { method: 'PUT', body }),
+  remove: (id: string) => api<void>(`/api/watches/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  enable: (id: string) => api<WatchView>(`/api/watches/${encodeURIComponent(id)}/enable`, { method: 'POST' }),
+  disable: (id: string) => api<WatchView>(`/api/watches/${encodeURIComponent(id)}/disable`, { method: 'POST' }),
+  check: (id: string) => api<WatchView>(`/api/watches/${encodeURIComponent(id)}/check`, { method: 'POST' }),
+  recordings: (id: string, limit = 20) => api<{ items: RecordingSummary[]; truncated?: boolean; retention_limit?: number }>(`/api/watches/${encodeURIComponent(id)}/recordings${queryString({ limit })}`),
+  events: (id: string, limit = 50) => api<{ items: WatchEvent[] }>(`/api/watches/${encodeURIComponent(id)}/events${queryString({ limit })}`),
 }
 export const productAPI = {
   search: (q: string) => api<{ results: SearchResult[] }>(`/api/search${queryString({ q, limit: 20 })}`),

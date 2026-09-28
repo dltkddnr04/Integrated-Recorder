@@ -15,7 +15,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,13 +32,17 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
+	"github.com/dltkddnr04/integrated-recorder/internal/watch"
 )
 
 const segmentPayload = "integrated-recorder-browser-e2e-source-segment"
 
 type sourceFixture struct {
+	mu       sync.RWMutex
 	playlist []byte
 	segments map[string][]byte
+	online   bool
+	endList  bool
 }
 
 func main() {
@@ -158,8 +164,18 @@ func run() error {
 		adapters.Close()
 		return err
 	}
+	watchService, err := watch.New(dataDir, adapters, manager, watch.Options{})
+	if err != nil {
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return err
+	}
 	auth, err := authn.Open(dataDir)
 	if err != nil {
+		_ = watchService.Close(context.Background())
 		_ = previewService.Close(context.Background())
 		_ = exportService.Close(context.Background())
 		_ = integrityService.Close(context.Background())
@@ -169,8 +185,8 @@ func run() error {
 	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Management: products, Integrity: integrityService, Derivatives: exportService,
-		Previews: previewService,
-		Auth:     auth, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(),
+		Previews: previewService, Watches: watchService,
+		Auth: auth, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(),
 		StartedAt: time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
 	})
 
@@ -185,6 +201,9 @@ func run() error {
 	previewCtx, cancelPreview := context.WithCancel(context.Background())
 	previewDone := make(chan error, 1)
 	go func() { previewDone <- previewService.Run(previewCtx) }()
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+	watchDone := make(chan error, 1)
+	go func() { watchDone <- watchService.Run(watchCtx) }()
 
 	shutdown, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -192,7 +211,10 @@ func run() error {
 	case err = <-serveErr:
 		if !errors.Is(err, http.ErrServerClosed) {
 			cancelPreview()
+			cancelWatch()
+			<-watchDone
 			<-previewDone
+			_ = watchService.Close(context.Background())
 			_ = closeServices(manager, integrityService, exportService, previewService, adapters)
 			return err
 		}
@@ -202,9 +224,14 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = web.Shutdown(ctx)
+	cancelWatch()
+	<-watchDone
 	cancelPreview()
 	<-previewDone
 	if err = previewService.Close(ctx); err != nil {
+		return err
+	}
+	if err = watchService.Close(ctx); err != nil {
 		return err
 	}
 	if err = manager.Close(ctx); err != nil {
@@ -328,9 +355,39 @@ func playlistSegmentNames(playlist []byte) []string {
 }
 
 func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/api/status" {
+		fixture.mu.RLock()
+		online := fixture.online
+		fixture.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"online":%t,"lastConnectTime":"2026-09-28T00:00:00Z"}`, online)
+		return
+	}
+	if r.URL.Path == "/e2e/set-online" {
+		value, parseErr := strconv.ParseBool(r.URL.Query().Get("value"))
+		if parseErr != nil {
+			http.Error(w, "value must be boolean", http.StatusBadRequest)
+			return
+		}
+		fixture.mu.Lock()
+		fixture.online = value
+		if endList := r.URL.Query().Get("endlist"); endList != "" {
+			fixture.endList = endList == "true"
+		}
+		fixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.URL.Path == "/hls/stream.m3u8" {
+		fixture.mu.RLock()
+		playlist := append([]byte(nil), fixture.playlist...)
+		endList := fixture.endList
+		fixture.mu.RUnlock()
+		if endList && !bytes.Contains(playlist, []byte("#EXT-X-ENDLIST")) {
+			playlist = append(playlist, []byte("#EXT-X-ENDLIST\n")...)
+		}
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		_, _ = w.Write(fixture.playlist)
+		_, _ = w.Write(playlist)
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/hls/") {
@@ -338,7 +395,10 @@ func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	name := filepath.Base(r.URL.Path)
+	fixture.mu.RLock()
 	payload, ok := fixture.segments[name]
+	payload = append([]byte(nil), payload...)
+	fixture.mu.RUnlock()
 	if !ok {
 		http.NotFound(w, r)
 		return

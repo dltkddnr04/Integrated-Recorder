@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Bell, ChevronDown, Command, HardDrive, LayoutDashboard, LogOut, Menu, Moon, Search, Settings2, Sun, Video, Workflow, X, Cable, Plus } from 'lucide-react'
+import { Bell, ChevronDown, Command, HardDrive, LayoutDashboard, LogOut, Menu, Moon, Search, Settings2, Sun, Video, Workflow, X, Cable, Plus, Radio } from 'lucide-react'
 import { authAPI, productAPI } from '@/api'
 import { invalidateCSRFToken } from '@/api/client'
 import { adaptersQuery, dashboardQuery, notificationsQuery, qk, workflowsQuery } from '@/api/queries'
@@ -20,7 +20,7 @@ import type { ApiSession, Notification } from '@/types/api'
 const navigation = [
   { to: '/', label: '대시보드', icon: LayoutDashboard }, { to: '/recordings', label: '녹화', icon: Video },
   { to: '/new', label: '새 녹화', icon: Plus }, { to: '/adapters', label: '어댑터', icon: Cable },
-  { to: '/workflows', label: '워크플로', icon: Workflow }, { to: '/settings', label: '설정', icon: Settings2 },
+  { to: '/watches', label: '자동 녹화', icon: Radio }, { to: '/workflows', label: '워크플로', icon: Workflow }, { to: '/settings', label: '설정', icon: Settings2 },
 ] as const
 
 export function AppShell() {

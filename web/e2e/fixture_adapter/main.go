@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 )
@@ -70,6 +73,54 @@ func serve(input io.Reader, output io.Writer) error {
 			delete(workflows, params.WorkflowID)
 			media := &adapterproto.MediaSource{Type: "hls", ManifestURL: manifestURL}
 			response, _ = adapterproto.Success(request.ID, adapterproto.ResolveWorkflowResult{State: "resolved", WorkflowID: params.WorkflowID, Media: media})
+		case adapterproto.MethodWatchCheck:
+			var params adapterproto.WatchCheckParams
+			if err = json.Unmarshal(request.Params, &params); err != nil {
+				response = adapterproto.Failure(request.ID, "invalid_params", "watch input is invalid", nil)
+				break
+			}
+			var input struct {
+				SourceURL string `json:"source_url"`
+			}
+			if err = json.Unmarshal(params.Input, &input); err != nil || strings.TrimSpace(input.SourceURL) == "" {
+				response = adapterproto.Failure(request.ID, "invalid_input", "watch input is invalid", nil)
+				break
+			}
+			base := strings.TrimRight(strings.TrimSpace(input.SourceURL), "/")
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			statusRequest, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/status", nil)
+			if requestErr != nil {
+				cancel()
+				response = adapterproto.Failure(request.ID, "check_failed", "fixture check failed", nil)
+				break
+			}
+			client := &http.Client{Timeout: 3 * time.Second}
+			statusResponse, requestErr := client.Do(statusRequest)
+			if requestErr != nil {
+				cancel()
+				response = adapterproto.Failure(request.ID, "check_failed", "fixture check failed", nil)
+				break
+			}
+			data, readErr := io.ReadAll(io.LimitReader(statusResponse.Body, 4097))
+			_ = statusResponse.Body.Close()
+			cancel()
+			if readErr != nil || statusResponse.StatusCode < 200 || statusResponse.StatusCode >= 300 || len(data) > 4096 {
+				response = adapterproto.Failure(request.ID, "check_failed", "fixture check failed", nil)
+				break
+			}
+			var status struct {
+				Online bool `json:"online"`
+			}
+			if json.Unmarshal(data, &status) != nil {
+				response = adapterproto.Failure(request.ID, "check_failed", "fixture check failed", nil)
+				break
+			}
+			if !status.Online {
+				response, _ = adapterproto.Success(request.ID, adapterproto.WatchCheckResult{State: "offline"})
+				break
+			}
+			media := &adapterproto.MediaSource{Type: "hls", ManifestURL: base + "/hls/stream.m3u8"}
+			response, _ = adapterproto.Success(request.ID, adapterproto.WatchCheckResult{State: "live", SessionRef: "browser-e2e-session", Media: media})
 		case adapterproto.MethodShutdown:
 			response, _ = adapterproto.Success(request.ID, map[string]bool{"stopped": true})
 			if err = adapterproto.WriteResponse(output, response); err != nil {
@@ -88,7 +139,7 @@ func serve(input io.Reader, output io.Writer) error {
 func describe() adapterproto.Descriptor {
 	return adapterproto.Descriptor{
 		ID: "workflow-fixture", Name: "Workflow Fixture", Version: "0.1.0", ProtocolVersion: adapterproto.Version,
-		Capabilities:        []string{adapterproto.CapabilityResolveWorkflow},
+		Capabilities:        []string{adapterproto.CapabilityResolveWorkflow, adapterproto.CapabilityWatch},
 		InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Fixture source URL", Required: true}}},
 		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}},
 		ResourceTypes:       []adapterproto.ResourceType{}, MediaTypes: []string{"hls"},

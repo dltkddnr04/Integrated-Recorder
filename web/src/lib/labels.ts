@@ -38,6 +38,10 @@ const workflowLabels: Record<string, string> = {
   resolved: '완료', completed: '완료', canceled: '취소됨', cancelled: '취소됨', expired: '만료됨', failed: '실패',
   queued: '대기 중', running: '진행 중', verifying: '검사 중',
 }
+const watchLabels: Record<string, string> = {
+  disabled: '사용 중지', offline: '오프라인', checking: '확인 중', starting: '녹화 시작 중',
+  recording: '녹화 중', backoff: '재시도 대기', attention_required: '주의 필요', suppressed: '현재 방송 제외',
+}
 const genericLabels: Record<string, string> = {
   queued: '대기 중', running: '진행 중', completed: '완료', failed: '실패', canceled: '취소됨', cancelled: '취소됨',
   recording: recordingLabels.recording, stopped: recordingLabels.stopped, interrupted: recordingLabels.interrupted,
@@ -48,6 +52,8 @@ const genericLabels: Record<string, string> = {
   configuration_required: workflowLabels.configuration_required, interaction_required: workflowLabels.interaction_required,
   challenge_required: workflowLabels.challenge_required, resolving: workflowLabels.resolving,
   resolved: workflowLabels.resolved, expired: workflowLabels.expired,
+  offline: watchLabels.offline, checking: watchLabels.checking, starting: watchLabels.starting,
+  backoff: watchLabels.backoff, attention_required: watchLabels.attention_required, suppressed: watchLabels.suppressed,
 }
 
 const recordingEventLabels: Record<string, string> = {
@@ -77,6 +83,7 @@ export const recordingStateLabel = (value?: string) => labelFrom(recordingLabels
 export const integrityStatusLabel = (value?: string) => labelFrom(integrityLabels, value)
 export const adapterStateLabel = (value?: string) => labelFrom(adapterLabels, value)
 export const workflowStateLabel = (value?: string) => labelFrom(workflowLabels, value)
+export const watchStateLabel = (value?: string) => labelFrom(watchLabels, value)
 export const statusLabel = (value?: string) => labelFrom(genericLabels, value)
 export const recordingEventLabel = (value?: string) => labelFrom(recordingEventLabels, value)
 export const auditEventLabel = (value?: string) => labelFrom(auditEventLabels, value)
