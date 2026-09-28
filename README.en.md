@@ -17,8 +17,8 @@ Integrated Recorder follows the source manifest, stores original media segments 
 - **Segment-native:** do not turn every recording into one monolithic file during acquisition.
 - **Headless first:** designed to run continuously in Docker.
 - **Browser controlled:** the API and web interface are the intended control surface.
-- **Rebuildable projections:** VOD playlists, indexes, exports, and future UI data should be reproducible from the archive.
-- **FFmpeg is optional:** it may be used later for explicit export/transcoding, not for recording.
+- **Rebuildable projections:** VOD playlists, preview indexes, exports, and future UI data should be reproducible from the archive.
+- **FFmpeg is for derivatives only:** it is not required for acquisition or canonical archival. It is used only for optional projections such as preview frames and remux exports.
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
@@ -28,7 +28,9 @@ Adapters declare input/settings schemas and may discover opaque resources or sus
 
 **Milestone 1 and the external adapter protocol milestone are complete.**
 
-Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, and thumbnail projections to backend APIs. First-run administrator setup uses `<DATA_DIR>/security/bootstrap-token`. If FFmpeg is available, separate remux exports and thumbnail generation are offered without changing the canonical recording.
+Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, and the Preview Frame Index to backend APIs. First-run administrator setup uses `<DATA_DIR>/security/bootstrap-token`. If FFmpeg is available, segment preview generation and separate remux exports are offered without changing the canonical recording.
+
+Scene previews are an opt-in derivative per recording and default to disabled. A background service produces at most one reusable frame for each committed primary-track segment. It first tries the target segment alone (including the required fMP4 init object); only after decode failure does it stage bounded prior-segment context. Posters, storyboards, and future navigation views reuse the stored frames, and slow or failed FFmpeg work never blocks acquisition.
 
 Currently supported:
 
@@ -72,7 +74,7 @@ DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 
 Then open `http://localhost:8080/`.
 
-Docker configuration is included:
+Docker configuration is included. The standard runtime image includes Alpine Linux's `ffmpeg` package for scene previews and MKV remux derivatives. Host installations do not require FFmpeg; canonical recording and VOD playback work without it. Alpine v3.21 package metadata identifies the `ffmpeg` license expression as `GPL-2.0-or-later AND LGPL-2.1-or-later`. FFmpeg upstream notes that optional GPL-covered components can affect distribution licensing. Before redistribution, check the exact image package metadata and the [Alpine package record](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg) and [FFmpeg legal considerations](https://ffmpeg.org/legal.html).
 
 ```sh
 docker compose up --build
@@ -101,11 +103,14 @@ The container uses a named `/data` volume and publishes the control API on host 
 | `POST` | `/api/integrity/jobs/{job_id}/cancel` | Cancel an active integrity verification |
 | `GET` | `/api/logs` | Query the bounded application request log |
 | `GET` | `/api/recordings/{id}/archive/index` | List canonical archive objects |
+| `GET` | `/api/recordings/{id}/previews` | Get a bounded sample from the Preview Frame Index |
+| `GET` | `/api/recordings/{id}/previews/{archive_ordinal}` | Get an individual scene preview frame |
+| `POST` | `/api/recordings/{id}/previews` | Enable or reconcile per-segment preview generation |
 | `GET` | `/api/adapters/{id}/resources` | List resources when the adapter advertises browse capability |
 | `POST` | `/api/adapters/{id}/restart`, `/enable`, `/disable` | Manage discovered adapter processes |
 | `POST` | `/api/recordings/{id}/exports` | Request MKV remux when FFmpeg is available |
-| `GET` | `/api/recordings/{id}/thumbnail` | Read a generated thumbnail projection |
-| `POST` | `/api/recordings/{id}/thumbnail/regenerate` | Regenerate a thumbnail when FFmpeg is available |
+| `GET` | `/api/recordings/{id}/thumbnail` | Read a compatibility poster projection from the Preview Frame Index |
+| `POST` | `/api/recordings/{id}/thumbnail/regenerate` | Compatibility endpoint to request preview generation/reconciliation |
 | `GET` / `PUT` | `/api/settings` | Supported UI theme and integrity concurrency settings |
 | `POST` | `/api/auth/login`, `/logout`, `/bootstrap` | Single-administrator session authentication |
 | `GET` | `/api/recordings/{id}` | Recording details |
@@ -119,8 +124,10 @@ Start a recording with the first adapter:
 ```sh
 curl -X POST http://localhost:8080/api/recordings \
   -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title"}'
+  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title","preview_mode":"segment"}'
 ```
+
+`preview_mode` is optional and defaults to `disabled`. Setting it to `segment` schedules scene previews asynchronously after canonical segments are committed.
 
 ## Development
 
@@ -160,7 +167,7 @@ go vet ./...
 - [x] React management SPA and connected product API foundation
 - [ ] Additional platform adapters such as CHZZK, SOOP, and Twitch
 - [ ] Hot/cold storage lifecycle, including HDD/NAS/LTO
-- [x] Optional remux-only export pipeline (when FFmpeg is available)
+- [x] Optional segment-based Preview Frame Index and remux-only export (when FFmpeg is available)
 
 ## Documentation
 

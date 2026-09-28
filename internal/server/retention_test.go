@@ -17,6 +17,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
+	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 )
@@ -144,6 +145,59 @@ func TestRetentionDisabledRunDoesNotDeleteAndEnabledRunClearsProjections(t *test
 		if response.Code != http.StatusBadRequest {
 			t.Fatalf("invalid run body %q: status=%d body=%s", body, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestRetentionDeletionCleansPreviewPolicyAndProjection(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	products, err := management.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := systemsettings.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.Update(systemsettings.Patch{RetentionEnabled: retentionPtr(true)}); err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("9", 32)
+	createRetentionRecording(t, store, id, domain.StateCompleted, time.Now().UTC().Add(-60*24*time.Hour))
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	previews, err := preview.OpenWithGet(root, store, manager.List, manager.Get, filepath.Join(root, "missing-ffmpeg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previews.Close(context.Background())
+	if _, err := previews.SetMode(id, preview.ModeSegment); err != nil {
+		t.Fatal(err)
+	}
+	projection := filepath.Join(root, "previews", id, "frames")
+	if err := os.MkdirAll(projection, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projection, "000000000001.jpg"), []byte("disposable"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	api := NewWithOptions(manager, nil, nil, Options{Management: products, Settings: settings, Previews: previews})
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/retention/run", strings.NewReader(`{}`)))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"deleted_count":1`) {
+		t.Fatalf("retention run status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(root, "previews", id)); !os.IsNotExist(err) {
+		t.Fatalf("retention deletion left preview projection: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "management", "previews", id+".json")); !os.IsNotExist(err) {
+		t.Fatalf("retention deletion left preview policy: %v", err)
 	}
 }
 

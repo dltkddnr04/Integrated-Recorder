@@ -32,7 +32,6 @@ const (
 	maxHistory       = 5000
 	maxInputBytes    = int64(512 << 30)
 	defaultTimeout   = 30 * time.Minute
-	thumbnailTimeout = 2 * time.Minute
 	jobKindExport    = "export"
 	defaultFFmpegBin = "ffmpeg"
 )
@@ -87,26 +86,22 @@ type queuedJob struct {
 }
 
 type Service struct {
-	mu               sync.Mutex
-	root             string
-	jobsDir          string
-	thumbnailDir     string
-	statePath        string
-	store            *storage.Store
-	ffmpegPath       string
-	timeout          time.Duration
-	queue            chan queuedJob
-	ctx              context.Context
-	cancel           context.CancelFunc
-	workers          sync.WaitGroup
-	closed           bool
-	jobs             map[string]Job
-	activeByRec      map[string]string
-	cancelByID       map[string]context.CancelFunc
-	thumbnailSlots   chan struct{}
-	thumbnailMu      sync.Mutex
-	thumbnailFlights map[string]*thumbnailFlight
-	thumbnailWG      sync.WaitGroup
+	mu           sync.Mutex
+	root         string
+	jobsDir      string
+	thumbnailDir string
+	statePath    string
+	store        *storage.Store
+	ffmpegPath   string
+	timeout      time.Duration
+	queue        chan queuedJob
+	ctx          context.Context
+	cancel       context.CancelFunc
+	workers      sync.WaitGroup
+	closed       bool
+	jobs         map[string]Job
+	activeByRec  map[string]string
+	cancelByID   map[string]context.CancelFunc
 }
 
 // Open initializes an optional remux-only service. Missing FFmpeg is not a
@@ -173,7 +168,6 @@ func Open(root string, store *storage.Store, ffmpegPath string, concurrency int)
 		store: store, ffmpegPath: resolved, timeout: defaultTimeout,
 		queue: make(chan queuedJob, maxActiveJobs), ctx: ctx, cancel: cancel,
 		jobs: make(map[string]Job), activeByRec: make(map[string]string), cancelByID: make(map[string]context.CancelFunc),
-		thumbnailSlots: make(chan struct{}, 2), thumbnailFlights: make(map[string]*thumbnailFlight),
 	}
 	if err := s.load(); err != nil {
 		cancel()
@@ -407,7 +401,7 @@ func (s *Service) Close(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 	done := make(chan struct{})
-	go func() { s.workers.Wait(); s.thumbnailWG.Wait(); close(done) }()
+	go func() { s.workers.Wait(); close(done) }()
 	if ctx == nil {
 		ctx = context.Background()
 	}

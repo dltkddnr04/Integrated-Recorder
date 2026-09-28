@@ -10,4 +10,5 @@
 /web/playwright-report/
 /web/test-results/
 /artifacts/ui-screenshots*/
+/artifacts/preview-frame-index/
 /artifacts/integrated-recorder-ui-screenshots.zip

@@ -1,10 +1,14 @@
 package derivative
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"os"
 	"os/exec"
@@ -37,13 +41,10 @@ func TestFakeFFmpegHelper(t *testing.T) {
 		os.Exit(41)
 	}
 	ffmpegArgs := args[separator+1:]
-	thumbnail := containsPair(ffmpegArgs, "-f", "image2")
-	validArgs := contains(ffmpegArgs, "-protocol_whitelist")
-	if thumbnail {
-		validArgs = validArgs && containsPair(ffmpegArgs, "-map", "0:v:0") && containsPair(ffmpegArgs, "-frames:v", "1")
-	} else {
-		validArgs = validArgs && containsPair(ffmpegArgs, "-c", "copy") && containsPair(ffmpegArgs, "-f", "matroska")
+	if marker := os.Getenv("DERIVATIVE_FAKE_INVOKED"); marker != "" {
+		_ = os.WriteFile(marker, []byte("invoked"), 0600)
 	}
+	validArgs := contains(ffmpegArgs, "-protocol_whitelist") && containsPair(ffmpegArgs, "-c", "copy") && containsPair(ffmpegArgs, "-f", "matroska")
 	if !validArgs {
 		os.Exit(42)
 	}
@@ -64,9 +65,6 @@ func TestFakeFFmpegHelper(t *testing.T) {
 	}
 	output := ffmpegArgs[len(ffmpegArgs)-1]
 	contents := []byte("matroska-fixture")
-	if thumbnail {
-		contents = []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xd9}
-	}
 	if err := os.WriteFile(output, contents, 0600); err != nil {
 		os.Exit(45)
 	}
@@ -142,36 +140,6 @@ func TestRealFFmpegRemuxWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestRealFFmpegThumbnailWhenAvailable(t *testing.T) {
-	ffmpeg, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		t.Skip("ffmpeg is not installed")
-	}
-	fixture := exec.Command(ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=1", "-an", "-threads", "1", "-c:v", "mpeg2video", "-f", "mpegts", "pipe:1")
-	input, err := fixture.Output()
-	if err != nil || len(input) == 0 {
-		t.Skip("ffmpeg lacks a minimal MPEG-TS fixture encoder")
-	}
-	root, store, recording := fixtureRecordingWithData(t, input)
-	service := openService(t, root, store, ffmpeg, 1)
-	thumbnail, err := service.GenerateThumbnail(context.Background(), recording)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if thumbnail.ContentType != "image/jpeg" || thumbnail.Size > maxThumbnailBytes {
-		t.Fatalf("thumbnail=%+v", thumbnail)
-	}
-	file, _, err := service.OpenThumbnail(recording.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	data, err := io.ReadAll(file)
-	if err != nil || !validJPEGBytes(data) {
-		t.Fatalf("invalid real thumbnail: size=%d err=%v", len(data), err)
-	}
-}
-
 func TestMissingFFmpegIsExplicitlyUnavailable(t *testing.T) {
 	root, store, recording := fixtureRecording(t)
 	emptyPath := t.TempDir()
@@ -183,146 +151,97 @@ func TestMissingFFmpegIsExplicitlyUnavailable(t *testing.T) {
 	if _, err := service.Start(context.Background(), recording); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Start err=%v", err)
 	}
-	if _, err := service.GenerateThumbnail(context.Background(), recording); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("GenerateThumbnail err=%v", err)
-	}
 }
 
-func TestThumbnailGenerationUsesProjectionAndLeavesArchiveUnchanged(t *testing.T) {
-	root, store, recording := fixtureRecording(t)
-	ffmpeg := fakeFFmpeg(t)
-	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "thumbnail-success")
-	service := openService(t, root, store, ffmpeg, 1)
-	thumbnail, err := service.GenerateThumbnail(context.Background(), recording)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if thumbnail.RecordingID != recording.ID || thumbnail.ContentType != "image/jpeg" || thumbnail.Size <= 0 || thumbnail.Size > maxThumbnailBytes {
-		t.Fatalf("unexpected thumbnail summary: %+v", thumbnail)
-	}
-	file, opened, err := service.OpenThumbnail(recording.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, readErr := io.ReadAll(file)
-	fileInfo, statErr := file.Stat()
-	closeErr := file.Close()
-	if readErr != nil || statErr != nil || closeErr != nil {
-		t.Fatalf("thumbnail read errors: %v %v %v", readErr, statErr, closeErr)
-	}
-	if !validJPEGBytes(data) || opened.Size != int64(len(data)) || fileInfo.Mode().Perm() != 0600 {
-		t.Fatalf("invalid thumbnail bytes or permissions: mode=%o size=%d", fileInfo.Mode().Perm(), len(data))
-	}
-	if _, err := os.Stat(filepath.Join(root, "recordings", recording.ID, "thumbnail.jpg")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("thumbnail entered canonical archive: %v", err)
-	}
-	payload, err := store.OpenPayload(recording.ID, recording.Tracks["main"].Segments[0].StoragePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	canonical, err := io.ReadAll(payload)
-	_ = payload.Close()
-	if err != nil || string(canonical) != "original-segment-bytes" {
-		t.Fatalf("canonical payload changed: %q err=%v", canonical, err)
-	}
-}
-
-func TestThumbnailGenerationSupportsInterruptedRecordings(t *testing.T) {
-	root, store, recording := fixtureRecording(t)
-	recording.State = domain.StateInterrupted
-	ffmpeg := fakeFFmpeg(t)
-	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "thumbnail-success")
-	service := openService(t, root, store, ffmpeg, 1)
-	thumbnail, err := service.GenerateThumbnail(context.Background(), recording)
-	if err != nil {
-		t.Fatalf("interrupted recording thumbnail: %v", err)
-	}
-	if thumbnail.RecordingID != recording.ID || thumbnail.ContentType != "image/jpeg" {
-		t.Fatalf("unexpected interrupted recording thumbnail: %+v", thumbnail)
-	}
-}
-
-func TestThumbnailCancellationAndFailureCleanTemporaryFiles(t *testing.T) {
-	for _, mode := range []string{"wait", "fail"} {
-		t.Run(mode, func(t *testing.T) {
-			root, store, recording := fixtureRecording(t)
-			ffmpeg := fakeFFmpeg(t)
-			marker := filepath.Join(t.TempDir(), "started")
-			t.Setenv("DERIVATIVE_FAKE_FFMPEG", mode)
-			t.Setenv("DERIVATIVE_FAKE_STARTED", marker)
-			service := openService(t, root, store, ffmpeg, 1)
-			ctx, cancel := context.WithCancel(context.Background())
-			result := make(chan error, 1)
-			go func() { _, err := service.GenerateThumbnail(ctx, recording); result <- err }()
-			if mode == "wait" {
-				waitFile(t, marker)
-				cancel()
-				if err := <-result; !errors.Is(err, context.Canceled) {
-					t.Fatalf("cancellation err=%v", err)
-				}
-			} else if err := <-result; !errors.Is(err, ErrThumbnailFailed) {
-				t.Fatalf("failure err=%v", err)
-			}
-			cancel()
-			entries, err := os.ReadDir(filepath.Join(root, "thumbnails"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, entry := range entries {
-				if strings.HasPrefix(entry.Name(), ".thumbnail-") {
-					t.Fatalf("temporary thumbnail remains: %s", entry.Name())
-				}
-			}
-			if _, _, err := service.OpenThumbnail(recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
-				t.Fatalf("unexpected published thumbnail: %v", err)
-			}
-		})
-	}
-}
-
-func TestOpenThumbnailRejectsMalformedIDAndSymlink(t *testing.T) {
+func TestOpenThumbnailReadsLegacyJPEGWithoutRunningFFmpeg(t *testing.T) {
 	root, store, recording := fixtureRecording(t)
 	service := openService(t, root, store, fakeFFmpeg(t), 1)
+	legacyPath := filepath.Join(root, "thumbnails", recording.ID+".jpg")
+	want := jpegFixture(t)
+	if err := os.WriteFile(legacyPath, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "ffmpeg-invoked")
+	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "success")
+	t.Setenv("DERIVATIVE_FAKE_INVOKED", marker)
+	file, summary, err := service.OpenThumbnail(recording.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got, err := io.ReadAll(file)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("legacy JPEG read mismatch: bytes=%d err=%v", len(got), err)
+	}
+	info, err := file.Stat()
+	if err != nil || summary.RecordingID != recording.ID || summary.ContentType != "image/jpeg" || summary.Size != int64(len(want)) || summary.UpdatedAt.IsZero() || info.Mode().Perm() != 0600 {
+		t.Fatalf("unexpected legacy thumbnail summary/stat: summary=%+v info=%v err=%v", summary, info, err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy read unexpectedly invoked FFmpeg: %v", err)
+	}
+}
+
+func TestOpenThumbnailRejectsMissingInvalidOversizedAndUnsafeFiles(t *testing.T) {
+	root, store, recording := fixtureRecording(t)
+	service := openService(t, root, store, fakeFFmpeg(t), 1)
+	if _, _, err := service.OpenThumbnail(recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
+		t.Fatalf("missing file err=%v", err)
+	}
 	if _, _, err := service.OpenThumbnail("../" + recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
 		t.Fatalf("malformed ID err=%v", err)
 	}
-	outside := filepath.Join(t.TempDir(), "outside.jpg")
-	if err := os.WriteFile(outside, []byte{0xff, 0xd8, 0xff, 0, 0xff, 0xd9}, 0600); err != nil {
+	thumbnailPath := filepath.Join(root, "thumbnails", recording.ID+".jpg")
+	if err := os.WriteFile(thumbnailPath, []byte{0xff, 0xd8, 0xff, 0xd9}, 0600); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(root, "thumbnails", recording.ID+".jpg")
-	if err := os.Symlink(outside, link); err != nil {
-		t.Skipf("symlink unavailable: %v", err)
+	if _, _, err := service.OpenThumbnail(recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
+		t.Fatalf("invalid JPEG err=%v", err)
+	}
+	if err := os.Truncate(thumbnailPath, maxThumbnailBytes+1); err != nil {
+		t.Fatal(err)
 	}
 	if _, _, err := service.OpenThumbnail(recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
-		t.Fatalf("symlink err=%v", err)
+		t.Fatalf("oversized file err=%v", err)
+	}
+	if err := os.Remove(thumbnailPath); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.jpg")
+	if err := os.WriteFile(outside, jpegFixture(t), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, thumbnailPath); err != nil {
+		t.Logf("symlink unavailable: %v", err)
+	} else {
+		if _, _, err := service.OpenThumbnail(recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
+			t.Fatalf("symlink err=%v", err)
+		}
+		if err := os.Remove(thumbnailPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(thumbnailPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.OpenThumbnail(recording.ID); !errors.Is(err, ErrThumbnailNotFound) {
+		t.Fatalf("non-regular file err=%v", err)
 	}
 }
 
-func TestThumbnailRejectsActiveRecordingAndPropagatesCancellation(t *testing.T) {
-	root, store, recording := fixtureRecording(t)
-	service := openService(t, root, store, fakeFFmpeg(t), 1)
-	recording.State = domain.StateRecording
-	if _, err := service.GenerateThumbnail(context.Background(), recording); !errors.Is(err, ErrActive) {
-		t.Fatalf("active err=%v", err)
+func jpegFixture(t *testing.T) []byte {
+	t.Helper()
+	imageData := image.NewRGBA(image.Rect(0, 0, 16, 9))
+	for y := 0; y < 9; y++ {
+		for x := 0; x < 16; x++ {
+			imageData.Set(x, y, color.RGBA{R: uint8(x * 10), G: uint8(y * 20), B: 80, A: 255})
+		}
 	}
-	recording.State = domain.StateStopped
-	marker := filepath.Join(t.TempDir(), "started")
-	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "wait")
-	t.Setenv("DERIVATIVE_FAKE_STARTED", marker)
-	ctx, cancel := context.WithCancel(context.Background())
-	first := make(chan error, 1)
-	go func() { _, err := service.GenerateThumbnail(ctx, recording); first <- err }()
-	waitFile(t, marker)
-	second := make(chan error, 1)
-	go func() { _, err := service.GenerateThumbnail(ctx, recording); second <- err }()
-	cancel()
-	if err := <-first; !errors.Is(err, context.Canceled) {
-		t.Fatalf("first err=%v", err)
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, imageData, &jpeg.Options{Quality: 75}); err != nil {
+		t.Fatal(err)
 	}
-	if err := <-second; !errors.Is(err, context.Canceled) {
-		t.Fatalf("coalesced err=%v", err)
-	}
+	return encoded.Bytes()
 }
 
 func TestDuplicateExportCoalescesAndCancelCleansPartial(t *testing.T) {
@@ -545,10 +464,6 @@ func containsPair(args []string, first, second string) bool {
 		}
 	}
 	return false
-}
-
-func validJPEGBytes(data []byte) bool {
-	return len(data) >= 5 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff && data[len(data)-2] == 0xff && data[len(data)-1] == 0xd9
 }
 
 func TestErrorCodesDoNotExposeCommandOrSourceURI(t *testing.T) {

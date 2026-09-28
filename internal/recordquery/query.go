@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"unicode"
 	"unicode/utf8"
 )
@@ -34,28 +36,29 @@ var errInvalidQuery = errors.New("invalid recording query")
 // Item is a prepared recording read-model item. Fields are populated by the
 // caller from canonical recording data and management projections.
 type Item struct {
-	ID                    string    `json:"id"`
-	Title                 string    `json:"title"`
-	AdapterID             string    `json:"adapter_id"`
-	AdapterName           string    `json:"adapter_name"`
-	State                 string    `json:"state"`
-	ResourceType          string    `json:"resource_type,omitempty"`
-	ResourceID            string    `json:"resource_id,omitempty"`
-	Tags                  []string  `json:"tags"`
-	StartedAt             time.Time `json:"started_at"`
-	CreatedAt             time.Time `json:"created_at"`
-	DurationSeconds       float64   `json:"duration_seconds"`
-	ArchiveSizeBytes      int64     `json:"archive_size_bytes"`
-	MediaPayloadSizeBytes int64     `json:"media_payload_size_bytes"`
-	ManifestSizeBytes     int64     `json:"manifest_size_bytes"`
-	InitPayloadSizeBytes  int64     `json:"init_payload_size_bytes"`
-	SegmentCount          int       `json:"segment_count"`
-	InitSegmentCount      int       `json:"init_segment_count"`
-	ManifestSnapshotCount int       `json:"manifest_snapshot_count"`
-	GapCount              int       `json:"gap_count"`
-	GapSegmentCount       int       `json:"gap_segment_count"`
-	GapDurationSeconds    *float64  `json:"gap_duration_seconds"`
-	Integrity             string    `json:"integrity"`
+	ID                    string           `json:"id"`
+	Title                 string           `json:"title"`
+	AdapterID             string           `json:"adapter_id"`
+	AdapterName           string           `json:"adapter_name"`
+	State                 string           `json:"state"`
+	ResourceType          string           `json:"resource_type,omitempty"`
+	ResourceID            string           `json:"resource_id,omitempty"`
+	Tags                  []string         `json:"tags"`
+	StartedAt             time.Time        `json:"started_at"`
+	CreatedAt             time.Time        `json:"created_at"`
+	DurationSeconds       float64          `json:"duration_seconds"`
+	ArchiveSizeBytes      int64            `json:"archive_size_bytes"`
+	MediaPayloadSizeBytes int64            `json:"media_payload_size_bytes"`
+	ManifestSizeBytes     int64            `json:"manifest_size_bytes"`
+	InitPayloadSizeBytes  int64            `json:"init_payload_size_bytes"`
+	SegmentCount          int              `json:"segment_count"`
+	InitSegmentCount      int              `json:"init_segment_count"`
+	ManifestSnapshotCount int              `json:"manifest_snapshot_count"`
+	GapCount              int              `json:"gap_count"`
+	GapSegmentCount       int              `json:"gap_segment_count"`
+	GapDurationSeconds    *float64         `json:"gap_duration_seconds"`
+	Integrity             string           `json:"integrity"`
+	Preview               *preview.Summary `json:"preview,omitempty"`
 }
 
 // Query contains the normalized recording-list filters. StartedAfter and

@@ -18,6 +18,22 @@ export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }
 export const recordingStates = ['recording', 'stopped', 'completed', 'interrupted'] as const
 export type RecordingState = typeof recordingStates[number]
 export function isRecordingState(value: unknown): value is RecordingState { return typeof value === 'string' && (recordingStates as readonly string[]).includes(value) }
+export type PreviewMode = 'disabled' | 'segment'
+export type PreviewState = 'disabled' | 'unavailable' | 'queued' | 'processing' | 'partial' | 'ready' | 'failed'
+export type PreviewSummary = {
+  mode: PreviewMode; state: PreviewState; available: boolean; frame_count: number;
+  image_archive_ordinal?: number; latest_archive_ordinal?: number; updated_at?: string
+}
+export type PreviewFrame = {
+  archive_ordinal: number; track_id: string; source_epoch: number; sequence: number;
+  segment_start_seconds: number; segment_duration_seconds: number; frame_time_seconds: number;
+  segment_sha256: string; width: number; height: number; size: number; generated_at: string;
+  state?: 'ready' | 'failed' | 'unsupported'; error_code?: string
+}
+export type PreviewFramesResponse = {
+  recording_id: string; mode: PreviewMode; state: PreviewState; available: boolean;
+  frame_count: number; items: PreviewFrame[]
+}
 export type Segment = { sequence?: number; source_sequence?: number; source_epoch?: number; archive_ordinal?: number; duration?: number; storage_path?: string; payload_size?: number; sha256?: string; discontinuity?: boolean; init_segment_id?: string; program_date_time?: string }
 export type Gap = { track_id?: string; source_epoch?: number; from_sequence?: number; to_sequence?: number; duration_seconds?: number; reason?: string }
 export type Track = { id?: string; name?: string; type?: string; segments?: Segment[]; init_segments?: Segment[]; [key: string]: unknown }
@@ -26,7 +42,7 @@ export type RecordingSummary = {
   resource?: ResourceRef & { display_name?: string }; state: RecordingState; created_at: string; started_at: string; stopped_at?: string | null;
   track_count?: number; segment_count?: number; duration_seconds?: number; gap_count?: number; archive_size_bytes?: number;
   media_payload_size_bytes?: number; manifest_size_bytes?: number; init_payload_size_bytes?: number; init_segment_count?: number;
-  manifest_snapshot_count?: number; gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus; tags?: string[]
+  manifest_snapshot_count?: number; gap_segment_count?: number; gap_duration_seconds?: number | null; integrity?: IntegrityStatus; tags?: string[]; preview?: PreviewSummary
 }
 export type RecordingListItem = {
   id: string; title?: string; adapter_id: string; adapter_name?: string; state: RecordingState;
@@ -34,7 +50,7 @@ export type RecordingListItem = {
   duration_seconds: number; archive_size_bytes: number; media_payload_size_bytes: number;
   manifest_size_bytes: number; init_payload_size_bytes: number; segment_count: number;
   init_segment_count: number; manifest_snapshot_count: number; gap_count: number;
-  gap_segment_count: number; gap_duration_seconds: number | null; integrity: IntegrityStatus
+  gap_segment_count: number; gap_duration_seconds: number | null; integrity: IntegrityStatus; preview?: PreviewSummary
 }
 export type RecordingDetail = {
   format_version?: number; id: string; title?: string; adapter_id?: string;
@@ -43,7 +59,7 @@ export type RecordingDetail = {
   source_url?: string; state: RecordingState; created_at: string; started_at: string; stopped_at?: string | null;
   tracks?: Record<string, Track>; gaps?: Gap[];
   manifest_snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
-  last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus
+  last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary
 }
 export type IntegrityStatus = 'unknown' | 'verifying' | 'verified' | 'degraded' | 'failed'
 export type RecordingStatistics = {

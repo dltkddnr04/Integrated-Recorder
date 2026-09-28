@@ -1,0 +1,2 @@
+# Vite minified bundles may contain trailing spaces inside embedded runtime CSS strings.
+internal/server/static/ui/assets/*.js whitespace=-blank-at-eol

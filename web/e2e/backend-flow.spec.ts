@@ -1,10 +1,11 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
-import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const dataDir = process.env.IR_E2E_DATA_DIR
 if (!dataDir) throw new Error('IR_E2E_DATA_DIR was not provided by Playwright config')
-const expectedSegment = 'integrated-recorder-browser-e2e-source-segment'
 
 type RecordingWire = {
   state: string
@@ -16,6 +17,8 @@ type TagsWire = { tags: string[] }
 type ArchiveIndexWire = { entries: { path: string }[] }
 type RecordingPageWire = { items: RecordingListWire[] }
 type RecordingListWire = { id: string; adapter_id: string; adapter_name: string; state: string; tags: string[] }
+type PreviewWire = { mode: string; state: string; available: boolean; frame_count: number; image_archive_ordinal?: number }
+type PreviewFramesWire = { state: string; available: boolean; frame_count: number; items: { archive_ordinal: number; frame_time_seconds: number; generated_at: string }[] }
 type CSPViolation = { effectiveDirective: string; violatedDirective: string; blockedURI: string; sourceFile: string }
 
 test.describe.configure({ mode: 'serial' })
@@ -23,6 +26,7 @@ test.describe.configure({ mode: 'serial' })
 test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete', async ({ page }) => {
   const bootstrapToken = readFileSync(join(dataDir, 'security', 'bootstrap-token'), 'utf8').trim()
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  const expectedSegmentSHA256 = createHash('sha256').update(readFileSync(join(dataDir, 'e2e-source-segment'))).digest('hex')
   const requests: string[] = []
   const cspViolations: CSPViolation[] = []
   const expectedAPIResponseFailures: { path: string; status: number }[] = []
@@ -109,8 +113,15 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   await page.getByRole('button', { name: /입력 설정/ }).click()
   await page.getByLabel('Owncast 인스턴스 URL').fill(sourceURL)
   await page.getByLabel('녹화 제목').fill('Browser E2E Owncast capture')
+  const previewToggle = page.getByRole('checkbox', { name: '장면 미리보기 생성' })
+  await expect(previewToggle).not.toBeChecked()
   await page.getByRole('button', { name: '입력 확인' }).click()
+  let recordingStartBody = ''
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/recordings' && request.method() === 'POST') recordingStartBody = request.postData() ?? ''
+  })
   await page.getByRole('button', { name: '녹화 시작' }).click()
+  expect(JSON.parse(recordingStartBody)).toMatchObject({ preview_mode: 'disabled' })
   await expect(page).toHaveURL(/\/recordings\/[^/]+$/)
   const recordingID = page.url().split('/').at(-1)!
 
@@ -125,7 +136,7 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   expect(vod.masterStatus).toBe(200)
   expect(vod.playlistStatus).toBe(200)
   expect(vod.segmentStatus).toBe(200)
-  expect(vod.segmentText).toBe(expectedSegment)
+  expect(vod.segmentSHA256).toBe(expectedSegmentSHA256)
 
   await page.getByRole('button', { name: '편집' }).click()
   await page.getByLabel('태그 목록').fill('browser-e2e, source-preserved')
@@ -234,6 +245,145 @@ async function exerciseTopbarPopovers(page: Page) {
     }
   }
   await page.setViewportSize({ width: 1440, height: 900 })
+}
+
+test('actual Go backend: opt-in segment previews, live/recent frames, storyboard seek, and screenshots', async ({ page }) => {
+  const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  const screenshots = fileURLToPath(new URL('../../artifacts/preview-frame-index/', import.meta.url))
+  const consoleErrors: string[] = []
+  const pageErrors: string[] = []
+  const requestFailures: string[] = []
+  const expectedUnavailableResponses: { path: string; status: number }[] = []
+  const unexpectedHTTPResponses: { path: string; status: number }[] = []
+  page.on('console', message => { if (message.type() === 'error') consoleErrors.push(message.text()) })
+  page.on('pageerror', error => pageErrors.push(error.message))
+  page.on('requestfailed', request => {
+    const reason = request.failure()?.errorText ?? 'unknown failure'
+    if (reason !== 'net::ERR_ABORTED') requestFailures.push(`${request.url()}: ${reason}`)
+  })
+  page.on('response', response => {
+    if (response.status() < 400) return
+    const path = new URL(response.url()).pathname
+    if (response.status() === 501 && /^\/api\/recordings\/[^/]+\/exports$/.test(path)) {
+      expectedUnavailableResponses.push({ path, status: response.status() })
+      return
+    }
+    unexpectedHTTPResponses.push({ path, status: response.status() })
+  })
+  mkdirSync(screenshots, { recursive: true })
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await login(page)
+  await page.goto('/new')
+  await page.getByRole('button', { name: /Owncast/ }).click()
+  await page.getByRole('button', { name: /입력 설정/ }).click()
+  await page.getByLabel('Owncast 인스턴스 URL').fill(sourceURL)
+  await page.getByLabel('녹화 제목').fill('Preview Frame Index E2E')
+  const previewToggle = page.getByRole('checkbox', { name: '장면 미리보기 생성' })
+  await expect(previewToggle).toBeVisible()
+  await expect(previewToggle).not.toBeChecked()
+  await previewToggle.check()
+  await page.getByRole('button', { name: '입력 확인' }).click()
+  let startBody = ''
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/recordings' && request.method() === 'POST') startBody = request.postData() ?? ''
+  })
+  await page.getByRole('button', { name: '녹화 시작' }).click()
+  await expect(page).toHaveURL(/\/recordings\/[^/]+$/)
+  const recordingID = page.url().split('/').at(-1)!
+  expect(JSON.parse(startBody)).toMatchObject({ preview_mode: 'segment' })
+  await expect(page.getByRole('heading', { name: '장면 미리보기' })).toBeVisible()
+
+  let summary: PreviewWire | undefined
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}`)
+    if (!response.ok()) return 0
+    const recording = await response.json() as { preview?: PreviewWire }
+    summary = recording.preview
+    return summary?.state ?? ''
+  }, { timeout: 15_000 }).not.toBe('')
+  expect(summary?.state, 'preview extraction must be available in the FFmpeg-capable E2E fixture').not.toBe('unavailable')
+  expect(summary?.mode).toBe('segment')
+  let recent: PreviewFramesWire | undefined
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/previews?sampling=recent&limit=48`)
+    expect(response.status()).toBe(200)
+    recent = await response.json() as PreviewFramesWire
+    return recent?.items.length ?? 0
+  }, { timeout: 45_000 }).toBeGreaterThan(0)
+  let latestOrdinal = summary?.image_archive_ordinal ?? recent?.items.at(-1)?.archive_ordinal ?? 0
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}`)
+    if (!response.ok()) return 0
+    const recording = await response.json() as { preview?: PreviewWire }
+    latestOrdinal = recording.preview?.image_archive_ordinal ?? 0
+    return latestOrdinal
+  }, { timeout: 15_000 }).toBeGreaterThan(0)
+  const liveImage = page.locator(`section[aria-labelledby="preview-heading"] img[src^="/api/recordings/${recordingID}/previews/"]`).first()
+  await expect.poll(() => liveImage.evaluate(image => ({ complete: (image as HTMLImageElement).complete, width: (image as HTMLImageElement).naturalWidth }))).toMatchObject({ complete: true })
+  await expect.poll(() => liveImage.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+  await scrollPreviewSectionIntoView(page)
+  await page.screenshot({ path: join(screenshots, '01-live-recording-detail.png') })
+
+  await page.goto('/recordings')
+  await expect(page.getByRole('link', { name: 'Preview Frame Index E2E' })).toBeVisible()
+  await expectPreviewImage(page, recordingID)
+  await page.screenshot({ path: join(screenshots, '03-recordings-list.png') })
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
+  await expectPreviewImage(page, recordingID)
+  await page.screenshot({ path: join(screenshots, '04-dashboard.png') })
+  await page.goto(`/recordings/${recordingID}`)
+  await page.getByRole('button', { name: '중지', exact: true }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: '중지', exact: true }).click()
+  await expect.poll(async () => (await getJSON<{ state: string }>(page, `/api/recordings/${encodeURIComponent(recordingID)}`)).state).toBe('stopped')
+  const uniformResponse = await page.request.get(`/api/recordings/${encodeURIComponent(recordingID)}/previews?sampling=uniform&limit=48`)
+  expect(uniformResponse.status()).toBe(200)
+  const uniform = await uniformResponse.json() as PreviewFramesWire
+  expect(uniform.items.length).toBeGreaterThan(0)
+  expect(new Set(uniform.items.map(item => item.archive_ordinal)).size).toBe(uniform.items.length)
+  await expect(page.locator('#vod-player video')).toHaveAttribute('controls', '')
+  const storyboardButtons = page.locator('section[aria-labelledby="preview-heading"] button[aria-label$="위치로 이동"]')
+  await expect(storyboardButtons).toHaveCount(uniform.items.length)
+  const video = page.locator('#vod-player video')
+  await expect.poll(() => video.evaluate(element => (element as HTMLVideoElement).readyState)).toBeGreaterThanOrEqual(2)
+  await scrollPreviewSectionIntoView(page)
+  const storyboardImages = page.locator('section[aria-labelledby="preview-heading"] img')
+  for (let i = 0; i < await storyboardImages.count(); i++) {
+    await expect.poll(() => storyboardImages.nth(i).evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+  }
+  const target = uniform.items[Math.floor(uniform.items.length / 2)]!
+  const wasPaused = await video.evaluate(element => (element as HTMLVideoElement).paused)
+  await storyboardButtons.nth(Math.floor(uniform.items.length / 2)).click()
+  await expect.poll(() => video.evaluate(element => (element as HTMLVideoElement).currentTime)).toBeCloseTo(target.frame_time_seconds, 0)
+  expect(await video.evaluate(element => (element as HTMLVideoElement).paused)).toBe(wasPaused)
+  await page.screenshot({ path: join(screenshots, '02-stopped-recording-storyboard.png') })
+
+  const frameImage = page.locator(`section[aria-labelledby="preview-heading"] img[src^="/api/recordings/${recordingID}/previews/"]`).first()
+  await expect.poll(() => frameImage.evaluate(image => ({ complete: (image as HTMLImageElement).complete, width: (image as HTMLImageElement).naturalWidth }))).toMatchObject({ complete: true })
+  await expect.poll(() => frameImage.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+  await page.getByRole('button', { name: '삭제' }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: '보관 데이터 삭제' }).click()
+  const expectedUnavailableConsoleErrors = consoleErrors.filter(message => message.includes('status of 501 (Not Implemented)'))
+  const unexpectedConsoleErrors = consoleErrors.filter(message => !message.includes('status of 501 (Not Implemented)'))
+  expect(expectedUnavailableResponses.length).toBeGreaterThan(0)
+  expect(expectedUnavailableConsoleErrors.length).toBe(expectedUnavailableResponses.length)
+  expect(unexpectedHTTPResponses).toEqual([])
+  expect(unexpectedConsoleErrors).toEqual([])
+  expect(pageErrors).toEqual([])
+  expect(requestFailures).toEqual([])
+})
+
+async function expectPreviewImage(page: Page, recordingID: string) {
+  const image = page.locator(`img[src^="/api/recordings/${encodeURIComponent(recordingID)}/previews/"]`).first()
+  await expect.poll(() => image.evaluate(node => ({ complete: (node as HTMLImageElement).complete, width: (node as HTMLImageElement).naturalWidth }))).toMatchObject({ complete: true })
+  await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
+}
+
+async function scrollPreviewSectionIntoView(page: Page) {
+  await page.locator('section[aria-labelledby="preview-heading"]').evaluate(section => {
+    const top = window.scrollY + section.getBoundingClientRect().top
+    window.scrollTo(0, Math.max(0, top - 620))
+  })
 }
 
 test('actual workflow adapter: challenge, secret, action URL, continue, cancel, and history', async ({ page }) => {
@@ -353,7 +503,9 @@ async function readVOD(page: Page, recordingID: string) {
       masterStatus: master.status,
       playlistStatus: playlist.status,
       segmentStatus: segment.status,
-      segmentText: await segment.text(),
+      segmentSHA256: await crypto.subtle.digest('SHA-256', await segment.arrayBuffer()).then(digest =>
+        [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join(''),
+      ),
     }
   }, recordingID)
 }

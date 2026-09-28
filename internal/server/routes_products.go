@@ -87,6 +87,10 @@ func (s *Server) recordingQueryItem(recording *domain.Recording) (recordquery.It
 		InitSegmentCount: 0, ManifestSnapshotCount: len(recording.Snapshots), GapCount: len(recording.Gaps),
 		GapDurationSeconds: nil, Integrity: string(storage.IntegrityUnknown), Tags: []string{},
 	}
+	if s.previews != nil {
+		previewSummary := s.previews.Summary(recording)
+		item.Preview = &previewSummary
+	}
 	if recording.Adapter != nil {
 		item.AdapterName = recording.Adapter.Name
 	}
@@ -171,6 +175,10 @@ func (s *Server) recordingDetail(recording *domain.Recording) (recordingDetail, 
 		ManifestSnapshotCount: item.ManifestSnapshotCount, DurationSeconds: item.DurationSeconds,
 		GapCount: item.GapCount, GapSegmentCount: item.GapSegmentCount,
 		GapDurationSeconds: item.GapDurationSeconds, Integrity: storage.IntegrityStatus(item.Integrity),
+	}
+	if s.previews != nil {
+		previewSummary := s.previews.Summary(recording)
+		response.Preview = &previewSummary
 	}
 	return response, nil
 }
@@ -295,7 +303,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		if item.State == domain.StateRecording {
 			result.ActiveRecordingsCount++
 			if len(result.ActiveRecordingItems) < 10 {
-				result.ActiveRecordingItems = append(result.ActiveRecordingItems, summary(item))
+				result.ActiveRecordingItems = append(result.ActiveRecordingItems, s.recordingSummary(item))
 			}
 		}
 		if item.StoppedAt != nil && !item.StoppedAt.Before(cutoff) {
@@ -318,7 +326,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		result.Integrity[status]++
 	}
 	for i := 0; i < len(items) && i < 10; i++ {
-		result.RecentRecordings = append(result.RecentRecordings, summary(items[i]))
+		result.RecentRecordings = append(result.RecentRecordings, s.recordingSummary(items[i]))
 	}
 	if s.adapters != nil {
 		for _, adapter := range s.adapters.List() {
@@ -405,6 +413,7 @@ func (s *Server) recordingDelete(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
+	s.cleanupPreviewProjection(id)
 	if s.products != nil {
 		if err = s.products.ForgetRecording(id); err != nil {
 			writeError(w, http.StatusInternalServerError, "recording was deleted but management metadata cleanup is pending")

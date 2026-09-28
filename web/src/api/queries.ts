@@ -1,10 +1,11 @@
 import { queryOptions } from '@tanstack/react-query'
-import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, workflowsAPI, type RecordingQuery } from './index'
+import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, workflowsAPI, type PreviewQuery, type RecordingQuery } from './index'
 
 export const qk = {
   session: ['auth', 'session'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
   settings: ['settings'] as const, recordings: (query: RecordingQuery) => ['recordings', query] as const,
   recording: (id: string) => ['recording', id] as const, tags: (id: string) => ['recording', id, 'tags'] as const,
+  previews: (id: string, query: PreviewQuery) => ['recording', id, 'previews', query] as const,
   archive: (id: string) => ['recording', id, 'archive'] as const, events: (id: string) => ['recording', id, 'events'] as const,
   integrity: (id: string) => ['recording', id, 'integrity'] as const, exports: (id: string) => ['recording', id, 'exports'] as const,
   adapters: ['adapters'] as const, adapter: (id: string) => ['adapter', id] as const, schema: (id: string, resource?: unknown) => ['adapter', id, 'schema', resource] as const,
@@ -18,5 +19,14 @@ export const dashboardQuery = queryOptions({ queryKey: qk.dashboard, queryFn: da
 export const notificationsQuery = queryOptions({ queryKey: qk.notifications, queryFn: productAPI.notifications, staleTime: 15_000, refetchInterval: 30_000, refetchIntervalInBackground: false })
 export const workflowsQuery = queryOptions({ queryKey: qk.workflows, queryFn: workflowsAPI.list, staleTime: 5_000, refetchInterval: query => query.state.data?.some(workflow => workflow.in_progress) ? 8_000 : false, refetchIntervalInBackground: false })
 export const recordingQuery = (id: string) => queryOptions({ queryKey: qk.recording(id), queryFn: () => recordingsAPI.get(id) })
+export const previewsQuery = (id: string, query: PreviewQuery, active = false) => queryOptions({
+  queryKey: qk.previews(id, query), queryFn: () => recordingsAPI.previews(id, query), staleTime: 0,
+  refetchInterval: queryState => {
+    if (active) return 3000
+    const state = queryState.state.data?.state
+    if (state === 'queued' || state === 'processing' || state === 'partial') return 2000
+    return false
+  }, refetchIntervalInBackground: false,
+})
 export const integrityQuery = (id: string) => queryOptions({ queryKey: qk.integrity(id), queryFn: () => integrityAPI.get(id), staleTime: 2000 })
 export const exportsQuery = (id: string) => queryOptions({ queryKey: qk.exports(id), queryFn: () => derivativeAPI.exports(id), staleTime: 2000 })

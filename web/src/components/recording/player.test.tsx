@@ -28,12 +28,16 @@ describe('RecordingPlayer lifecycle', () => {
   })
 
   it('destroys hls.js and clears the media element when unmounted', async () => {
-    const view = render(<RecordingPlayer recordingId="rec-1" />)
+    const onVideoRef = vi.fn()
+    const view = render(<RecordingPlayer recordingId="rec-1" onVideoRef={onVideoRef} />)
     await waitFor(() => expect(hlsState.loadSource).toHaveBeenCalledWith('/api/recordings/rec-1/play/master.m3u8'))
     const video = view.container.querySelector('video')!
+    expect(video.controls).toBe(true)
+    expect(onVideoRef).toHaveBeenCalledWith(video)
     const pause = vi.spyOn(video, 'pause').mockImplementation(() => undefined)
     const load = vi.spyOn(video, 'load').mockImplementation(() => undefined)
     view.unmount()
+    expect(onVideoRef).toHaveBeenLastCalledWith(null)
     expect(hlsState.destroy).toHaveBeenCalledTimes(1)
     expect(video.hasAttribute('src')).toBe(false)
     expect(pause).toHaveBeenCalled()

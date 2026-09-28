@@ -28,6 +28,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
+	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 )
@@ -39,6 +40,7 @@ type Server struct {
 	products                    *management.Store
 	integrity                   *integrity.Service
 	derivatives                 *derivative.Service
+	previews                    *preview.Service
 	auth                        *authn.Service
 	settings                    *systemsettings.Store
 	logs                        *applog.Store
@@ -61,6 +63,7 @@ type Options struct {
 	Management                  *management.Store
 	Integrity                   *integrity.Service
 	Derivatives                 *derivative.Service
+	Previews                    *preview.Service
 	Auth                        *authn.Service
 	Settings                    *systemsettings.Store
 	Logs                        *applog.Store
@@ -72,8 +75,9 @@ type Options struct {
 }
 
 type workflowTitle struct {
-	title     string
-	updatedAt time.Time
+	title       string
+	previewMode preview.Mode
+	updatedAt   time.Time
 }
 
 const (
@@ -105,7 +109,7 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	if logs == nil {
 		logs = applog.NewStore()
 	}
-	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, auth: options.Auth, settings: options.Settings, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
+	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, auth: options.Auth, settings: options.Settings, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
@@ -182,10 +186,11 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 }
 
 type createRequest struct {
-	AdapterID string                    `json:"adapter_id"`
-	Input     json.RawMessage           `json:"input"`
-	Resource  *adapterproto.ResourceRef `json:"resource,omitempty"`
-	Title     string                    `json:"title,omitempty"`
+	AdapterID   string                    `json:"adapter_id"`
+	Input       json.RawMessage           `json:"input"`
+	Resource    *adapterproto.ResourceRef `json:"resource,omitempty"`
+	Title       string                    `json:"title,omitempty"`
+	PreviewMode preview.Mode              `json:"preview_mode,omitempty"`
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
@@ -196,6 +201,15 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(request.AdapterID) == "" || len(request.Input) == 0 {
 		writeError(w, http.StatusBadRequest, "adapter_id and input are required")
+		return
+	}
+	previewMode, err := normalizePreviewMode(request.PreviewMode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid preview mode")
+		return
+	}
+	if previewMode == preview.ModeSegment && s.previews == nil {
+		writeError(w, http.StatusNotImplemented, "preview generation is unavailable")
 		return
 	}
 	if s.adapters == nil {
@@ -214,7 +228,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	if progress.State != "resolved" || progress.Media == nil {
 		s.appendWorkflowHistory(progress, "started")
 		s.appendWorkflowHistory(progress, "challenge_required")
-		if !s.storeWorkflowTitle(progress.WorkflowID, strings.TrimSpace(request.Title)) {
+		if !s.storeWorkflowTitle(progress.WorkflowID, strings.TrimSpace(request.Title), previewMode) {
 			_ = s.adapters.CancelWorkflow(progress.WorkflowID)
 			writeError(w, http.StatusServiceUnavailable, "too many active workflows")
 			return
@@ -229,8 +243,14 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "recording could not be started")
 		return
 	}
+	s.applyPreviewPolicy(recording.ID, previewMode)
 	s.appendRecordingEvent(recording.ID, "recording_started", recording.StartedAt, 0, "")
-	writeJSON(w, http.StatusCreated, detail(recording))
+	response, responseErr := s.recordingDetail(recording)
+	if responseErr != nil {
+		writeJSON(w, http.StatusCreated, detail(recording))
+		return
+	}
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) workflowGet(w http.ResponseWriter, r *http.Request) {
@@ -262,24 +282,24 @@ func (s *Server) workflowCancel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) storeWorkflowTitle(id, title string) bool {
+func (s *Server) storeWorkflowTitle(id, title string, mode preview.Mode) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupWorkflowTitlesLocked(time.Now())
 	if _, exists := s.workflowTitles[id]; !exists && len(s.workflowTitles) >= maxWorkflowTitles {
 		return false
 	}
-	s.workflowTitles[id] = workflowTitle{title: title, updatedAt: time.Now()}
+	s.workflowTitles[id] = workflowTitle{title: title, previewMode: mode, updatedAt: time.Now()}
 	return true
 }
 
-func (s *Server) takeWorkflowTitle(id string) string {
+func (s *Server) takeWorkflowTitle(id string) workflowTitle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cleanupWorkflowTitlesLocked(time.Now())
 	item := s.workflowTitles[id]
 	delete(s.workflowTitles, id)
-	return item.title
+	return item
 }
 
 func (s *Server) touchWorkflowTitle(id string) {
@@ -344,14 +364,43 @@ func (s *Server) workflowContinue(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, progress)
 		return
 	}
-	title := s.takeWorkflowTitle(progress.WorkflowID)
-	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, title, &progress.Provenance)
+	workflow := s.takeWorkflowTitle(progress.WorkflowID)
+	recording, err := s.manager.StartResolved(r.Context(), progress.AdapterID, *progress.Media, progress.Resource, workflow.title, &progress.Provenance)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "recording could not be started")
 		return
 	}
+	s.applyPreviewPolicy(recording.ID, workflow.previewMode)
 	s.appendRecordingEvent(recording.ID, "recording_started", recording.StartedAt, 0, "")
-	writeJSON(w, http.StatusCreated, detail(recording))
+	response, responseErr := s.recordingDetail(recording)
+	if responseErr != nil {
+		writeJSON(w, http.StatusCreated, detail(recording))
+		return
+	}
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func normalizePreviewMode(mode preview.Mode) (preview.Mode, error) {
+	if mode == "" {
+		return preview.ModeDisabled, nil
+	}
+	if mode != preview.ModeDisabled && mode != preview.ModeSegment {
+		return "", preview.ErrInvalid
+	}
+	return mode, nil
+}
+
+func (s *Server) applyPreviewPolicy(recordingID string, mode preview.Mode) {
+	if mode != preview.ModeSegment || s.previews == nil {
+		return
+	}
+	if _, err := s.previews.SetMode(recordingID, mode); err != nil {
+		if s.logs != nil {
+			s.logs.Add("error", "preview", "preview policy could not be persisted after recording start")
+		}
+		return
+	}
+	_ = s.previews.Reconcile()
 }
 
 func (s *Server) adapterList(w http.ResponseWriter, r *http.Request) {
@@ -595,6 +644,7 @@ type recordingSummary struct {
 	Duration                float64                   `json:"duration_seconds"`
 	GapCount                int                       `json:"gap_count"`
 	LastError               string                    `json:"last_error,omitempty"`
+	Preview                 *preview.Summary          `json:"preview,omitempty"`
 }
 
 func summary(r *domain.Recording) recordingSummary {
@@ -603,6 +653,15 @@ func summary(r *domain.Recording) recordingSummary {
 		classification = "sensitive"
 	}
 	return recordingSummary{ID: r.ID, Title: r.Title, AdapterID: r.AdapterID, Adapter: r.Adapter, Resource: r.Resource, SourceURIClassification: classification, State: r.State, CreatedAt: r.CreatedAt, StartedAt: r.StartedAt, StoppedAt: r.StoppedAt, TrackCount: len(r.Tracks), SegmentCount: r.SegmentCount(), Duration: r.Duration(), GapCount: len(r.Gaps), LastError: publicLastError(r.LastError)}
+}
+
+func (s *Server) recordingSummary(r *domain.Recording) recordingSummary {
+	item := summary(r)
+	if s.previews != nil {
+		value := s.previews.Summary(r)
+		item.Preview = &value
+	}
+	return item
 }
 
 func publicLastError(value string) string {
@@ -618,6 +677,7 @@ type recordingDetail struct {
 	SegmentCount int                  `json:"segment_count"`
 	Duration     float64              `json:"duration_seconds"`
 	Statistics   *recordingStatistics `json:"statistics,omitempty"`
+	Preview      *preview.Summary     `json:"preview,omitempty"`
 }
 
 type recordingStatistics struct {
@@ -666,7 +726,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	recordings := s.manager.List()
 	out := make([]recordingSummary, 0, len(recordings))
 	for _, recording := range recordings {
-		out = append(out, summary(recording))
+		out = append(out, s.recordingSummary(recording))
 	}
 	writeJSON(w, http.StatusOK, out)
 }

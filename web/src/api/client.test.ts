@@ -23,6 +23,22 @@ describe('typed API client', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toContain('/api/v2/recordings?q=live+show&state=completed&tag=important&sort=-started_at&limit=25&cursor=next-page')
   })
 
+  it('sends preview policy only as management-level recording creation input and uses the frame-index API', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'rec-1' }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ recording_id: 'rec-1', mode: 'segment', state: 'ready', available: true, frame_count: 1, items: [] }), { status: 200, headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ mode: 'segment', state: 'queued', available: true, frame_count: 0 }), { status: 202, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await recordingsAPI.start({ adapter_id: 'owncast', input: {}, preview_mode: 'disabled' })
+    await recordingsAPI.previews('rec-1', { sampling: 'uniform', limit: 48 })
+    await recordingsAPI.enablePreviews('rec-1')
+    const startRequest = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(JSON.parse(String(startRequest[1].body))).toMatchObject({ preview_mode: 'disabled' })
+    expect(fetchMock.mock.calls[1]?.[0]).toContain('/api/recordings/rec-1/previews?sampling=uniform&limit=48')
+    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/recordings/rec-1/previews')
+    expect(fetchMock.mock.calls[2]?.[1]?.body).toBe('{"mode":"segment"}')
+  })
+
   it('returns structured API errors with request identifiers', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'conflict' }), { status: 409, headers: { 'content-type': 'application/json', 'X-Request-ID': 'req-1' } })))
     await expect(api('/api/example')).rejects.toMatchObject({ status: 409, message: 'conflict', requestID: 'req-1' })

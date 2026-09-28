@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,12 +26,18 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
+	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 )
 
 const segmentPayload = "integrated-recorder-browser-e2e-source-segment"
+
+type sourceFixture struct {
+	playlist []byte
+	segments map[string][]byte
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -65,7 +73,8 @@ func run() error {
 		}
 	}
 
-	source := http.Server{Handler: http.HandlerFunc(sourceHandler)}
+	fixture, ffmpegPath := buildSourceFixture(dataDir)
+	source := http.Server{Handler: http.HandlerFunc(fixture.serveHTTP)}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -74,6 +83,9 @@ func run() error {
 	defer source.Close()
 	sourceURL := "http://" + listener.Addr().String()
 	if err = os.WriteFile(filepath.Join(dataDir, "e2e-source-url"), []byte(sourceURL), 0o600); err != nil {
+		return err
+	}
+	if err = os.WriteFile(filepath.Join(dataDir, "e2e-preview-available"), []byte(fmt.Sprint(ffmpegPath != "")), 0o600); err != nil {
 		return err
 	}
 	store, err := storage.New(dataDir)
@@ -138,8 +150,17 @@ func run() error {
 		adapters.Close()
 		return err
 	}
+	previewService, err := preview.OpenWithGet(dataDir, store, manager.List, manager.Get, ffmpegPath)
+	if err != nil {
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return err
+	}
 	auth, err := authn.Open(dataDir)
 	if err != nil {
+		_ = previewService.Close(context.Background())
 		_ = exportService.Close(context.Background())
 		_ = integrityService.Close(context.Background())
 		_ = manager.Close(context.Background())
@@ -148,7 +169,8 @@ func run() error {
 	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Management: products, Integrity: integrityService, Derivatives: exportService,
-		Auth: auth, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(),
+		Previews: previewService,
+		Auth:     auth, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(),
 		StartedAt: time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
 	})
 
@@ -160,13 +182,18 @@ func run() error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- web.ListenAndServe() }()
 	log.Printf("browser e2e API listening on %s", addr)
+	previewCtx, cancelPreview := context.WithCancel(context.Background())
+	previewDone := make(chan error, 1)
+	go func() { previewDone <- previewService.Run(previewCtx) }()
 
 	shutdown, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	select {
 	case err = <-serveErr:
 		if !errors.Is(err, http.ErrServerClosed) {
-			_ = closeServices(manager, integrityService, exportService, adapters)
+			cancelPreview()
+			<-previewDone
+			_ = closeServices(manager, integrityService, exportService, previewService, adapters)
 			return err
 		}
 	case <-shutdown.Done():
@@ -175,6 +202,11 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = web.Shutdown(ctx)
+	cancelPreview()
+	<-previewDone
+	if err = previewService.Close(ctx); err != nil {
+		return err
+	}
 	if err = manager.Close(ctx); err != nil {
 		return err
 	}
@@ -188,11 +220,11 @@ func run() error {
 	return nil
 }
 
-func closeServices(manager *acquire.Manager, integrityService *integrity.Service, exportService *derivative.Service, adapters *adapterhost.Host) error {
+func closeServices(manager *acquire.Manager, integrityService *integrity.Service, exportService *derivative.Service, previewService *preview.Service, adapters *adapterhost.Host) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	defer adapters.Close()
-	return errors.Join(manager.Close(ctx), exportService.Close(ctx), integrityService.Close(ctx))
+	return errors.Join(manager.Close(ctx), exportService.Close(ctx), integrityService.Close(ctx), previewService.Close(ctx))
 }
 
 func repositoryRoot() string {
@@ -203,15 +235,114 @@ func repositoryRoot() string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), "../../.."))
 }
 
-func sourceHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case "/hls/stream.m3u8":
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		_, _ = fmt.Fprint(w, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:1.5,browser fixture\nsegment-7.ts\n")
-	case "/hls/segment-7.ts":
-		w.Header().Set("Content-Type", "video/mp2t")
-		_, _ = fmt.Fprint(w, segmentPayload)
-	default:
-		http.NotFound(w, r)
+func buildSourceFixture(dataDir string) (*sourceFixture, string) {
+	fallback := &sourceFixture{playlist: []byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:1.5,browser fixture\nsegment-7.ts\n"), segments: map[string][]byte{"segment-7.ts": []byte(segmentPayload)}}
+	_ = os.WriteFile(filepath.Join(dataDir, "e2e-source-segment"), fallback.segments["segment-7.ts"], 0600)
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return fallback, ""
 	}
+	outputDir := filepath.Join(dataDir, "e2e-hls-source")
+	if err := os.MkdirAll(outputDir, 0700); err != nil {
+		return fallback, ""
+	}
+	manifestPath := filepath.Join(outputDir, "stream.m3u8")
+	segmentPattern := filepath.Join(outputDir, "source-%03d.ts")
+	base := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-t", "10"}
+	variants := [][]string{
+		{"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "50", "-sc_threshold", "0", "-an"},
+		{"-c:v", "mpeg2video", "-pix_fmt", "yuv420p", "-g", "12", "-an"},
+	}
+	generated := false
+	for _, codec := range variants {
+		_ = os.RemoveAll(outputDir)
+		if err := os.MkdirAll(outputDir, 0700); err != nil {
+			return fallback, ""
+		}
+		arguments := append(append([]string{}, base...), codec...)
+		arguments = append(arguments, "-f", "hls", "-hls_time", "2", "-hls_list_size", "0", "-hls_segment_filename", segmentPattern, manifestPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		command := exec.CommandContext(ctx, ffmpegPath, arguments...)
+		_, runErr := command.CombinedOutput()
+		cancel()
+		if runErr == nil {
+			generated = true
+			break
+		}
+	}
+	if !generated {
+		_ = os.RemoveAll(outputDir)
+		return fallback, ""
+	}
+	playlist, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fallback, ""
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(playlist))
+	var published strings.Builder
+	segments := map[string][]byte{}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || line == "#EXT-X-ENDLIST" {
+			continue
+		}
+		if strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:") {
+			line = "#EXT-X-MEDIA-SEQUENCE:7"
+		}
+		if !strings.HasPrefix(line, "#") {
+			name := filepath.Base(line)
+			payload, readErr := os.ReadFile(filepath.Join(outputDir, name))
+			if readErr != nil || len(payload) == 0 {
+				return fallback, ""
+			}
+			segments[name] = payload
+		}
+		published.WriteString(line)
+		published.WriteByte('\n')
+	}
+	if scanner.Err() != nil || len(segments) < 2 {
+		return fallback, ""
+	}
+	fallback.playlist, fallback.segments = []byte(published.String()), segments
+	for _, name := range playlistSegmentNames(playlist) {
+		if payload := segments[name]; len(payload) > 0 {
+			if err := os.WriteFile(filepath.Join(dataDir, "e2e-source-segment"), payload, 0600); err != nil {
+				return fallback, ""
+			}
+			break
+		}
+	}
+	return fallback, ffmpegPath
+}
+
+func playlistSegmentNames(playlist []byte) []string {
+	scanner := bufio.NewScanner(bytes.NewReader(playlist))
+	var names []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			names = append(names, filepath.Base(line))
+		}
+	}
+	return names
+}
+
+func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/hls/stream.m3u8" {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write(fixture.playlist)
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, "/hls/") {
+		http.NotFound(w, r)
+		return
+	}
+	name := filepath.Base(r.URL.Path)
+	payload, ok := fixture.segments[name]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "video/mp2t")
+	_, _ = w.Write(payload)
 }

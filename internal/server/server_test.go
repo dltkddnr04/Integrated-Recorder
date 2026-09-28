@@ -20,6 +20,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
+	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
@@ -60,6 +61,8 @@ func runServerTestAdapter() int {
 			response, _ = adapterproto.Success(request.ID, descriptor)
 		case adapterproto.MethodShutdown:
 			response, _ = adapterproto.Success(request.ID, map[string]bool{"stopped": true})
+		case adapterproto.MethodResolve:
+			response, _ = adapterproto.Success(request.ID, adapterproto.ResolveResult{Media: adapterproto.MediaSource{Type: "hls", ManifestURL: "http://127.0.0.1:9/live.m3u8", ArchivePolicy: &adapterproto.ArchivePolicy{SourceURI: "sensitive"}}})
 		default:
 			response = adapterproto.Failure(request.ID, "unsupported_method", "unsupported", nil)
 		}
@@ -69,6 +72,63 @@ func runServerTestAdapter() int {
 		if request.Method == adapterproto.MethodShutdown {
 			return 0
 		}
+	}
+}
+
+func TestDirectRecordingCreatePersistsOptionalPreviewPolicyOutsideArchive(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configFiles, secretFiles, err := pluginconfig.NewTypedFileStores(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err := pluginconfig.NewService(configFiles, secretFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapterDir := t.TempDir()
+	writeServerTestAdapter(t, adapterDir)
+	host, err := adapterhost.Discover(context.Background(), adapterDir, configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	manager, err := acquire.NewManager(store, nil, nil, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close(context.Background())
+	previews, err := preview.Open(root, store, manager.List, filepath.Join(root, "missing-ffmpeg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previews.Close(context.Background())
+	api := NewWithOptions(manager, host, configs, Options{Previews: previews})
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"schema-test","input":{},"title":"preview opt-in","preview_mode":"segment"}`)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("recording create status=%d body=%s", response.Code, response.Body.String())
+	}
+	id := extractJSONID(t, response.Body.Bytes())
+	if mode := previews.Policy(id).Mode; mode != preview.ModeSegment {
+		t.Fatalf("direct create lost preview policy: mode=%q", mode)
+	}
+	archive, err := manager.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "preview_mode") {
+		t.Fatalf("management preview policy leaked into canonical recording metadata: %s", encoded)
+	}
+	if _, err := manager.Stop(id); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -192,7 +252,8 @@ func TestWorkflowAPIResourceChallengePersistenceAndEphemeralAnswers(t *testing.T
 		t.Fatal(err)
 	}
 	defer host.Close()
-	store, err := storage.New(t.TempDir())
+	root := t.TempDir()
+	store, err := storage.New(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,13 +261,28 @@ func TestWorkflowAPIResourceChallengePersistenceAndEphemeralAnswers(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := New(manager, host, configs)
+	previews, err := preview.Open(root, store, manager.List, filepath.Join(root, "ffmpeg-unavailable"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previews.Close(context.Background())
+	handler := NewWithOptions(manager, host, configs, Options{Previews: previews})
 	invalid := httptest.NewRecorder()
 	handler.ServeHTTP(invalid, httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"workflow-test","input":{}}`)))
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid input accepted: %d %s", invalid.Code, invalid.Body.String())
 	}
-	workflowID, resource := startWorkflowChallenge(t, handler, "persisted-resource")
+	begin := httptest.NewRecorder()
+	beginRequest := httptest.NewRequest(http.MethodPost, "/api/recordings", strings.NewReader(`{"adapter_id":"workflow-test","input":{"opaque_input":"persisted-resource"},"preview_mode":"segment"}`))
+	handler.ServeHTTP(begin, beginRequest)
+	if begin.Code != http.StatusAccepted {
+		t.Fatalf("workflow with preview policy begin=%d %s", begin.Code, begin.Body.String())
+	}
+	var beginProgress adapterhost.WorkflowProgress
+	if err := json.Unmarshal(begin.Body.Bytes(), &beginProgress); err != nil || beginProgress.WorkflowID == "" || beginProgress.Resource == nil {
+		t.Fatalf("workflow with preview policy response=%s err=%v", begin.Body.String(), err)
+	}
+	workflowID, resource := beginProgress.WorkflowID, beginProgress.Resource
 	getWorkflow := httptest.NewRecorder()
 	handler.ServeHTTP(getWorkflow, httptest.NewRequest(http.MethodGet, "/api/resolve-workflows/"+workflowID, nil))
 	if getWorkflow.Code != http.StatusOK || !strings.Contains(getWorkflow.Body.String(), `"resource_type":"alpha"`) || strings.Contains(getWorkflow.Body.String(), "private-secret-value") {
@@ -220,6 +296,9 @@ func TestWorkflowAPIResourceChallengePersistenceAndEphemeralAnswers(t *testing.T
 		t.Fatalf("persistent continuation=%d %s", continued.Code, continued.Body.String())
 	}
 	recordingID := extractJSONID(t, continued.Body.Bytes())
+	if mode := previews.Policy(recordingID).Mode; mode != preview.ModeSegment {
+		t.Fatalf("resolved workflow lost preview policy: mode=%q", mode)
+	}
 	encodedResource := encodeResource(t, resource)
 	configURL := "/api/adapters/workflow-test/config?resource=" + encodedResource
 	configGet := httptest.NewRecorder()

@@ -269,6 +269,7 @@ func (s *Server) deleteRetentionCandidateLocked(ctx context.Context, id string, 
 		}
 		return false, err
 	}
+	s.cleanupPreviewProjection(id)
 	if err := s.products.ForgetRecording(id); err != nil {
 		return true, err
 	}

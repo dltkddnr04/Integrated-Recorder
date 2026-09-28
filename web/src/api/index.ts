@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, RecordingDetail, RecordingEvent, RecordingPage, Resource, ResourceRef, Schema, SearchResult, StorageInfo, SystemInfo, SystemSettings, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingPage, Resource, ResourceRef, Schema, SearchResult, StorageInfo, SystemInfo, SystemSettings, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -11,19 +11,21 @@ export const dashboardAPI = {
   get: () => api<Dashboard>('/api/dashboard'), storage: () => api<StorageInfo>('/api/system/storage'), info: () => api<SystemInfo>('/api/system/info'),
 }
 export type RecordingQuery = { q?: string; state?: string; adapter?: string; resource_type?: string; started_after?: string; started_before?: string; has_gaps?: string; integrity?: string; tag?: string; sort?: string; limit?: number; cursor?: string }
+export type PreviewQuery = { sampling: 'uniform' | 'recent' | 'nearest'; limit: number; time_seconds?: number }
 function encodeRef(ref: ResourceRef) { return btoa(unescape(encodeURIComponent(JSON.stringify(ref)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
 export const recordingsAPI = {
   list: (query: RecordingQuery) => api<RecordingPage>(`/api/v2/recordings${queryString(query)}`),
   get: (id: string) => api<RecordingDetail>(`/api/recordings/${encodeURIComponent(id)}`),
-  start: (body: { adapter_id: string; input: Record<string, unknown>; resource?: ResourceRef; title?: string }) => api<RecordingDetail | WorkflowProgress>('/api/recordings', { method: 'POST', body }),
+  start: (body: { adapter_id: string; input: Record<string, unknown>; resource?: ResourceRef; title?: string; preview_mode: 'disabled' | 'segment' }) => api<RecordingDetail | WorkflowProgress>('/api/recordings', { method: 'POST', body }),
   stop: (id: string) => api<RecordingDetail>(`/api/recordings/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
   remove: (id: string) => api<void>(`/api/recordings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   tags: (id: string) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`),
   setTags: (id: string, tags: string[]) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: { tags } }),
   archive: (id: string) => api<{ recording_id: string; entries: ArchiveEntry[] }>(`/api/recordings/${encodeURIComponent(id)}/archive/index`),
   events: (id: string) => api<{ items: RecordingEvent[] }>(`/api/recordings/${encodeURIComponent(id)}/events`),
-  thumbnail: (id: string) => `/api/recordings/${encodeURIComponent(id)}/thumbnail`,
-  regenerateThumbnail: (id: string) => api<unknown>(`/api/recordings/${encodeURIComponent(id)}/thumbnail/regenerate`, { method: 'POST' }),
+  previews: (id: string, query: PreviewQuery) => api<PreviewFramesResponse>(`/api/recordings/${encodeURIComponent(id)}/previews${queryString(query)}`),
+  previewFrame: (id: string, ordinal: number) => `/api/recordings/${encodeURIComponent(id)}/previews/${encodeURIComponent(String(ordinal))}`,
+  enablePreviews: (id: string) => api<import('@/types/api').PreviewSummary>(`/api/recordings/${encodeURIComponent(id)}/previews`, { method: 'POST', body: { mode: 'segment' } }),
 }
 export const integrityAPI = {
   get: (id: string) => api<IntegrityResult>(`/api/recordings/${encodeURIComponent(id)}/integrity`),

@@ -22,6 +22,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
 	"github.com/dltkddnr04/integrated-recorder/internal/network"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
+	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
@@ -108,9 +109,18 @@ func run() error {
 		adapters.Close()
 		return fmt.Errorf("initialize remux export: %w", err)
 	}
+	previewService, err := preview.OpenWithGet(dataDir, store, manager.List, manager.Get, os.Getenv("FFMPEG_PATH"))
+	if err != nil {
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("initialize preview projections: %w", err)
+	}
 
 	authDisabled := os.Getenv("AUTH_DISABLED") == "1"
 	if authDisabled && !isLoopbackAddress(addr) {
+		_ = previewService.Close(context.Background())
 		_ = exportService.Close(context.Background())
 		_ = integrityService.Close(context.Background())
 		_ = manager.Close(context.Background())
@@ -121,6 +131,7 @@ func run() error {
 	if !authDisabled {
 		authService, err = authn.Open(dataDir)
 		if err != nil {
+			_ = previewService.Close(context.Background())
 			_ = exportService.Close(context.Background())
 			_ = integrityService.Close(context.Background())
 			_ = manager.Close(context.Background())
@@ -137,7 +148,7 @@ func run() error {
 	version := buildVersion
 	commit := buildCommit
 
-	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(), ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
+	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(), ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
 	httpServer := &http.Server{Addr: addr, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -146,6 +157,8 @@ func run() error {
 		defer close(retentionDone)
 		apiServer.RunRetention(shutdownCtx)
 	}()
+	previewDone := make(chan error, 1)
+	go func() { previewDone <- previewService.Run(shutdownCtx) }()
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpServer.ListenAndServe() }()
 
@@ -171,8 +184,14 @@ func run() error {
 	// manager and projection dependencies are closed.
 	stop()
 	<-retentionDone
+	if err = <-previewDone; err != nil && !errors.Is(err, context.Canceled) {
+		runErr = errors.Join(runErr, fmt.Errorf("preview reconciliation shutdown: %w", err))
+	}
 
 	shutdownWorkers, cancelWorkers := context.WithTimeout(context.Background(), 15*time.Second)
+	if err = previewService.Close(shutdownWorkers); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("preview shutdown: %w", err))
+	}
 	if err = exportService.Close(shutdownWorkers); err != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("export shutdown: %w", err))
 	}

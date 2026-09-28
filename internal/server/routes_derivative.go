@@ -17,15 +17,12 @@ func (s *Server) registerDerivativeRoutes() {
 	s.mux.HandleFunc("GET /api/exports/{job_id}", s.exportGet)
 	s.mux.HandleFunc("GET /api/exports/{job_id}/download", s.exportDownload)
 	s.mux.HandleFunc("DELETE /api/exports/{job_id}", s.exportDelete)
+	s.registerPreviewRoutes()
 	s.mux.HandleFunc("GET /api/recordings/{id}/thumbnail", s.thumbnailGet)
 	s.mux.HandleFunc("POST /api/recordings/{id}/thumbnail/regenerate", s.thumbnailRegenerate)
 }
 
 func (s *Server) thumbnailGet(w http.ResponseWriter, r *http.Request) {
-	if s.derivatives == nil {
-		writeError(w, http.StatusNotImplemented, "thumbnail generation is unavailable")
-		return
-	}
 	id := r.PathValue("id")
 	if !validRecordingPathID(id) {
 		writeError(w, http.StatusNotFound, "recording not found")
@@ -34,28 +31,42 @@ func (s *Server) thumbnailGet(w http.ResponseWriter, r *http.Request) {
 	lock := s.productLock(id)
 	lock.RLock()
 	defer lock.RUnlock()
-	if _, err := s.manager.Get(id); err != nil {
+	recording, err := s.manager.Get(id)
+	if err != nil {
 		writeStorageError(w, err)
 		return
 	}
-	file, thumbnail, err := s.derivatives.OpenThumbnail(id)
-	if err != nil {
-		if errors.Is(err, derivative.ErrThumbnailNotFound) {
-			writeError(w, http.StatusNotFound, "thumbnail is not available")
+	if s.previews != nil {
+		summary := s.previews.Summary(recording)
+		if summary.ImageArchiveOrdinal != nil {
+			file, frame, err := s.previews.OpenFrame(id, *summary.ImageArchiveOrdinal)
+			if err == nil {
+				defer file.Close()
+				servePreviewImage(w, r, file, frame)
+				return
+			}
+		}
+	}
+	if s.derivatives != nil {
+		file, thumbnail, err := s.derivatives.OpenThumbnail(id)
+		if err == nil {
+			defer file.Close()
+			w.Header().Set("Content-Type", thumbnail.ContentType)
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Cache-Control", "private, no-store")
+			http.ServeContent(w, r, "thumbnail.jpg", thumbnail.UpdatedAt, file)
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "thumbnail is unavailable")
-		return
+		if !errors.Is(err, derivative.ErrThumbnailNotFound) {
+			writeError(w, http.StatusInternalServerError, "thumbnail is unavailable")
+			return
+		}
 	}
-	defer file.Close()
-	w.Header().Set("Content-Type", thumbnail.ContentType)
-	w.Header().Set("Content-Length", fmt.Sprint(thumbnail.Size))
-	w.Header().Set("Cache-Control", "private, no-store")
-	http.ServeContent(w, r, "thumbnail.jpg", thumbnail.UpdatedAt, file)
+	writeError(w, http.StatusNotFound, "thumbnail is not available")
 }
 
 func (s *Server) thumbnailRegenerate(w http.ResponseWriter, r *http.Request) {
-	if s.derivatives == nil || !s.derivatives.Available() {
+	if s.previews == nil {
 		writeError(w, http.StatusNotImplemented, "thumbnail generation is unavailable")
 		return
 	}
@@ -72,14 +83,15 @@ func (s *Server) thumbnailRegenerate(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
-	defer cancel()
-	thumbnail, err := s.derivatives.GenerateThumbnail(ctx, recording)
-	if err != nil {
-		writeThumbnailError(w, err)
+	if _, err := s.previews.SetMode(id, "segment"); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "preview policy could not be saved")
 		return
 	}
-	writeJSON(w, http.StatusOK, thumbnail)
+	if err := s.previews.RetryFailed(id); err != nil {
+		writePreviewError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.previews.Summary(recording))
 }
 
 func writeThumbnailError(w http.ResponseWriter, err error) {

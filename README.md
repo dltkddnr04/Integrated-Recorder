@@ -17,8 +17,8 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 - **Segment-native:** acquisition 중 모든 녹화를 하나의 거대한 파일로 만들지 않습니다.
 - **Headless first:** Docker에서 장시간 상시 실행하는 것을 전제로 합니다.
 - **Browser controlled:** API와 Web UI가 공식 제어 경로가 됩니다.
-- **재생성 가능한 projection:** VOD playlist, index, export, 향후 UI 데이터는 archive에서 다시 만들 수 있어야 합니다.
-- **FFmpeg는 선택 사항:** 향후 사용자가 export/transcode를 명시적으로 요청할 때만 사용할 수 있습니다.
+- **재생성 가능한 projection:** VOD playlist, preview index, export, 향후 UI 데이터는 archive에서 다시 만들 수 있어야 합니다.
+- **FFmpeg는 파생 작업 전용:** 녹화 수집과 원본 보관에는 필요하지 않습니다. 장면 미리보기와 리먹스 내보내기 같은 선택적 파생 기능에만 사용합니다.
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
@@ -28,7 +28,9 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 
 **Milestone 1과 external adapter protocol milestone 완료.**
 
-React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, resource 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, thumbnail projection을 backend API에 연결합니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우에만 별도의 remux export와 thumbnail 생성이 제공되며 canonical 녹화 데이터는 변경하지 않습니다.
+React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, resource 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, Preview Frame Index를 backend API에 연결합니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우 장면 미리보기 프레임 생성과 별도의 remux export를 제공하며 canonical 녹화 데이터는 변경하지 않습니다.
+
+장면 미리보기는 녹화별 opt-in 파생 기능이며 기본값은 꺼져 있습니다. 각 확정된 primary track 세그먼트에는 최대 한 개의 재사용 가능한 프레임을 비동기로 생성합니다. 먼저 대상 세그먼트만 시도하고(필요한 fMP4 init object 포함), 실패할 때만 제한된 이전 세그먼트 context로 재시도합니다. FFmpeg가 느리거나 실패해도 녹화는 계속되며, 포스터·스토리보드·향후 탐색 UI는 저장된 프레임을 재사용합니다.
 
 현재 지원:
 
@@ -72,7 +74,7 @@ DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 
 실행 후 `http://localhost:8080/`을 엽니다.
 
-Docker 설정도 포함되어 있습니다.
+Docker 설정도 포함되어 있습니다. 기본 runtime image에는 Alpine Linux의 `ffmpeg` package가 포함되어 장면 미리보기와 MKV 리먹스 파생 기능을 사용할 수 있습니다. Host 설치에서는 FFmpeg가 선택 사항이며, FFmpeg가 없어도 원본 녹화와 VOD 재생은 동작합니다. Alpine v3.21 package metadata는 `ffmpeg`의 license expression을 `GPL-2.0-or-later AND LGPL-2.1-or-later`로 표시합니다. FFmpeg upstream은 선택적 GPL 적용 구성 요소가 포함될 때 배포 조건이 달라질 수 있다고 설명합니다. 배포자는 실제 image의 package metadata와 [Alpine package record](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html)를 확인하세요.
 
 ```sh
 docker compose up --build
@@ -101,11 +103,14 @@ docker compose up --build
 | `POST` | `/api/integrity/jobs/{job_id}/cancel` | 실행 중인 무결성 확인 취소 |
 | `GET` | `/api/logs` | bounded application request-log 조회 |
 | `GET` | `/api/recordings/{id}/archive/index` | canonical archive object 목록 |
+| `GET` | `/api/recordings/{id}/previews` | Preview Frame Index에서 bounded sample 조회 |
+| `GET` | `/api/recordings/{id}/previews/{archive_ordinal}` | 개별 장면 미리보기 프레임 조회 |
+| `POST` | `/api/recordings/{id}/previews` | 녹화의 세그먼트별 미리보기 생성 활성화/보충 요청 |
 | `GET` | `/api/adapters/{id}/resources` | adapter가 resource browse capability를 선언한 경우 목록 조회 |
 | `POST` | `/api/adapters/{id}/restart`, `/enable`, `/disable` | 발견된 adapter process 관리 |
 | `POST` | `/api/recordings/{id}/exports` | FFmpeg 설치 시 MKV remux job 요청 |
-| `GET` | `/api/recordings/{id}/thumbnail` | 생성된 thumbnail projection 읽기 |
-| `POST` | `/api/recordings/{id}/thumbnail/regenerate` | FFmpeg 설치 시 thumbnail 다시 생성 |
+| `GET` | `/api/recordings/{id}/thumbnail` | Preview Frame Index의 호환 포스터 projection 읽기 |
+| `POST` | `/api/recordings/{id}/thumbnail/regenerate` | 미리보기 생성/보충을 요청하는 호환 endpoint |
 | `GET` / `PUT` | `/api/settings` | 실제 지원되는 UI theme 및 integrity concurrency 설정 |
 | `POST` | `/api/auth/login`, `/logout`, `/bootstrap` | single-admin session 인증 |
 | `GET` | `/api/recordings/{id}` | 녹화 상세 |
@@ -119,8 +124,10 @@ docker compose up --build
 ```sh
 curl -X POST http://localhost:8080/api/recordings \
   -H 'Content-Type: application/json' \
-  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title"}'
+  -d '{"adapter_id":"owncast","input":{"source_url":"https://watch.owncast.online"},"title":"optional title","preview_mode":"segment"}'
 ```
+
+`preview_mode`는 선택 사항이며 생략하면 `disabled`입니다. `segment`를 지정하면 canonical segment가 저장된 뒤 별도 bounded background worker가 장면 미리보기를 생성합니다.
 
 ## 개발
 
@@ -160,7 +167,7 @@ go vet ./...
 - [x] management browser UI v2 및 실제 product API 기초
 - [ ] CHZZK, SOOP, Twitch 등 추가 platform adapter
 - [ ] HDD/NAS/LTO를 포함한 hot/cold storage lifecycle
-- [x] Optional remux-only export pipeline (FFmpeg가 있을 때)
+- [x] Optional segment-based Preview Frame Index and remux-only export (FFmpeg가 있을 때)
 
 ## 문서
 
