@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Descriptor struct {
@@ -176,6 +177,54 @@ type ResolveParams struct {
 	Configuration map[string]json.RawMessage `json:"configuration,omitempty"`
 	Secrets       map[string]string          `json:"secrets,omitempty"`
 	State         []StateDocument            `json:"state,omitempty"`
+}
+
+// WatchCheckParams asks an adapter to inspect whether its configured source is
+// currently live. It reuses resolve's composed configuration, secrets, and
+// adapter-owned state without introducing platform semantics into Core.
+type WatchCheckParams struct {
+	Input         json.RawMessage            `json:"input"`
+	Resource      *ResourceRef               `json:"resource,omitempty"`
+	Configuration map[string]json.RawMessage `json:"configuration,omitempty"`
+	Secrets       map[string]string          `json:"secrets,omitempty"`
+	State         []StateDocument            `json:"state,omitempty"`
+}
+
+// WatchCheckResult separates a successful offline observation from an
+// adapter/network error. SessionRef is opaque and must not be exposed by Core.
+type WatchCheckResult struct {
+	State          string          `json:"state"`
+	SessionRef     string          `json:"session_ref,omitempty"`
+	Title          string          `json:"title,omitempty"`
+	StartedAt      *time.Time      `json:"started_at,omitempty"`
+	Media          *MediaSource    `json:"media,omitempty"`
+	StateMutations []StateMutation `json:"state_mutations,omitempty"`
+}
+
+// Validate checks the generic result envelope. Descriptor-specific media and
+// state target validation is performed by adapterhost before it is accepted.
+func (result WatchCheckResult) Validate(mediaTypes []string) error {
+	if result.State != "offline" && result.State != "live" {
+		return fmt.Errorf("watch result state is invalid")
+	}
+	if len(result.SessionRef) > 4096 || strings.IndexByte(result.SessionRef, 0) >= 0 {
+		return fmt.Errorf("watch session reference is invalid")
+	}
+	if !utf8.ValidString(result.SessionRef) || !utf8.ValidString(result.Title) || len(result.Title) > 4096 {
+		return fmt.Errorf("watch result text is invalid")
+	}
+	if result.StartedAt != nil && (result.StartedAt.IsZero() || result.StartedAt.Year() < 1 || result.StartedAt.Year() > 9999) {
+		return fmt.Errorf("watch result timestamp is invalid")
+	}
+	if result.Media != nil {
+		if result.State != "live" || ValidateMediaSource(*result.Media, mediaTypes) != nil {
+			return fmt.Errorf("watch result media is invalid")
+		}
+	}
+	if len(result.StateMutations) > 64 {
+		return fmt.Errorf("watch state mutation list exceeds limit")
+	}
+	return nil
 }
 
 // ResolveResult is the extensible result form for adapters that need to return

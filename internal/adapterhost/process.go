@@ -36,6 +36,24 @@ type readResult struct {
 	err      error
 }
 
+// SafeProtocolError preserves only protocol error codes whose meaning is safe
+// for Core to act on. Adapter-controlled messages and details are deliberately
+// discarded at the process boundary.
+type SafeProtocolError struct {
+	Code string
+}
+
+func (e *SafeProtocolError) Error() string { return "adapter returned an error" }
+
+func isSafeProtocolErrorCode(code string) bool {
+	switch code {
+	case "authentication_required", "interaction_required", "configuration_required":
+		return true
+	default:
+		return false
+	}
+}
+
 type boundedCapture struct {
 	mu    sync.Mutex
 	bytes []byte
@@ -207,6 +225,9 @@ func (p *process) consumeResponse(result readResult, id string) (json.RawMessage
 		return nil, adapterproto.ErrUnsupportedProtocolVersion
 	}
 	if result.response.Error != nil {
+		if isSafeProtocolErrorCode(result.response.Error.Code) {
+			return nil, &SafeProtocolError{Code: result.response.Error.Code}
+		}
 		return nil, errors.New("adapter returned an error")
 	}
 	return result.response.Result, nil

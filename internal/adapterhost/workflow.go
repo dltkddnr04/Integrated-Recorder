@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
@@ -21,6 +22,17 @@ var ErrWorkflowFailed = errors.New("adapter workflow failed")
 
 func provenance(d adapterproto.Descriptor) adapterproto.AdapterProvenance {
 	return adapterproto.AdapterProvenance{ID: d.ID, Version: d.Version, ProtocolVersion: d.ProtocolVersion, Fingerprint: descriptorFingerprint(d)}
+}
+
+// Provenance returns the current semantic descriptor identity for a recording
+// resolved by this adapter. Presentation metadata is excluded by the existing
+// descriptor fingerprint implementation.
+func (h *Host) Provenance(id string) (adapterproto.AdapterProvenance, error) {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return adapterproto.AdapterProvenance{}, err
+	}
+	return provenance(d), nil
 }
 
 func (h *Host) BeginResolution(ctx context.Context, id string, input json.RawMessage, resource *adapterproto.ResourceRef) (WorkflowProgress, error) {
@@ -99,10 +111,32 @@ func (h *Host) ResolveLegacy(ctx context.Context, id string, input json.RawMessa
 	if err != nil {
 		return adapterproto.MediaSource{}, err
 	}
+	// Preserve the legacy resolve contract: adapters may receive secret fields
+	// inline in Input. Only Watch persistence requires a split secret map.
 	if err = adapterproto.ValidateObjectAgainstSchema(d.InputSchema, input); err != nil {
 		return adapterproto.MediaSource{}, err
 	}
-	if err = adapterproto.ValidateResourceRefForDescriptor(d, resource); err != nil {
+	return h.resolveLegacyValidated(ctx, id, input, resource, d)
+}
+
+// ResolveLegacyWithInputSecrets performs the same stateless composition as
+// ResolveLegacy while accepting input-schema secret values separately from
+// ordinary input. The secret fields are merged only in memory immediately
+// before the adapter call.
+func (h *Host) ResolveLegacyWithInputSecrets(ctx context.Context, id string, input json.RawMessage, inputSecrets map[string]string, resource *adapterproto.ResourceRef) (adapterproto.MediaSource, error) {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return adapterproto.MediaSource{}, err
+	}
+	input, err = composeInputSecrets(d.InputSchema, input, inputSecrets)
+	if err != nil {
+		return adapterproto.MediaSource{}, err
+	}
+	return h.resolveLegacyValidated(ctx, id, input, resource, d)
+}
+
+func (h *Host) resolveLegacyValidated(ctx context.Context, id string, input json.RawMessage, resource *adapterproto.ResourceRef, d adapterproto.Descriptor) (adapterproto.MediaSource, error) {
+	if err := adapterproto.ValidateResourceRefForDescriptor(d, resource); err != nil {
 		return adapterproto.MediaSource{}, fmt.Errorf("invalid resource reference")
 	}
 	input = marshalObject(adapterproto.ApplyDefaults(d.InputSchema, decodeObject(input)))
@@ -138,6 +172,113 @@ func (h *Host) ResolveLegacy(ctx context.Context, id string, input json.RawMessa
 		return adapterproto.MediaSource{}, fmt.Errorf("adapter state could not be saved")
 	}
 	return media, nil
+}
+
+// ValidateWatchInput validates a Watch's split ordinary/secret input without
+// returning or persisting a combined object containing secret values.
+func (h *Host) ValidateWatchInput(id string, input json.RawMessage, inputSecrets map[string]string, resource *adapterproto.ResourceRef) error {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return err
+	}
+	if err := adapterproto.ValidateResourceRefForDescriptor(d, resource); err != nil {
+		return fmt.Errorf("invalid resource reference")
+	}
+	_, err = composeInputSecrets(d.InputSchema, input, inputSecrets)
+	return err
+}
+
+// WatchCheck runs one generic adapter-defined observation. Adapter configuration
+// inheritance, secrets, and state use the same composition path as resolve.
+// Watch input secrets are merged into Input only for the adapter call.
+func (h *Host) WatchCheck(ctx context.Context, id string, input json.RawMessage, inputSecrets map[string]string, resource *adapterproto.ResourceRef) (adapterproto.WatchCheckResult, error) {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, err
+	}
+	if !hasCapability(d, adapterproto.CapabilityWatch) {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("adapter does not support watch checks")
+	}
+	if err := adapterproto.ValidateResourceRefForDescriptor(d, resource); err != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("invalid resource reference")
+	}
+	composedInput, err := composeInputSecrets(d.InputSchema, input, inputSecrets)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, err
+	}
+	effective, err := h.effective(id, resource)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("adapter configuration unavailable")
+	}
+	schema, err := h.Schema(id, resource)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("adapter configuration schema unavailable")
+	}
+	configuration, configSecrets, err := effectiveConfiguration(schema, effective, true)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("effective adapter configuration is invalid")
+	}
+	state, err := h.stateDocuments(id, resource)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("adapter state is unavailable")
+	}
+	params := adapterproto.WatchCheckParams{Input: composedInput, Resource: cloneResourceRef(resource), Configuration: configuration, Secrets: configSecrets, State: state}
+	raw, err := h.call(ctx, id, adapterproto.MethodWatchCheck, params)
+	if err != nil {
+		return adapterproto.WatchCheckResult{}, err
+	}
+	var result adapterproto.WatchCheckResult
+	if err := json.Unmarshal(raw, &result); err != nil || result.Validate(d.MediaTypes) != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("adapter returned an invalid watch result")
+	}
+	if err := h.applyStateMutations(id, resource, result.StateMutations); err != nil {
+		return adapterproto.WatchCheckResult{}, fmt.Errorf("adapter state could not be saved")
+	}
+	return result, nil
+}
+
+func composeInputSecrets(schema adapterproto.Schema, input json.RawMessage, secrets map[string]string) (json.RawMessage, error) {
+	if err := adapterproto.ValidateObject(input); err != nil {
+		return nil, err
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(input, &values); err != nil || values == nil {
+		return nil, fmt.Errorf("input must be a JSON object")
+	}
+	secretFields := make(map[string]adapterproto.Field)
+	for _, field := range schema.Fields {
+		if field.Control == "secret" {
+			secretFields[field.Key] = field
+		}
+	}
+	for key := range values {
+		if _, secret := secretFields[key]; secret {
+			return nil, fmt.Errorf("secret input must be supplied separately")
+		}
+	}
+	if len(secrets) > len(secretFields) {
+		return nil, fmt.Errorf("invalid secret input")
+	}
+	for key, value := range secrets {
+		_, ok := secretFields[key]
+		if !ok || len(value) > 16<<10 || !utf8.ValidString(value) {
+			return nil, fmt.Errorf("invalid secret input")
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid secret input")
+		}
+		values[key] = encoded
+	}
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("invalid input")
+	}
+	if err := adapterproto.ValidateObjectAgainstSchema(schema, encoded); err != nil {
+		return nil, err
+	}
+	values = adapterproto.ApplyDefaults(schema, values)
+	return json.Marshal(values)
 }
 
 func parseResolveResult(raw json.RawMessage) (adapterproto.MediaSource, []adapterproto.StateMutation, error) {

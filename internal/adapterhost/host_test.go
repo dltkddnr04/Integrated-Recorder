@@ -90,9 +90,16 @@ func runHelperAdapter() int {
 			capabilities := []string{"resolve"}
 			configurationSchema := adapterproto.Schema{Fields: []adapterproto.Field{}}
 			resourceTypes := []adapterproto.ResourceType{}
+			inputSchema := adapterproto.Schema{Fields: []adapterproto.Field{{Key: "manifest_url", Control: "text", Label: "Manifest URL", Required: true}}}
 			variant := os.Getenv("IR_ADAPTER_VARIANT")
 			if mode == "refresh" {
 				capabilities = append(capabilities, adapterproto.CapabilityRefresh)
+			}
+			if mode == "watch" || strings.HasPrefix(mode, "watch_error_") {
+				capabilities = append(capabilities, adapterproto.CapabilityWatch)
+				if mode == "watch" {
+					inputSchema.Fields = append(inputSchema.Fields, adapterproto.Field{Key: "token", Control: "secret", Label: "Token", Required: true})
+				}
 			}
 			if variant == "capabilities" {
 				capabilities = append(capabilities, adapterproto.CapabilityMetadata)
@@ -123,7 +130,7 @@ func runHelperAdapter() int {
 			if mode == "workflow_required" || mode == "workflow_cancel" || mode == "workflow_default" || mode == "workflow_error" {
 				capabilities = []string{adapterproto.CapabilityResolveWorkflow}
 			}
-			descriptor := adapterproto.Descriptor{ID: os.Getenv("IR_ADAPTER_ID"), Name: "Test adapter", Version: version, ProtocolVersion: protocolVersion, Capabilities: capabilities, InputSchema: adapterproto.Schema{Fields: []adapterproto.Field{{Key: "manifest_url", Control: "text", Label: "Manifest URL", Required: true}}}, ConfigurationSchema: configurationSchema, ResourceTypes: resourceTypes, MediaTypes: []string{"hls"}}
+			descriptor := adapterproto.Descriptor{ID: os.Getenv("IR_ADAPTER_ID"), Name: "Test adapter", Version: version, ProtocolVersion: protocolVersion, Capabilities: capabilities, InputSchema: inputSchema, ConfigurationSchema: configurationSchema, ResourceTypes: resourceTypes, MediaTypes: []string{"hls"}}
 			if encoded := os.Getenv("IR_ADAPTER_BRANDING"); encoded != "" {
 				if icon, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil {
 					descriptor.Branding = &adapterproto.Branding{Icon: &adapterproto.BrandIcon{MediaType: "image/png", Data: icon}}
@@ -273,6 +280,32 @@ func runHelperAdapter() int {
 					response, _ = adapterproto.Success(request.ID, media)
 				}
 			}
+		case adapterproto.MethodWatchCheck:
+			if strings.HasPrefix(mode, "watch_error_") {
+				code := strings.TrimPrefix(mode, "watch_error_")
+				response = adapterproto.Failure(request.ID, code, "remote-message-secret-sentinel", map[string]string{"detail": "remote-details-secret-sentinel"})
+				break
+			}
+			if mode != "watch" {
+				response = adapterproto.Failure(request.ID, "unsupported_method", "unsupported", nil)
+				break
+			}
+			var params adapterproto.WatchCheckParams
+			if json.Unmarshal(request.Params, &params) != nil {
+				response = adapterproto.Failure(request.ID, "invalid_params", "invalid watch params", nil)
+				break
+			}
+			var input struct {
+				ManifestURL string `json:"manifest_url"`
+				Token       string `json:"token"`
+			}
+			_ = json.Unmarshal(params.Input, &input)
+			if input.Token != "split-watch-secret" || params.Secrets["token"] != "" || input.ManifestURL == "" {
+				response = adapterproto.Failure(request.ID, "invalid_watch_input", "invalid watch input", nil)
+				break
+			}
+			media := adapterproto.MediaSource{Type: "hls", ManifestURL: input.ManifestURL}
+			response, _ = adapterproto.Success(request.ID, adapterproto.WatchCheckResult{State: "live", SessionRef: "opaque-session", Media: &media})
 		case adapterproto.MethodRefresh:
 			if mode != "refresh" {
 				response = adapterproto.Failure(request.ID, "unsupported_method", "unsupported", nil)
@@ -1601,3 +1634,90 @@ func writeRestartingAdapter(t *testing.T, dir, id, firstMode, laterID, laterMode
 	}
 }
 func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
+
+func TestWatchCheckUsesSeparatedInputSecretAndLegacyResolveKeepsInlineSecret(t *testing.T) {
+	dir := t.TempDir()
+	writeAdapter(t, dir, binaryPrefix+"watch", "watch", "watch", true)
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	input := json.RawMessage(`{"manifest_url":"https://watch.example/live.m3u8"}`)
+	if err := host.ValidateWatchInput("watch", input, map[string]string{"token": "split-watch-secret"}, nil); err != nil {
+		t.Fatalf("valid separated Watch input rejected: %v", err)
+	}
+	result, err := host.WatchCheck(context.Background(), "watch", input, map[string]string{"token": "split-watch-secret"}, nil)
+	if err != nil {
+		t.Fatalf("WatchCheck: %v", err)
+	}
+	if result.State != "live" || result.Media == nil || result.Media.ManifestURL != "https://watch.example/live.m3u8" {
+		t.Fatalf("WatchCheck result = %#v", result)
+	}
+	if err := host.ValidateWatchInput("watch", json.RawMessage(`{"manifest_url":"https://watch.example/live.m3u8","token":"inline"}`), nil, nil); err == nil {
+		t.Fatal("Watch accepted a secret in ordinary input")
+	}
+
+	legacyInput := json.RawMessage(`{"manifest_url":"https://legacy.example/live.m3u8","token":"inline-secret"}`)
+	media, err := host.ResolveLegacy(context.Background(), "watch", legacyInput, nil)
+	if err != nil {
+		t.Fatalf("legacy Resolve rejected inline schema secret: %v", err)
+	}
+	if media.ManifestURL != "https://legacy.example/live.m3u8" {
+		t.Fatalf("legacy resolve media = %#v", media)
+	}
+}
+
+func TestWatchCheckRejectsAdapterWithoutCapability(t *testing.T) {
+	dir := t.TempDir()
+	writeAdapter(t, dir, binaryPrefix+"plain", "normal", "plain", true)
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	if _, err := host.WatchCheck(context.Background(), "plain", json.RawMessage(`{"manifest_url":"https://plain.example/live.m3u8"}`), nil, nil); err == nil || !strings.Contains(err.Error(), "does not support watch") {
+		t.Fatalf("WatchCheck without capability error = %v", err)
+	}
+}
+
+func TestWatchCheckPreservesOnlyAllowlistedProtocolErrorCodes(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		wantCode  string
+		wantTyped bool
+	}{
+		{name: "authentication", wantCode: "authentication_required", wantTyped: true},
+		{name: "interaction", wantCode: "interaction_required", wantTyped: true},
+		{name: "configuration", wantCode: "configuration_required", wantTyped: true},
+		{name: "disallowed", wantCode: "remote_failure_secret_sentinel"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			adapterID := "watch-error-" + test.name
+			writeAdapter(t, dir, binaryPrefix+adapterID, "watch_error_"+test.wantCode, adapterID, true)
+			host, err := Discover(context.Background(), dir, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer host.Close()
+
+			_, err = host.WatchCheck(context.Background(), adapterID, json.RawMessage(`{"manifest_url":"https://watch.example/live.m3u8"}`), nil, nil)
+			if err == nil || err.Error() != "adapter returned an error" {
+				t.Fatalf("WatchCheck error = %v; want stable generic message", err)
+			}
+			if strings.Contains(err.Error(), "secret-sentinel") {
+				t.Fatalf("remote error message/details leaked: %v", err)
+			}
+			var safeErr *SafeProtocolError
+			if test.wantTyped {
+				if !errors.As(err, &safeErr) || safeErr.Code != test.wantCode {
+					t.Fatalf("typed protocol error = %#v; want %q", safeErr, test.wantCode)
+				}
+			} else if errors.As(err, &safeErr) {
+				t.Fatalf("disallowed remote code escaped as typed error: %#v", safeErr)
+			}
+		})
+	}
+}

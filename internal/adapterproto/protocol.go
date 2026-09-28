@@ -33,6 +33,7 @@ const (
 	CapabilityRefresh         = "refresh"
 	CapabilityResolveWorkflow = "resolve_workflow"
 	CapabilityResourceBrowse  = "resource_browse"
+	CapabilityWatch           = "watch"
 )
 
 const (
@@ -50,6 +51,7 @@ const (
 	MethodRefresh             = "refresh"
 	MethodResourceList        = "resource.list"
 	MethodResourceSearch      = "resource.search"
+	MethodWatchCheck          = "watch.check"
 )
 
 type Request struct {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRequestResponseFramesAndStructuredError(t *testing.T) {
@@ -357,6 +358,52 @@ func TestDescriptorForwardCompatibleCapabilitiesAndResourceEdges(t *testing.T) {
 	d.Capabilities = append(d.Capabilities, "bad capability")
 	if err := d.Validate(); err == nil {
 		t.Fatal("malformed capability accepted")
+	}
+}
+
+func TestWatchCheckResultValidationAndWireShape(t *testing.T) {
+	media := MediaSource{Type: "hls", ManifestURL: "https://stream.example/live.m3u8"}
+	result := WatchCheckResult{State: "live", SessionRef: "opaque-session", Title: "Example", Media: &media}
+	if err := result.Validate([]string{"hls"}); err != nil {
+		t.Fatalf("valid live watch result rejected: %v", err)
+	}
+	wire, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(wire, &shape); err != nil {
+		t.Fatal(err)
+	}
+	for key := range map[string]bool{"state": true, "session_ref": true, "title": true, "media": true} {
+		if _, ok := shape[key]; !ok {
+			t.Errorf("watch result wire shape missing %q: %s", key, wire)
+		}
+	}
+
+	invalid := []WatchCheckResult{
+		{State: "unknown"},
+		{State: "offline", SessionRef: strings.Repeat("x", 4097)},
+		{State: "offline", SessionRef: string([]byte{0xff})},
+		{State: "offline", Media: &media},
+		{State: "live", Media: &MediaSource{Type: "hls", ManifestURL: "file:///tmp/unsafe.m3u8"}},
+		{State: "live", StartedAt: &time.Time{}},
+		{State: "offline", StateMutations: make([]StateMutation, 65)},
+	}
+	for i, candidate := range invalid {
+		if err := candidate.Validate([]string{"hls"}); err == nil {
+			t.Errorf("invalid watch result %d accepted", i)
+		}
+	}
+
+	for _, malformed := range []string{
+		`{"state":"live","started_at":"not-a-time"}`,
+		`{"state":"live","media":{"type":"unknown","manifest_url":"https://stream.example/live.m3u8"}}`,
+	} {
+		var decoded WatchCheckResult
+		if err := json.Unmarshal([]byte(malformed), &decoded); err == nil && decoded.Validate([]string{"hls"}) == nil {
+			t.Errorf("malformed watch JSON accepted: %s", malformed)
+		}
 	}
 }
 

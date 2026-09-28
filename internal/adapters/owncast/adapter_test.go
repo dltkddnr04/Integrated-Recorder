@@ -1,8 +1,15 @@
 package owncast
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 )
@@ -35,5 +42,114 @@ func TestDescribeSchemaIsGenericAndValid(t *testing.T) {
 	}
 	if d.Branding == nil || d.Branding.Icon == nil || d.Branding.Icon.MediaType != "image/png" || len(d.Branding.Icon.Data) == 0 {
 		t.Fatalf("Owncast descriptor branding = %#v", d.Branding)
+	}
+}
+
+func TestWatchCheckUsesStatusAPIAndReturnsMediaFastPath(t *testing.T) {
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s", r.Method)
+		}
+		_, _ = io.WriteString(w, `{"online":true,"lastConnectTime":"2026-09-28T01:02:03Z"}`)
+	}))
+	defer server.Close()
+	validated := ""
+	deadlineSeen := false
+	result, err := WatchCheckWith(json.RawMessage(`{"source_url":"`+server.URL+`/"}`), server.Client(), func(ctx context.Context, raw string) error {
+		validated = raw
+		_, deadlineSeen = ctx.Deadline()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seenPath != statusPath || !strings.HasSuffix(validated, statusPath) || !deadlineSeen {
+		t.Fatalf("status request path=%q validated=%q deadline=%v", seenPath, validated, deadlineSeen)
+	}
+	if result.State != "live" || result.Media == nil || result.Media.ManifestURL != server.URL+StreamPath || result.SessionRef != "2026-09-28T01:02:03Z" || result.StartedAt == nil {
+		t.Fatalf("live result = %#v", result)
+	}
+}
+
+func TestWatchCheckOfflineAndRejectsStatusErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		code int
+		body string
+		want string
+	}{
+		{name: "offline", code: http.StatusOK, body: `{"online":false}`, want: "offline"},
+		{name: "missing online", code: http.StatusOK, body: `{"streaming":false}`},
+		{name: "malformed json", code: http.StatusOK, body: `{`},
+		{name: "invalid identity", code: http.StatusOK, body: `{"online":true,"lastConnectTime":"not-a-time"}`},
+		{name: "server error", code: http.StatusServiceUnavailable, body: `{"online":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.code)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			result, err := WatchCheckWith(json.RawMessage(`{"source_url":"`+server.URL+`"}`), server.Client(), func(context.Context, string) error { return nil })
+			if test.want == "offline" {
+				if err != nil || result.State != "offline" || result.Media != nil {
+					t.Fatalf("offline result=%#v error=%v", result, err)
+				}
+				return
+			}
+			if err == nil || result.State == "offline" {
+				t.Fatalf("invalid status was treated as offline: result=%#v error=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestWatchCheckAuthenticationStatusMapsToSafeProtocolFailure(t *testing.T) {
+	for _, statusCode := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(statusCode)
+				_, _ = io.WriteString(w, "response-body-secret-sentinel")
+			}))
+			defer server.Close()
+			result, err := WatchCheckWith(json.RawMessage(`{"source_url":"`+server.URL+`"}`), server.Client(), func(context.Context, string) error { return nil })
+			if err == nil || result.State == "offline" {
+				t.Fatalf("authentication failure was treated as offline: result=%#v error=%v", result, err)
+			}
+			var checkErr *watchCheckError
+			if !errors.As(err, &checkErr) || checkErr.code != "authentication_required" {
+				t.Fatalf("WatchCheck error = %#v; want safe authentication code", err)
+			}
+			response := watchCheckFailure("request-1", err)
+			if response.Error == nil || response.Error.Code != "authentication_required" || response.Error.Message != "status check failed" || response.Error.Details != nil {
+				t.Fatalf("wire error = %#v", response.Error)
+			}
+			encoded, marshalErr := json.Marshal(response)
+			if marshalErr != nil {
+				t.Fatal(marshalErr)
+			}
+			if strings.Contains(string(encoded), "secret-sentinel") || strings.Contains(string(encoded), server.URL) {
+				t.Fatalf("authentication response leaked body or source URL: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestWatchCheckRejectsOversizedStatusBodyAndUsesBoundedValidationContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", maxStatusBytes+1))
+	}))
+	defer server.Close()
+	result, err := WatchCheckWith(json.RawMessage(`{"source_url":"`+server.URL+`"}`), server.Client(), func(ctx context.Context, _ string) error {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 9*time.Second {
+			t.Fatalf("validation context deadline missing or unbounded: %v %v", deadline, ok)
+		}
+		return nil
+	})
+	if err == nil || result.State == "offline" {
+		t.Fatalf("oversized status result=%#v error=%v", result, err)
 	}
 }
