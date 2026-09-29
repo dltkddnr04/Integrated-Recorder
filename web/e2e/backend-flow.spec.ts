@@ -17,6 +17,12 @@ type TagsWire = { tags: string[] }
 type ArchiveIndexWire = { entries: { path: string }[] }
 type RecordingPageWire = { items: RecordingListWire[] }
 type RecordingListWire = { id: string; adapter_id: string; adapter_name: string; state: string; tags: string[] }
+type StorageSettingsWire = {
+  ingest_memory: { global_buffer_bytes: number; per_recording_buffer_bytes: number; max_payload_bytes: number }
+  queue_writer: { pending_queue_capacity: number; writer_concurrency: number }
+  failure_handling: { retry_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
+  observability: { sampling_interval_ms: number; metrics_retention_ms: number }
+}
 type PreviewWire = { mode: string; state: string; available: boolean; frame_count: number; image_archive_ordinal?: number }
 type PreviewFramesWire = { state: string; available: boolean; frame_count: number; items: { archive_ordinal: number; frame_time_seconds: number; generated_at: string }[] }
 type CSPViolation = { effectiveDirective: string; violatedDirective: string; blockedURI: string; sourceFile: string }
@@ -234,6 +240,38 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   expect(staticAssetFailures).toEqual([])
   expect(unexpectedRequestFailures).toEqual([])
   expect(expectedAPIResponseFailures).toEqual([])
+})
+
+test('actual Go backend: storage ingest settings persist, show restart state, and reject invalid values', async ({ page }) => {
+  await login(page)
+  await page.goto('/settings')
+  await page.getByRole('tab', { name: '저장소' }).click()
+  await expect(page.getByRole('heading', { name: '고급 수집·저장 설정' })).toBeVisible()
+  const before = await getJSON<{ settings: { storage: StorageSettingsWire } }>(page, '/api/settings')
+  expect(before.settings.storage.observability.sampling_interval_ms).toBe(5000)
+
+  await page.getByLabel('측정 간격').fill('10')
+  await page.getByRole('button', { name: '수집·저장 설정 저장' }).click()
+  await expect(page.getByRole('status').filter({ hasText: '재시작해야 적용됩니다' })).toBeVisible()
+  await expect(page.getByTestId('effective-storage-settings').getByText('5초')).toBeVisible()
+  await expect(page.getByLabel('측정 간격')).toHaveValue('10')
+
+  const stored = await getJSON<{ settings: { storage: StorageSettingsWire }; effective_storage: StorageSettingsWire; restart_required: string[] }>(page, '/api/settings')
+  expect(stored.settings.storage.observability.sampling_interval_ms).toBe(10_000)
+  expect(stored.effective_storage.observability.sampling_interval_ms).toBe(5_000)
+  expect(stored.restart_required).toContain('storage.observability.sampling_interval_ms')
+
+  const session = await getJSON<{ csrf_token: string }>(page, '/api/auth/session')
+  const invalidStorage: StorageSettingsWire = {
+    ...stored.settings.storage,
+    ingest_memory: { ...stored.settings.storage.ingest_memory, global_buffer_bytes: 64 * 1024 * 1024, per_recording_buffer_bytes: 65 * 1024 * 1024, max_payload_bytes: 32 * 1024 * 1024 },
+  }
+  const invalid = await page.request.put('/api/settings', { headers: { 'X-CSRF-Token': session.csrf_token }, data: { storage: invalidStorage } })
+  expect(invalid.status()).toBe(400)
+  const body = await invalid.json() as { error?: unknown; message?: unknown }
+  const message = typeof body.error === 'string' ? body.error : body.message
+  expect(typeof message).toBe('string')
+  expect((message as string).length).toBeGreaterThan(0)
 })
 
 async function expectOwncastLogo(page: Page) {

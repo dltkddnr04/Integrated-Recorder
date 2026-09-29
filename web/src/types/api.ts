@@ -115,9 +115,24 @@ export type StoragePool = {
 }
 export type StorageMetricSample = { at: string; read_bytes_per_second: number; write_bytes_per_second: number; buffer_used_bytes: number; persist_queue_bytes: number }
 export type StoragePoolsResponse = { items: StoragePool[] }
-export type StorageMetricsResponse = { pool_id: string; sample_interval_seconds: number; items: StorageMetricSample[] }
+export type StorageMetricsResponse = { pool_id: string; sample_interval_ms: number; sample_interval_seconds: number; items: StorageMetricSample[] }
 export type SystemInfo = { version: string; commit: string; go_version: string; goos: string; goarch: string; started_at: string; uptime_seconds: number; export_available: boolean }
-export type SystemSettings = { settings: { ui: { theme: 'system' | 'light' | 'dark' }; integrity: { concurrency: number }; retention: { enabled: boolean; completed_after_days: number } }; restart_required: string[] }
+export type StorageSettings = {
+  ingest_memory: { global_buffer_bytes: number; per_recording_buffer_bytes: number; max_payload_bytes: number }
+  queue_writer: { pending_queue_capacity: number; writer_concurrency: number }
+  failure_handling: { retry_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
+  observability: { sampling_interval_ms: number; metrics_retention_ms: number }
+}
+export type SystemSettings = {
+  settings: {
+    ui: { theme: 'system' | 'light' | 'dark' }
+    integrity: { concurrency: number }
+    retention: { enabled: boolean; completed_after_days: number }
+    storage: StorageSettings
+  }
+  effective_storage: StorageSettings
+  restart_required: string[]
+}
 export type SearchResult = { type: 'recording' | 'adapter' | 'resource' | 'workflow'; id?: string; workflow_id?: string; adapter_id?: string; resource_type?: string; resource_id?: string; title?: string; name?: string; display_name?: string; state?: string; resource?: ResourceRef }
 export type ArchiveEntry = { kind: string; path: string; size: number; sha256?: string }
 export type RecordingEvent = { id: string; recording_id: string; type: string; at: string; count?: number; message?: string }

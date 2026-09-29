@@ -10,9 +10,9 @@ import (
 
 const (
 	PoolIDLocalPrimary  = "local-primary"
-	poolSamplePeriod    = 5 * time.Second
-	maxPoolSamples      = 17280 // bounded 24-hour window at five-second cadence
-	minCeilingSamples   = 60    // five minutes of non-idle observation
+	poolSamplePeriod    = DefaultPoolSampleInterval
+	maxPoolSamples      = int(DefaultPoolMetricsRetention / poolSamplePeriod)
+	minCeilingSamples   = 60 // five minutes of non-idle observation
 	minDirectionSamples = 20
 )
 
@@ -96,9 +96,35 @@ type telemetry struct {
 	current                       PoolThroughput
 	samples                       []PoolSample
 	ioDegraded                    bool
+	sampleInterval                time.Duration
+	retention                     time.Duration
+	maxSamples                    int
 }
 
-func newTelemetry() *telemetry { return &telemetry{samples: make([]PoolSample, 0, maxPoolSamples)} }
+func newTelemetry() *telemetry {
+	return newTelemetryWithRetention(DefaultPoolSampleInterval, DefaultPoolMetricsRetention)
+}
+
+func newTelemetryWithRetention(sampleInterval, retention time.Duration) *telemetry {
+	maxSamples := int(retention / sampleInterval)
+	return &telemetry{samples: make([]PoolSample, 0, maxSamples), sampleInterval: sampleInterval, retention: retention, maxSamples: maxSamples}
+}
+
+func (t *telemetry) configure(sampleInterval, retention time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sampleInterval = sampleInterval
+	t.retention = retention
+	t.maxSamples = int(retention / sampleInterval)
+	if cap(t.samples) < t.maxSamples {
+		grown := make([]PoolSample, len(t.samples), t.maxSamples)
+		copy(grown, t.samples)
+		t.samples = grown
+	}
+	if len(t.samples) > t.maxSamples {
+		t.samples = append([]PoolSample(nil), t.samples[len(t.samples)-t.maxSamples:]...)
+	}
+}
 
 // recordRead adds one or more completed filesystem Read calls immediately.
 // Callers pass only time spent inside those calls, never consumer wait time.
@@ -157,7 +183,7 @@ func (t *telemetry) sample(now time.Time, ingest IngestSnapshot) (PoolThroughput
 		t.lastReadBytes, t.lastWriteBytes = t.readBytes, t.writeBytes
 		t.lastReadOps, t.lastWriteOps = t.readOps, t.writeOps
 		t.lastReadNanos, t.lastWriteNanos = t.readNanos, t.writeNanos
-	} else if now.Sub(t.lastAt) >= poolSamplePeriod {
+	} else if now.Sub(t.lastAt) >= t.sampleInterval {
 		elapsed := now.Sub(t.lastAt)
 		read := delta(t.readBytes, t.lastReadBytes)
 		write := delta(t.writeBytes, t.lastWriteBytes)
@@ -169,8 +195,16 @@ func (t *telemetry) sample(now time.Time, ingest IngestSnapshot) (PoolThroughput
 			WriteLatencyMillis: meanMillis(delta(t.writeNanos, t.lastWriteNanos), writeOps),
 		}
 		t.samples = append(t.samples, PoolSample{At: now.UTC(), ReadBytesPerSecond: t.current.ReadBytesPerSecond, WriteBytesPerSecond: t.current.WriteBytesPerSecond, BufferUsedBytes: ingest.BufferUsedBytes, PersistQueueBytes: ingest.QueueBytes})
-		if len(t.samples) > maxPoolSamples {
-			t.samples = append([]PoolSample(nil), t.samples[len(t.samples)-maxPoolSamples:]...)
+		cutoff := now.Add(-t.retention)
+		first := 0
+		for first < len(t.samples) && t.samples[first].At.Before(cutoff) {
+			first++
+		}
+		if first > 0 {
+			t.samples = append([]PoolSample(nil), t.samples[first:]...)
+		}
+		if len(t.samples) > t.maxSamples {
+			t.samples = append([]PoolSample(nil), t.samples[len(t.samples)-t.maxSamples:]...)
 		}
 		t.lastAt = now
 		t.lastReadBytes, t.lastWriteBytes = t.readBytes, t.writeBytes

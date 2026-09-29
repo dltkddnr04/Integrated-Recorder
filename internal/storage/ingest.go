@@ -23,7 +23,14 @@ const (
 	// arrays while a maximum-sized payload grows from 256 MiB to 512 MiB.
 	DefaultIngestPerRecordingBytes int64 = 768 << 20
 	DefaultIngestWriters                 = 1
-	defaultPersistAttempts               = 5
+	DefaultPersistAttempts               = 5
+	DefaultRetryInitialBackoff           = 100 * time.Millisecond
+	DefaultRetryMaxBackoff               = 800 * time.Millisecond
+	DefaultPoolSampleInterval            = 5 * time.Second
+	DefaultPoolMetricsRetention          = 24 * time.Hour
+	MaxIngestGlobalBytes           int64 = 2 << 30
+	MaxIngestPerRecordingBytes     int64 = 1536 << 20
+	MaxIngestPayloadBytes          int64 = 1 << 30
 )
 
 var (
@@ -41,10 +48,69 @@ type IngestOptions struct {
 	Writers           int
 	PersistAttempts   int
 	RetryBase         time.Duration
+	RetryMaxBackoff   time.Duration
+	SampleInterval    time.Duration
+	MetricsRetention  time.Duration
 }
 
 func DefaultIngestOptions() IngestOptions {
-	return IngestOptions{QueueObjects: MaxIngestObjects, GlobalBytes: DefaultIngestGlobalBytes, PerRecordingBytes: DefaultIngestPerRecordingBytes, MaxPayloadBytes: DefaultMaxIngestPayloadBytes, Writers: DefaultIngestWriters, PersistAttempts: defaultPersistAttempts, RetryBase: 100 * time.Millisecond}
+	return IngestOptions{
+		QueueObjects: MaxIngestObjects, GlobalBytes: DefaultIngestGlobalBytes,
+		PerRecordingBytes: DefaultIngestPerRecordingBytes, MaxPayloadBytes: DefaultMaxIngestPayloadBytes,
+		Writers: DefaultIngestWriters, PersistAttempts: DefaultPersistAttempts,
+		RetryBase: DefaultRetryInitialBackoff, RetryMaxBackoff: DefaultRetryMaxBackoff,
+		SampleInterval: DefaultPoolSampleInterval, MetricsRetention: DefaultPoolMetricsRetention,
+	}
+}
+
+// ValidateIngestOptions applies public operational bounds. The byte ceilings
+// are twice the current production defaults, permitting one step of capacity
+// tuning while capping volatile payload memory at 2 GiB process-wide, 1.5 GiB
+// per recording, and 1 GiB per source object. Per-recording/global budgets
+// must also admit the largest transient old+new slice allocation used by
+// ReadPayload.
+func ValidateIngestOptions(options IngestOptions) error {
+	if options.GlobalBytes <= 0 || options.GlobalBytes > MaxIngestGlobalBytes {
+		return errors.New("global buffer limit must be greater than zero and at most 2 GiB")
+	}
+	if options.PerRecordingBytes <= 0 || options.PerRecordingBytes > MaxIngestPerRecordingBytes {
+		return errors.New("per-recording buffer limit must be greater than zero and at most 1536 MiB")
+	}
+	if options.MaxPayloadBytes <= 0 || options.MaxPayloadBytes > MaxIngestPayloadBytes {
+		return errors.New("maximum payload size must be greater than zero and at most 1 GiB")
+	}
+	if options.PerRecordingBytes > options.GlobalBytes {
+		return errors.New("per-recording buffer limit cannot exceed the global buffer limit")
+	}
+	if options.MaxPayloadBytes > options.PerRecordingBytes {
+		return errors.New("maximum payload size cannot exceed the per-recording buffer limit")
+	}
+	peak := maxReallocationPeak(options.MaxPayloadBytes)
+	if options.GlobalBytes < peak || options.PerRecordingBytes < peak {
+		return errors.New("global and per-recording buffer limits must each fit the maximum payload's temporary reallocation peak")
+	}
+	if options.QueueObjects < 1 || options.QueueObjects > MaxIngestObjects {
+		return errors.New("pending storage queue capacity must be between 1 and 128 objects")
+	}
+	if options.Writers != 1 {
+		return errors.New("writer concurrency must be 1 to preserve canonical commit ordering")
+	}
+	if options.PersistAttempts < 1 || options.PersistAttempts > 10 {
+		return errors.New("storage retry attempts must be between 1 and 10")
+	}
+	if options.RetryBase < 10*time.Millisecond || options.RetryBase > 30*time.Second {
+		return errors.New("initial storage retry backoff must be between 10 ms and 30 s")
+	}
+	if options.RetryMaxBackoff < options.RetryBase || options.RetryMaxBackoff > 5*time.Minute {
+		return errors.New("maximum storage retry backoff must be at least the initial backoff and at most 5 minutes")
+	}
+	if options.SampleInterval < time.Second || options.SampleInterval > time.Hour {
+		return errors.New("storage metrics sampling interval must be between 1 s and 1 hour")
+	}
+	if options.MetricsRetention < options.SampleInterval || options.MetricsRetention > 24*time.Hour {
+		return errors.New("storage metrics retention must be at least the sampling interval and at most 24 hours")
+	}
+	return nil
 }
 
 type IngestSnapshot struct {
@@ -160,9 +226,20 @@ func NewIngestService(store *Store, options IngestOptions) (*IngestService, erro
 	if options.RetryBase <= 0 {
 		options.RetryBase = defaults.RetryBase
 	}
-	peakReallocationBytes := maxReallocationPeak(options.MaxPayloadBytes)
-	if options.QueueObjects > MaxIngestObjects || options.QueueObjects < 1 || options.MaxPayloadBytes <= 0 || options.GlobalBytes < peakReallocationBytes || options.PerRecordingBytes < peakReallocationBytes || options.PerRecordingBytes > options.GlobalBytes || options.Writers > options.QueueObjects {
+	if options.RetryMaxBackoff <= 0 {
+		options.RetryMaxBackoff = defaults.RetryMaxBackoff
+	}
+	if options.SampleInterval <= 0 {
+		options.SampleInterval = defaults.SampleInterval
+	}
+	if options.MetricsRetention <= 0 {
+		options.MetricsRetention = defaults.MetricsRetention
+	}
+	if err := ValidateIngestOptions(options); err != nil || options.Writers > options.QueueObjects {
 		return nil, errors.New("invalid bounded ingest configuration")
+	}
+	if backend, ok := store.StorageBackend.(*LocalFilesystemBackend); ok {
+		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
 	}
 	s := &IngestService{store: store, options: options, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]bool{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{})}
 	for i := 0; i < options.Writers; i++ {
@@ -563,11 +640,25 @@ func (s *IngestService) persistWithRetry(job *ingestJob) (PayloadResult, error) 
 		if attempt+1 == s.options.PersistAttempts {
 			break
 		}
-		delay := s.options.RetryBase << attempt
+		delay := retryBackoff(s.options.RetryBase, s.options.RetryMaxBackoff, attempt)
 		timer := time.NewTimer(delay)
 		<-timer.C
 	}
 	return PayloadResult{}, errors.New("canonical storage commit failed after bounded retries")
+}
+
+func retryBackoff(initial, maximum time.Duration, retryIndex int) time.Duration {
+	delay := initial
+	for i := 0; i < retryIndex && delay < maximum; i++ {
+		if delay > maximum/2 {
+			return maximum
+		}
+		delay *= 2
+	}
+	if delay > maximum {
+		return maximum
+	}
+	return delay
 }
 
 func (s *IngestService) Snapshot() IngestSnapshot {
@@ -584,6 +675,15 @@ func (s *IngestService) Snapshot() IngestSnapshot {
 		oldest = time.Since(oldestQueued).Seconds()
 	}
 	return IngestSnapshot{BufferCapacityBytes: s.options.GlobalBytes, PerRecordingCapacityBytes: s.options.PerRecordingBytes, BufferUsedBytes: s.usedBytes, ReservedBytes: s.reservedGlobal, QueueObjects: s.queuedObjects, QueueBytes: s.queuedBytes, OldestPersistAgeSeconds: oldest, ActiveWriters: s.activeWriters, WriterConcurrency: s.options.Writers, StorageErrorsTotal: s.storageErrors}
+}
+
+// Options returns the immutable runtime options used when this service was
+// constructed. Settings edits do not resize a running service.
+func (s *IngestService) Options() IngestOptions {
+	if s == nil {
+		return DefaultIngestOptions()
+	}
+	return s.options
 }
 
 // PoolMetrics joins the local backend observations with volatile ingest state
@@ -604,7 +704,7 @@ func (s *IngestService) PoolMetrics() PoolSnapshot {
 
 func (s *IngestService) sampleLoop() {
 	defer close(s.samplerDone)
-	ticker := time.NewTicker(poolSamplePeriod)
+	ticker := time.NewTicker(s.options.SampleInterval)
 	defer ticker.Stop()
 	s.runSampler(ticker.C, s.samplerStop)
 }

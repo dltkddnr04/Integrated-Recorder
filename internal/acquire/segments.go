@@ -950,7 +950,7 @@ func (s *segmentScheduler) persistSegment(segment domain.Segment, initDependency
 	}
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
-	result, err := s.manager.store.SavePayload(recordingID(s.e), segment.StoragePath, bytes.NewReader(data), maxPayloadBytes)
+	result, err := s.manager.store.SavePayload(recordingID(s.e), segment.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
 	if err != nil {
 		return storage.PayloadResult{}, err
 	}
@@ -1163,7 +1163,7 @@ func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, m
 		}
 		s.commitMu.Lock()
 		defer s.commitMu.Unlock()
-		result, persistErr := s.manager.store.SavePayload(recording.ID, asset.StoragePath, bytes.NewReader(data), maxPayloadBytes)
+		result, persistErr := s.manager.store.SavePayload(recording.ID, asset.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
 		if persistErr != nil {
 			return storage.PayloadResult{}, persistErr
 		}

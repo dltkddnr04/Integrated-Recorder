@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/authn"
@@ -18,6 +19,11 @@ func TestStoragePoolAPIProjectsOnlyBoundedRecorderMetrics(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.New(root)
 	if err != nil {
+		t.Fatal(err)
+	}
+	options := storage.DefaultIngestOptions()
+	options.SampleInterval = 7 * time.Second
+	if err := store.ConfigureIngestOptions(options); err != nil {
 		t.Fatal(err)
 	}
 	manager, err := acquire.NewManager(store, nil, nil, nil)
@@ -58,7 +64,7 @@ func TestStoragePoolAPIProjectsOnlyBoundedRecorderMetrics(t *testing.T) {
 	if err := json.Unmarshal(metrics.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if response.PoolID != storage.PoolIDLocalPrimary || response.SampleIntervalSeconds != 5 || response.Items == nil {
+	if response.PoolID != storage.PoolIDLocalPrimary || response.SampleIntervalSeconds != 7 || response.SampleIntervalMS != 7000 || response.Items == nil {
 		t.Fatalf("metrics response=%+v", response)
 	}
 	if strings.Contains(metrics.Body.String(), root) {

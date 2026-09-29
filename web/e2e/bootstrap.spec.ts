@@ -1,5 +1,15 @@
 import { expect, test } from '@playwright/test'
 
+const storageSettings = {
+  ingest_memory: { global_buffer_bytes: 1073741824, per_recording_buffer_bytes: 805306368, max_payload_bytes: 536870912 },
+  queue_writer: { pending_queue_capacity: 128, writer_concurrency: 1 },
+  failure_handling: { retry_attempts: 5, retry_initial_backoff_ms: 100, retry_max_backoff_ms: 800 },
+  observability: { sampling_interval_ms: 5000, metrics_retention_ms: 86400000 },
+}
+function settingsResponse() {
+  return { settings: { ui: { theme: 'light' as const }, integrity: { concurrency: 1 }, retention: { enabled: false, completed_after_days: 30 }, storage: structuredClone(storageSettings) }, effective_storage: structuredClone(storageSettings), restart_required: [] }
+}
+
 test('first-run setup sends bootstrap token and password through authenticated API flow', async ({ page }) => {
   let bootstrapped = false
   let csrfHeader = ''
@@ -28,7 +38,7 @@ test('first-run setup sends bootstrap token and password through authenticated A
   await page.route('**/api/notifications', route => route.fulfill({ json: { items: [] } }))
   await page.route('**/api/resolve-workflows', route => route.fulfill({ json: [] }))
   await page.route('**/api/adapters', route => route.fulfill({ json: [] }))
-  await page.route('**/api/settings', route => route.fulfill({ json: { settings: { ui: { theme: 'light' }, integrity: { concurrency: 1 }, retention: { enabled: false, completed_after_days: 30 } }, restart_required: [] } }))
+  await page.route('**/api/settings', route => route.fulfill({ json: settingsResponse() }))
   await page.route('**/api/system/storage', route => route.fulfill({ json: { filesystem_total_bytes: 0, filesystem_used_bytes: 0, filesystem_available_bytes: 0, recordings_bytes: 0, recording_count: 0, segment_count: 0, init_segment_count: 0, manifest_count: 0 } }))
   await page.goto('/login?mode=bootstrap')
   await expect(page.getByText('/data/bootstrap-token')).toBeVisible()
@@ -81,7 +91,7 @@ test('administrator can log in, use the application, and log out', async ({ page
     } else if (path === '/api/notifications') {
       await route.fulfill({ json: { items: [] } })
     } else if (path === '/api/settings') {
-      await route.fulfill({ json: { settings: { ui: { theme: 'light' }, integrity: { concurrency: 1 }, retention: { enabled: false, completed_after_days: 30 } }, restart_required: [] } })
+      await route.fulfill({ json: settingsResponse() })
     } else {
       await route.fulfill({ status: 404, json: { error: 'unexpected test request' } })
     }

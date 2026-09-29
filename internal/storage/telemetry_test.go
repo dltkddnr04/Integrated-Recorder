@@ -77,6 +77,58 @@ func TestTelemetrySamplesAreBoundedAndCarryQueueState(t *testing.T) {
 	}
 }
 
+func TestTelemetryUsesConfiguredCadenceAndRetention(t *testing.T) {
+	telemetry := newTelemetryWithRetention(time.Second, 2*time.Second)
+	start := time.Now().UTC()
+	telemetry.sample(start, IngestSnapshot{})
+	telemetry.recordWrite(100, time.Millisecond)
+	_, _, samples := telemetry.sample(start.Add(500*time.Millisecond), IngestSnapshot{})
+	if len(samples) != 0 {
+		t.Fatalf("sample was recorded before configured interval: %d", len(samples))
+	}
+	for _, offset := range []time.Duration{time.Second, 2 * time.Second, 3 * time.Second} {
+		telemetry.sample(start.Add(offset), IngestSnapshot{})
+	}
+	_, _, samples = telemetry.sample(start.Add(3*time.Second), IngestSnapshot{})
+	if len(samples) != 2 {
+		t.Fatalf("retained samples = %d, want bounded configured window of 2", len(samples))
+	}
+	for _, sample := range samples {
+		if !sample.At.After(start.Add(time.Second)) {
+			t.Fatalf("sample outside configured retention remained: %s", sample.At)
+		}
+	}
+	if telemetry.maxSamples != 2 {
+		t.Fatalf("max samples = %d, want 2", telemetry.maxSamples)
+	}
+}
+
+func TestDirectIngestConstructorConfiguresTelemetry(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultIngestOptions()
+	options.SampleInterval = 2 * time.Second
+	options.MetricsRetention = 10 * time.Second
+	service, err := NewIngestService(store, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := store.StorageBackend.(*LocalFilesystemBackend)
+	backend.telemetry.mu.Lock()
+	interval, retention, maxSamples := backend.telemetry.sampleInterval, backend.telemetry.retention, backend.telemetry.maxSamples
+	backend.telemetry.mu.Unlock()
+	if interval != options.SampleInterval || retention != options.MetricsRetention || maxSamples != 5 {
+		t.Fatalf("configured telemetry = interval %s retention %s max %d", interval, retention, maxSamples)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestIngestSamplesWithoutPoolMetricsRequests(t *testing.T) {
 	store, err := New(t.TempDir())
 	if err != nil {

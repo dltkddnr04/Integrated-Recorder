@@ -16,10 +16,17 @@ func newSmallIngest(t *testing.T, attempts int) *IngestService {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewIngestService(store, IngestOptions{
-		QueueObjects: 2, GlobalBytes: 16, PerRecordingBytes: 8,
-		MaxPayloadBytes: 8, Writers: 1, PersistAttempts: attempts, RetryBase: time.Millisecond,
-	})
+	options := DefaultIngestOptions()
+	options.QueueObjects = 2
+	options.GlobalBytes = 16
+	options.PerRecordingBytes = 8
+	options.MaxPayloadBytes = 8
+	options.PersistAttempts = attempts
+	options.RetryBase = 10 * time.Millisecond
+	if err := store.ConfigureIngestOptions(options); err != nil {
+		t.Fatal(err)
+	}
+	service, err := store.IngestService()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +150,79 @@ func TestIngestOptionsRequireMaximumReallocationPeak(t *testing.T) {
 	}
 }
 
+func TestStoreIngestOptionsApplyBeforeConstructionAndCannotResizeService(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultIngestOptions()
+	options.QueueObjects = 4
+	options.GlobalBytes = 8 << 20
+	options.PerRecordingBytes = 8 << 20
+	options.MaxPayloadBytes = 4 << 20
+	options.SampleInterval = time.Second
+	options.MetricsRetention = 2 * time.Second
+	if err := store.ConfigureIngestOptions(options); err != nil {
+		t.Fatal(err)
+	}
+	service, err := store.IngestService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := service.Options(); got != options {
+		t.Fatalf("service options = %#v, want %#v", got, options)
+	}
+	if cap(service.jobs) != options.QueueObjects {
+		t.Fatalf("persist queue capacity = %d, want configured %d", cap(service.jobs), options.QueueObjects)
+	}
+	if err := store.ConfigureIngestOptions(DefaultIngestOptions()); err == nil {
+		t.Fatal("reconfiguring after service construction succeeded")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIngestUsesConfiguredMaximumPayloadAndSaturatingRetryBackoff(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultIngestOptions()
+	options.MaxPayloadBytes = 256 << 10
+	options.GlobalBytes = 768 << 10
+	options.PerRecordingBytes = 768 << 10
+	options.RetryBase = 10 * time.Millisecond
+	options.RetryMaxBackoff = 25 * time.Millisecond
+	if err := store.ConfigureIngestOptions(options); err != nil {
+		t.Fatal(err)
+	}
+	service, err := store.IngestService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := service.Close(ctx); err != nil {
+			t.Errorf("close ingest service: %v", err)
+		}
+	}()
+	if _, err := service.ReadPayload(context.Background(), "limited", bytes.NewReader([]byte("too large")), options.MaxPayloadBytes+1, -1, 0); !errors.Is(err, ErrIngestTooLarge) {
+		t.Fatalf("ReadPayload above configured max = %v", err)
+	}
+	for _, test := range []struct {
+		index int
+		want  time.Duration
+	}{{0, 10 * time.Millisecond}, {1, 20 * time.Millisecond}, {2, 25 * time.Millisecond}, {3, 25 * time.Millisecond}, {1000, 25 * time.Millisecond}} {
+		if got := retryBackoff(options.RetryBase, options.RetryMaxBackoff, test.index); got != test.want {
+			t.Errorf("retryBackoff(index=%d) = %s, want %s", test.index, got, test.want)
+		}
+	}
+}
+
 func TestCapacityFromBlocksRejectsInvalidAndOverflowingStatfs(t *testing.T) {
 	got, ok := capacityFromBlocks(10, 3, 2, 4096)
 	if !ok || got.TotalBytes != 40960 || got.UsedBytes != 28672 || got.AvailableBytes != 8192 {
@@ -174,7 +254,7 @@ func TestKnownSmallHintsAllowFourSameRecordingCaptures(t *testing.T) {
 		QueueObjects: 4, GlobalBytes: DefaultIngestGlobalBytes,
 		PerRecordingBytes: DefaultIngestPerRecordingBytes,
 		MaxPayloadBytes:   DefaultMaxIngestPayloadBytes, Writers: 1,
-		PersistAttempts: 1, RetryBase: time.Millisecond,
+		PersistAttempts: 1, RetryBase: 10 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)

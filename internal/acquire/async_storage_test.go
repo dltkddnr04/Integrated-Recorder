@@ -140,13 +140,20 @@ func TestStorageRetryReusesFetchedBytesWithoutNetworkRedownload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	options := storage.DefaultIngestOptions()
+	options.PersistAttempts = 3
+	options.RetryBase = 10 * time.Millisecond
+	options.RetryMaxBackoff = 10 * time.Millisecond
+	if err := store.ConfigureIngestOptions(options); err != nil {
+		t.Fatal(err)
+	}
 	manager, err := NewManager(store, server.Client(), emptyResolver{}, func(context.Context, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
 	var attempts atomic.Int32
 	manager.storageWriteFailureHook = func() error {
-		if attempts.Add(1) == 1 {
+		if attempts.Add(1) < 3 {
 			return errors.New("temporary storage failure")
 		}
 		return nil
@@ -164,8 +171,8 @@ func TestStorageRetryReusesFetchedBytesWithoutNetworkRedownload(t *testing.T) {
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("network segment fetch count=%d after storage retry, want 1", got)
 	}
-	if attempts.Load() < 2 {
-		t.Fatalf("storage hook attempts=%d, want retry", attempts.Load())
+	if attempts.Load() != int32(options.PersistAttempts) {
+		t.Fatalf("storage hook attempts=%d, want configured attempt count %d", attempts.Load(), options.PersistAttempts)
 	}
 	if _, err = manager.Stop(recording.ID); err != nil {
 		t.Fatal(err)

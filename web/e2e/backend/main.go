@@ -98,6 +98,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	settings, err := systemsettings.Open(dataDir)
+	if err != nil {
+		return err
+	}
+	startupSettings := settings.Current()
+	if err = store.ConfigureIngestOptions(startupSettings.Storage.IngestOptions()); err != nil {
+		return err
+	}
 	configStore, secretStore, stateStore, err := pluginconfig.NewTypedFileStoresAndState(dataDir)
 	if err != nil {
 		return err
@@ -123,12 +131,6 @@ func run() error {
 		return err
 	}
 	products, err := management.Open(dataDir)
-	if err != nil {
-		_ = manager.Close(context.Background())
-		adapters.Close()
-		return err
-	}
-	settings, err := systemsettings.Open(dataDir)
 	if err != nil {
 		_ = manager.Close(context.Background())
 		adapters.Close()
@@ -186,7 +188,7 @@ func run() error {
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Management: products, Integrity: integrityService, Derivatives: exportService,
 		Previews: previewService, Watches: watchService,
-		Auth: auth, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(),
+		Auth: auth, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage,
 		StartedAt: time.Now().UTC(), Version: "browser-e2e", Commit: "test-fixture",
 	})
 

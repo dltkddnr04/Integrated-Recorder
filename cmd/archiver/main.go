@@ -55,6 +55,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initialize storage: %w", err)
 	}
+	settings, err := systemsettings.Open(dataDir)
+	if err != nil {
+		return fmt.Errorf("initialize system settings: %w", err)
+	}
+	startupSettings := settings.Current()
+	if err := store.ConfigureIngestOptions(startupSettings.Storage.IngestOptions()); err != nil {
+		return fmt.Errorf("configure storage ingest: %w", err)
+	}
 	configStore, secretStore, stateStore, err := pluginconfig.NewTypedFileStoresAndState(dataDir)
 	if err != nil {
 		return fmt.Errorf("initialize plugin settings: %w", err)
@@ -90,12 +98,6 @@ func run() error {
 				return fmt.Errorf("apply adapter preference: %w", setErr)
 			}
 		}
-	}
-	settings, err := systemsettings.Open(dataDir)
-	if err != nil {
-		_ = manager.Close(context.Background())
-		adapters.Close()
-		return fmt.Errorf("initialize system settings: %w", err)
 	}
 	integrityService, err := integrity.Open(dataDir, store, settings.IntegrityConcurrency())
 	if err != nil {
@@ -175,7 +177,7 @@ func run() error {
 	version := buildVersion
 	commit := buildCommit
 
-	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: settings.IntegrityConcurrency(), ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
+	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage, ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
 	httpServer := &http.Server{Addr: addr, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

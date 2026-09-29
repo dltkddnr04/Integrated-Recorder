@@ -45,6 +45,7 @@ type Server struct {
 	watches                     *watch.Service
 	auth                        *authn.Service
 	settings                    *systemsettings.Store
+	effectiveStorage            systemsettings.StorageSettings
 	logs                        *applog.Store
 	initialIntegrityConcurrency int
 	forceSecureCookie           bool
@@ -71,6 +72,7 @@ type Options struct {
 	Settings                    *systemsettings.Store
 	Logs                        *applog.Store
 	InitialIntegrityConcurrency int
+	InitialStorageSettings      *systemsettings.StorageSettings
 	ForceSecureCookies          bool
 	StartedAt                   time.Time
 	Version                     string
@@ -112,7 +114,13 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	if logs == nil {
 		logs = applog.NewStore()
 	}
-	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
+	effectiveStorage := systemsettings.StorageSettings{}
+	if options.InitialStorageSettings != nil {
+		effectiveStorage = *options.InitialStorageSettings
+	} else if options.Settings != nil {
+		effectiveStorage = options.Settings.Current().Storage
+	}
+	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)

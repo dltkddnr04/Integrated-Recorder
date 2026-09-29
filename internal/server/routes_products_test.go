@@ -472,6 +472,9 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"theme":"system"`) || !strings.Contains(get.Body.String(), `"concurrency":2`) {
 		t.Fatalf("settings get=%d %s", get.Code, get.Body.String())
 	}
+	if !strings.Contains(get.Body.String(), `"effective_storage"`) || !strings.Contains(get.Body.String(), `"global_buffer_bytes":1073741824`) {
+		t.Fatalf("settings get did not return effective storage defaults: %s", get.Body.String())
+	}
 
 	update := httptest.NewRecorder()
 	handler.ServeHTTP(update, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"ui":{"theme":"dark"},"integrity":{"concurrency":3}}`)))
@@ -480,6 +483,39 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 	}
 	if current := settings.Current(); current.UI.Theme != "dark" || current.Integrity.Concurrency != 3 {
 		t.Fatalf("settings were not persisted: %+v", current)
+	}
+
+	storageSettings := settings.Current().Storage
+	storageSettings.Observability.SamplingIntervalMS = 10000
+	storageBody, err := json.Marshal(map[string]any{"storage": storageSettings})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageUpdate := httptest.NewRecorder()
+	handler.ServeHTTP(storageUpdate, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(storageBody)))
+	wantRestart := `"restart_required":["integrity.concurrency","storage.observability.sampling_interval_ms"]`
+	if storageUpdate.Code != http.StatusOK || !strings.Contains(storageUpdate.Body.String(), wantRestart) || !strings.Contains(storageUpdate.Body.String(), `"sampling_interval_ms":10000`) {
+		t.Fatalf("storage settings update=%d %s", storageUpdate.Code, storageUpdate.Body.String())
+	}
+
+	// Returning a changed value to the startup snapshot clears its individual
+	// restart marker while unrelated integrity restart state remains.
+	storageSettings = settings.Current().Storage
+	storageSettings.Observability.SamplingIntervalMS = 5000
+	storageBody, _ = json.Marshal(map[string]any{"storage": storageSettings})
+	revert := httptest.NewRecorder()
+	handler.ServeHTTP(revert, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(storageBody)))
+	if revert.Code != http.StatusOK || strings.Contains(revert.Body.String(), "storage.observability.sampling_interval_ms") {
+		t.Fatalf("reverted storage setting remained restart-required: %d %s", revert.Code, revert.Body.String())
+	}
+
+	invalidStorage := settings.Current().Storage
+	invalidStorage.QueueWriter.WriterConcurrency = 2
+	invalidBody, _ := json.Marshal(map[string]any{"storage": invalidStorage})
+	invalidStorageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidStorageResponse, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(invalidBody)))
+	if invalidStorageResponse.Code != http.StatusBadRequest || !strings.Contains(invalidStorageResponse.Body.String(), "writer concurrency must be 1") || strings.Contains(invalidStorageResponse.Body.String(), `"writer_concurrency":2`) {
+		t.Fatalf("invalid storage settings response=%d %s", invalidStorageResponse.Code, invalidStorageResponse.Body.String())
 	}
 
 	invalid := httptest.NewRecorder()

@@ -65,9 +65,10 @@ type StorageBackend interface {
 // rather than the local filesystem implementation.
 type Store struct {
 	StorageBackend
-	root     string // internal/test compatibility only; never part of API models
-	ingestMu sync.RWMutex
-	ingest   *IngestService
+	root          string // internal/test compatibility only; never part of API models
+	ingestMu      sync.RWMutex
+	ingest        *IngestService
+	ingestOptions IngestOptions
 }
 
 // LocalFilesystemBackend owns physical filesystem paths and crash-safe local
@@ -105,7 +106,7 @@ func New(root string) (*Store, error) {
 	}
 	backend := &LocalFilesystemBackend{root: abs}
 	backend.telemetry = newTelemetry()
-	return &Store{StorageBackend: backend, root: abs}, nil
+	return &Store{StorageBackend: backend, root: abs, ingestOptions: DefaultIngestOptions()}, nil
 }
 
 func (s *Store) Root() string { return s.root }
@@ -136,12 +137,49 @@ func (s *Store) IngestService() (*IngestService, error) {
 	if s.ingest != nil {
 		return s.ingest, nil
 	}
-	service, err := NewIngestService(s, DefaultIngestOptions())
+	service, err := NewIngestService(s, s.ingestOptions)
 	if err != nil {
 		return nil, err
 	}
 	s.ingest = service
 	return service, nil
+}
+
+// ConfigureIngestOptions sets fixed-lifetime ingest limits before the lazy
+// service is created. A running queue/buffer cannot be resized safely.
+func (s *Store) ConfigureIngestOptions(options IngestOptions) error {
+	if err := ValidateIngestOptions(options); err != nil {
+		return err
+	}
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if s.ingest != nil {
+		return errors.New("ingest service is already constructed; restart required")
+	}
+	s.ingestOptions = options
+	if backend, ok := s.StorageBackend.(*LocalFilesystemBackend); ok {
+		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
+	}
+	return nil
+}
+
+// IngestOptions returns the running service's immutable options, or the
+// configured startup options before the service is constructed.
+func (s *Store) IngestOptions() IngestOptions {
+	s.ingestMu.RLock()
+	defer s.ingestMu.RUnlock()
+	if s.ingest != nil {
+		return s.ingest.Options()
+	}
+	return s.ingestOptions
+}
+
+func (s *Store) MetricsSamplingInterval() time.Duration {
+	return s.IngestOptions().SampleInterval
+}
+
+func (s *Store) MetricsRetention() time.Duration {
+	return s.IngestOptions().MetricsRetention
 }
 
 // PoolMetrics returns one coherent local-primary pool snapshot, including the
@@ -156,11 +194,12 @@ func (s *Store) PoolMetrics() PoolSnapshot {
 	return s.StorageBackend.PoolMetrics()
 }
 
-// PoolMetricsWindow returns bounded in-memory samples from at most the most
-// recent 24 hours. The current snapshot is always included.
+// PoolMetricsWindow returns bounded in-memory samples from at most the
+// configured retention window. The current snapshot is always included.
 func (s *Store) PoolMetricsWindow(window time.Duration) PoolSnapshot {
-	if window <= 0 || window > 24*time.Hour {
-		window = 24 * time.Hour
+	retention := s.MetricsRetention()
+	if window <= 0 || window > retention {
+		window = retention
 	}
 	pool := s.PoolMetrics()
 	cutoff := time.Now().Add(-window)

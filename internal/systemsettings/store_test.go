@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -14,7 +15,7 @@ func TestOpenDefaultsAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Settings{UI: UISettings{Theme: "system"}, Integrity: IntegritySettings{Concurrency: 2}, Retention: RetentionSettings{Enabled: false, CompletedAfterDays: 30}}
+	want := defaultSettings()
 	if got := store.Current(); got != want {
 		t.Fatalf("Current() = %#v, want %#v", got, want)
 	}
@@ -41,7 +42,9 @@ func TestUpdatePersistsAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Settings{UI: UISettings{Theme: "dark"}, Integrity: IntegritySettings{Concurrency: 4}, Retention: RetentionSettings{Enabled: false, CompletedAfterDays: 30}}
+	want := defaultSettings()
+	want.UI.Theme = "dark"
+	want.Integrity.Concurrency = 4
 	if got != want {
 		t.Fatalf("Update() = %#v, want %#v", got, want)
 	}
@@ -102,6 +105,9 @@ func TestOpenBackfillsRetentionDefaultsForExistingSettings(t *testing.T) {
 	if got := store.Current().Retention; got != want {
 		t.Fatalf("existing settings retention = %#v, want %#v", got, want)
 	}
+	if got := store.Current().Storage; got != defaultStorageSettings() {
+		t.Fatalf("existing settings storage defaults = %#v", got)
+	}
 	if _, err := store.Update(Patch{RetentionEnabled: ptr(true)}); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +117,83 @@ func TestOpenBackfillsRetentionDefaultsForExistingSettings(t *testing.T) {
 	}
 	if got := reloaded.Current().Retention; got != (RetentionSettings{Enabled: true, CompletedAfterDays: 30}) {
 		t.Fatalf("retention after partial update/reload = %#v", got)
+	}
+}
+
+func TestStorageSettingsDefaultsPersistAndReload(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := defaultStorageSettings()
+	if defaults.IngestMemory.GlobalBufferBytes != 1<<30 || defaults.IngestMemory.PerRecordingBufferBytes != 768<<20 || defaults.IngestMemory.MaxPayloadBytes != 512<<20 || defaults.QueueWriter.PendingQueueCapacity != 128 || defaults.QueueWriter.WriterConcurrency != 1 || defaults.FailureHandling.RetryAttempts != 5 || defaults.FailureHandling.RetryInitialBackoffMS != 100 || defaults.FailureHandling.RetryMaxBackoffMS != 800 || defaults.Observability.SamplingIntervalMS != 5000 || defaults.Observability.MetricsRetentionMS != 86400000 {
+		t.Fatalf("storage defaults changed: %#v", defaults)
+	}
+	updated := defaults
+	updated.IngestMemory.GlobalBufferBytes = 1536 << 20
+	updated.IngestMemory.PerRecordingBufferBytes = 1024 << 20
+	updated.IngestMemory.MaxPayloadBytes = 512 << 20
+	updated.Observability.SamplingIntervalMS = 10000
+	updated.Observability.MetricsRetentionMS = 3600000
+	if _, err = store.Update(Patch{Storage: &updated}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Current().Storage; got != updated {
+		t.Fatalf("reloaded storage settings = %#v, want %#v", got, updated)
+	}
+}
+
+func TestStorageSettingsRejectInvalidLimits(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := defaultStorageSettings()
+	for _, test := range []struct {
+		name   string
+		change func(*StorageSettings)
+		want   string
+	}{
+		{"per-recording above global", func(s *StorageSettings) {
+			s.IngestMemory.PerRecordingBufferBytes = s.IngestMemory.GlobalBufferBytes + 1
+		}, "per-recording"},
+		{"payload above per-recording", func(s *StorageSettings) { s.IngestMemory.MaxPayloadBytes = 800 << 20 }, "maximum payload size cannot exceed"},
+		{"reallocation peak", func(s *StorageSettings) {
+			s.IngestMemory.GlobalBufferBytes, s.IngestMemory.PerRecordingBufferBytes, s.IngestMemory.MaxPayloadBytes = 300<<10, 300<<10, 256<<10
+		}, "reallocation peak"},
+		{"zero global", func(s *StorageSettings) { s.IngestMemory.GlobalBufferBytes = 0 }, "global buffer"},
+		{"negative max payload", func(s *StorageSettings) { s.IngestMemory.MaxPayloadBytes = -1 }, "maximum payload"},
+		{"too large global", func(s *StorageSettings) { s.IngestMemory.GlobalBufferBytes = 3 << 30 }, "at most 2 GiB"},
+		{"too large payload", func(s *StorageSettings) { s.IngestMemory.MaxPayloadBytes = 2 << 30 }, "at most 1 GiB"},
+		{"zero queue", func(s *StorageSettings) { s.QueueWriter.PendingQueueCapacity = 0 }, "queue capacity"},
+		{"queue too large", func(s *StorageSettings) { s.QueueWriter.PendingQueueCapacity = 129 }, "queue capacity"},
+		{"writer concurrency", func(s *StorageSettings) { s.QueueWriter.WriterConcurrency = 2 }, "writer concurrency"},
+		{"retry attempts", func(s *StorageSettings) { s.FailureHandling.RetryAttempts = 11 }, "retry attempts"},
+		{"negative retry", func(s *StorageSettings) { s.FailureHandling.RetryAttempts = -1 }, "retry attempts"},
+		{"initial backoff", func(s *StorageSettings) { s.FailureHandling.RetryInitialBackoffMS = 1 }, "initial storage retry"},
+		{"overflowing duration", func(s *StorageSettings) { s.FailureHandling.RetryInitialBackoffMS = int64(^uint64(0) >> 1) }, "initial storage retry"},
+		{"max below initial", func(s *StorageSettings) { s.FailureHandling.RetryMaxBackoffMS = 99 }, "maximum storage retry"},
+		{"sampling interval", func(s *StorageSettings) { s.Observability.SamplingIntervalMS = 0 }, "sampling interval"},
+		{"retention below sampling", func(s *StorageSettings) { s.Observability.MetricsRetentionMS = 4999 }, "retention"},
+		{"retention too large", func(s *StorageSettings) { s.Observability.MetricsRetentionMS = 86400001 }, "retention"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := base
+			test.change(&candidate)
+			before := store.Current()
+			_, updateErr := store.Update(Patch{Storage: &candidate})
+			if !errors.Is(updateErr, ErrInvalidSettings) || !strings.Contains(updateErr.Error(), test.want) {
+				t.Fatalf("Update() error = %v, want invalid settings mentioning %q", updateErr, test.want)
+			}
+			if got := store.Current(); got != before {
+				t.Fatalf("invalid storage settings changed current settings")
+			}
+		})
 	}
 }
 

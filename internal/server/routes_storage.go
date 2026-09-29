@@ -63,6 +63,7 @@ type storageWritersView struct {
 type storageMetricsResponse struct {
 	PoolID                string                `json:"pool_id"`
 	SampleIntervalSeconds int                   `json:"sample_interval_seconds"`
+	SampleIntervalMS      int64                 `json:"sample_interval_ms"`
 	Items                 []storageMetricSample `json:"items"`
 }
 
@@ -93,7 +94,7 @@ func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "storage_pool_not_found"})
 		return
 	}
-	window, interval, ok := storageMetricsWindow(r.URL.Query().Get("window"))
+	window, _, ok := storageMetricsWindow(r.URL.Query().Get("window"))
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_storage_metrics_window"})
 		return
@@ -107,7 +108,9 @@ func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
 			BufferUsedBytes:     sample.BufferUsedBytes, PersistQueueBytes: sample.PersistQueueBytes,
 		})
 	}
-	writeJSON(w, http.StatusOK, storageMetricsResponse{PoolID: poolID, SampleIntervalSeconds: interval, Items: items})
+	configuredInterval := s.manager.Store().MetricsSamplingInterval()
+	intervalSeconds := int((configuredInterval + time.Second - 1) / time.Second)
+	writeJSON(w, http.StatusOK, storageMetricsResponse{PoolID: poolID, SampleIntervalSeconds: intervalSeconds, SampleIntervalMS: configuredInterval.Milliseconds(), Items: items})
 }
 
 func storageMetricsWindow(value string) (time.Duration, int, bool) {

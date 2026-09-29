@@ -12,6 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 const (
@@ -33,6 +36,39 @@ type Settings struct {
 	UI        UISettings        `json:"ui"`
 	Integrity IntegritySettings `json:"integrity"`
 	Retention RetentionSettings `json:"retention"`
+	Storage   StorageSettings   `json:"storage"`
+}
+
+// StorageSettings contains operational limits for volatile ingest and
+// recorder-originated storage metrics. It is management state, never archive
+// metadata. Values use stable byte, count, and millisecond units.
+type StorageSettings struct {
+	IngestMemory    IngestMemorySettings    `json:"ingest_memory"`
+	QueueWriter     QueueWriterSettings     `json:"queue_writer"`
+	FailureHandling FailureHandlingSettings `json:"failure_handling"`
+	Observability   ObservabilitySettings   `json:"observability"`
+}
+
+type IngestMemorySettings struct {
+	GlobalBufferBytes       int64 `json:"global_buffer_bytes"`
+	PerRecordingBufferBytes int64 `json:"per_recording_buffer_bytes"`
+	MaxPayloadBytes         int64 `json:"max_payload_bytes"`
+}
+
+type QueueWriterSettings struct {
+	PendingQueueCapacity int `json:"pending_queue_capacity"`
+	WriterConcurrency    int `json:"writer_concurrency"`
+}
+
+type FailureHandlingSettings struct {
+	RetryAttempts         int   `json:"retry_attempts"`
+	RetryInitialBackoffMS int64 `json:"retry_initial_backoff_ms"`
+	RetryMaxBackoffMS     int64 `json:"retry_max_backoff_ms"`
+}
+
+type ObservabilitySettings struct {
+	SamplingIntervalMS int64 `json:"sampling_interval_ms"`
+	MetricsRetentionMS int64 `json:"metrics_retention_ms"`
 }
 
 type UISettings struct {
@@ -52,10 +88,11 @@ type RetentionSettings struct {
 
 // Patch updates only the fields provided by the caller.
 type Patch struct {
-	UITheme              *string `json:"ui_theme,omitempty"`
-	IntegrityConcurrency *int    `json:"integrity_concurrency,omitempty"`
-	RetentionEnabled     *bool   `json:"retention_enabled,omitempty"`
-	RetentionAfterDays   *int    `json:"retention_completed_after_days,omitempty"`
+	UITheme              *string          `json:"ui_theme,omitempty"`
+	IntegrityConcurrency *int             `json:"integrity_concurrency,omitempty"`
+	RetentionEnabled     *bool            `json:"retention_enabled,omitempty"`
+	RetentionAfterDays   *int             `json:"retention_completed_after_days,omitempty"`
+	Storage              *StorageSettings `json:"storage,omitempty"`
 }
 
 // Store serializes updates and publishes a new in-memory snapshot only after
@@ -85,15 +122,7 @@ func Open(dataRoot string) (*Store, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, settingsFilename)
-	store := &Store{
-		path:      path,
-		directory: dir,
-		settings: Settings{
-			UI:        UISettings{Theme: defaultTheme},
-			Integrity: IntegritySettings{Concurrency: defaultConcurrency},
-			Retention: RetentionSettings{Enabled: false, CompletedAfterDays: defaultRetentionDays},
-		},
-	}
+	store := &Store{path: path, directory: dir, settings: defaultSettings()}
 
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -139,6 +168,24 @@ func (s *Store) IntegrityConcurrency() int {
 	return s.settings.Integrity.Concurrency
 }
 
+// IngestOptions converts persisted storage settings into runtime configuration.
+// Callers apply it before constructing the acquisition manager because queue,
+// buffer, and sampler structures are fixed for that service lifetime.
+func (settings StorageSettings) IngestOptions() storage.IngestOptions {
+	return storage.IngestOptions{
+		QueueObjects:      settings.QueueWriter.PendingQueueCapacity,
+		GlobalBytes:       settings.IngestMemory.GlobalBufferBytes,
+		PerRecordingBytes: settings.IngestMemory.PerRecordingBufferBytes,
+		MaxPayloadBytes:   settings.IngestMemory.MaxPayloadBytes,
+		Writers:           settings.QueueWriter.WriterConcurrency,
+		PersistAttempts:   settings.FailureHandling.RetryAttempts,
+		RetryBase:         time.Duration(settings.FailureHandling.RetryInitialBackoffMS) * time.Millisecond,
+		RetryMaxBackoff:   time.Duration(settings.FailureHandling.RetryMaxBackoffMS) * time.Millisecond,
+		SampleInterval:    time.Duration(settings.Observability.SamplingIntervalMS) * time.Millisecond,
+		MetricsRetention:  time.Duration(settings.Observability.MetricsRetentionMS) * time.Millisecond,
+	}
+}
+
 // Update validates and persists a partial settings update atomically.
 func (s *Store) Update(patch Patch) (Settings, error) {
 	s.mu.Lock()
@@ -156,6 +203,9 @@ func (s *Store) Update(patch Patch) (Settings, error) {
 	}
 	if patch.RetentionAfterDays != nil {
 		candidate.Retention.CompletedAfterDays = *patch.RetentionAfterDays
+	}
+	if patch.Storage != nil {
+		candidate.Storage = *patch.Storage
 	}
 	if err := validate(candidate); err != nil {
 		return s.settings, err
@@ -179,15 +229,62 @@ func validate(settings Settings) error {
 	if settings.Retention.CompletedAfterDays < 1 || settings.Retention.CompletedAfterDays > 3650 {
 		return fmt.Errorf("%w: retention age is out of range", ErrInvalidSettings)
 	}
+	// Validate persisted millisecond values before converting them to
+	// time.Duration; multiplication by time.Millisecond can overflow int64.
+	storageSettings := settings.Storage
+	if storageSettings.FailureHandling.RetryInitialBackoffMS < 10 || storageSettings.FailureHandling.RetryInitialBackoffMS > 30_000 {
+		return fmt.Errorf("%w: initial storage retry backoff must be between 10 ms and 30 s", ErrInvalidSettings)
+	}
+	if storageSettings.FailureHandling.RetryMaxBackoffMS < storageSettings.FailureHandling.RetryInitialBackoffMS || storageSettings.FailureHandling.RetryMaxBackoffMS > 300_000 {
+		return fmt.Errorf("%w: maximum storage retry backoff must be at least the initial backoff and at most 5 minutes", ErrInvalidSettings)
+	}
+	if storageSettings.Observability.SamplingIntervalMS < 1_000 || storageSettings.Observability.SamplingIntervalMS > 3_600_000 {
+		return fmt.Errorf("%w: storage metrics sampling interval must be between 1 s and 1 hour", ErrInvalidSettings)
+	}
+	if storageSettings.Observability.MetricsRetentionMS < storageSettings.Observability.SamplingIntervalMS || storageSettings.Observability.MetricsRetentionMS > 86_400_000 {
+		return fmt.Errorf("%w: storage metrics retention must be at least the sampling interval and at most 24 hours", ErrInvalidSettings)
+	}
+	if err := storage.ValidateIngestOptions(settings.Storage.IngestOptions()); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSettings, err)
+	}
 	return nil
 }
 
-func readSettings(path string) (Settings, error) {
-	settings := Settings{
+func defaultStorageSettings() StorageSettings {
+	options := storage.DefaultIngestOptions()
+	return StorageSettings{
+		IngestMemory: IngestMemorySettings{
+			GlobalBufferBytes:       options.GlobalBytes,
+			PerRecordingBufferBytes: options.PerRecordingBytes,
+			MaxPayloadBytes:         options.MaxPayloadBytes,
+		},
+		QueueWriter: QueueWriterSettings{
+			PendingQueueCapacity: options.QueueObjects,
+			WriterConcurrency:    options.Writers,
+		},
+		FailureHandling: FailureHandlingSettings{
+			RetryAttempts:         options.PersistAttempts,
+			RetryInitialBackoffMS: options.RetryBase.Milliseconds(),
+			RetryMaxBackoffMS:     options.RetryMaxBackoff.Milliseconds(),
+		},
+		Observability: ObservabilitySettings{
+			SamplingIntervalMS: options.SampleInterval.Milliseconds(),
+			MetricsRetentionMS: options.MetricsRetention.Milliseconds(),
+		},
+	}
+}
+
+func defaultSettings() Settings {
+	return Settings{
 		UI:        UISettings{Theme: defaultTheme},
 		Integrity: IntegritySettings{Concurrency: defaultConcurrency},
 		Retention: RetentionSettings{Enabled: false, CompletedAfterDays: defaultRetentionDays},
+		Storage:   defaultStorageSettings(),
 	}
+}
+
+func readSettings(path string) (Settings, error) {
+	settings := defaultSettings()
 	f, err := os.Open(path)
 	if err != nil {
 		return settings, fmt.Errorf("open system settings: %w", err)

@@ -23,7 +23,6 @@ import (
 )
 
 const (
-	maxPayloadBytes  = int64(512 << 20)
 	manifestAttempts = 3
 	segmentAttempts  = 3
 	maxRefreshCycles = 3
@@ -633,6 +632,7 @@ func (m *Manager) acquireMediaBuffered(ctx context.Context, e *entry, source hls
 }
 
 func (m *Manager) downloadObjectBufferedOnceAtGeneration(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64) (*storage.IngestPayload, error) {
+	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return nil, newFetchError("segment", 0, false, false)
 	}
@@ -724,6 +724,7 @@ func (m *Manager) downloadObjectAttemptsAtGeneration(ctx context.Context, uri st
 }
 
 func (m *Manager) downloadObjectAttemptsInternal(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, attempts int, generationEntry *entry, expectedGeneration uint64) (storage.PayloadResult, error) {
+	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return storage.PayloadResult{}, fmt.Errorf("byte range is invalid or exceeds the %d byte payload limit", maxPayloadBytes)
 	}
