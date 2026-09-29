@@ -234,15 +234,18 @@ func copyVerified(ctx context.Context, store *storage.Store, id, relative, name 
 	if expectedSize <= 0 || expectedSize > maxContextBytes || len(expectedHash) != 64 {
 		return ErrInvalid
 	}
-	f, err := store.OpenPayload(id, relative)
+	info, err := store.StatPayload(id, relative)
+	if err != nil {
+		return err
+	}
+	if !info.Regular || info.Size != expectedSize {
+		return ErrInvalid
+	}
+	f, err := store.OpenPayloadReader(id, relative)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
-		return ErrInvalid
-	}
 	dst, err := os.OpenFile(filepath.Join(directory, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err

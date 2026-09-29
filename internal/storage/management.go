@@ -84,7 +84,7 @@ type archiveReference struct {
 
 // ArchiveIndex lists only recording.json and files directly referenced by its
 // canonical media metadata. Unreferenced files are deliberately omitted.
-func (s *Store) ArchiveIndex(recording *domain.Recording) ([]ArchiveEntry, error) {
+func (s *LocalFilesystemBackend) ArchiveIndex(recording *domain.Recording) ([]ArchiveEntry, error) {
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return nil, errors.New("invalid recording")
 	}
@@ -150,7 +150,7 @@ func (s *Store) ArchiveIndex(recording *domain.Recording) ([]ArchiveEntry, error
 // recording directory. It does not require every canonical reference to
 // exist, so management queries can still report a degraded archive's size.
 // Symlinks and non-regular objects fail closed instead of being followed.
-func (s *Store) RecordingDirectoryBytes(recordingID string) (int64, error) {
+func (s *LocalFilesystemBackend) RecordingDirectoryBytes(recordingID string) (int64, error) {
 	if !recordingIDPattern.MatchString(recordingID) {
 		return 0, errors.New("invalid recording id")
 	}
@@ -191,13 +191,13 @@ func (s *Store) RecordingDirectoryBytes(recordingID string) (int64, error) {
 
 // VerifyRecording streams each canonical payload through SHA-256 using bounded
 // memory. It does not mutate the recording document or payloads.
-func (s *Store) VerifyRecording(recording *domain.Recording) IntegrityResult {
+func (s *LocalFilesystemBackend) VerifyRecording(recording *domain.Recording) IntegrityResult {
 	return s.VerifyRecordingContext(context.Background(), recording)
 }
 
 // VerifyRecordingContext streams canonical objects through SHA-256 while
 // honoring cancellation between reads and object boundaries.
-func (s *Store) VerifyRecordingContext(ctx context.Context, recording *domain.Recording) IntegrityResult {
+func (s *LocalFilesystemBackend) VerifyRecordingContext(ctx context.Context, recording *domain.Recording) IntegrityResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -237,7 +237,7 @@ func (s *Store) VerifyRecordingContext(ctx context.Context, recording *domain.Re
 			result.Issues = append(result.Issues, IntegrityIssue{Code: "invalid_integrity_metadata", Path: safePath})
 			return
 		}
-		file, openErr := s.openArchiveFile(recording.ID, path)
+		file, openErr := s.OpenPayloadReader(recording.ID, path)
 		if openErr != nil {
 			if errors.Is(openErr, os.ErrNotExist) {
 				result.ObjectsMissing++
@@ -313,7 +313,7 @@ func (r contextReader) Read(buffer []byte) (int, error) {
 
 // StorageStats returns canonical object counts and physical bytes below the
 // recordings directory. Symlinks are counted neither as files nor traversed.
-func (s *Store) StorageStats() (StorageStats, error) {
+func (s *LocalFilesystemBackend) StorageStats() (StorageStats, error) {
 	stats := StorageStats{ArchiveRoot: s.root}
 	var fs syscall.Statfs_t
 	if err := syscall.Statfs(s.root, &fs); err != nil {
@@ -396,7 +396,7 @@ func (s *Store) StorageStats() (StorageStats, error) {
 // DeleteRecordingData atomically hides a recording by renaming its directory
 // to a random tombstone before removing it. Calls for an already absent ID are
 // successful, making retries idempotent.
-func (s *Store) DeleteRecordingData(id string) error {
+func (s *LocalFilesystemBackend) DeleteRecordingData(id string) error {
 	if !recordingIDPattern.MatchString(id) {
 		return errors.New("invalid recording id")
 	}
@@ -488,7 +488,7 @@ func removeDeletionTombstones(base, recordingID string) error {
 	return nil
 }
 
-func (s *Store) readCanonicalRecording(id string) (*domain.Recording, error) {
+func (s *LocalFilesystemBackend) readCanonicalRecording(id string) (*domain.Recording, error) {
 	file, err := s.openArchiveFile(id, "recording.json")
 	if err != nil {
 		return nil, err
@@ -504,7 +504,7 @@ func (s *Store) readCanonicalRecording(id string) (*domain.Recording, error) {
 	return &recording, nil
 }
 
-func (s *Store) archiveFileInfo(id, relative string) (os.FileInfo, error) {
+func (s *LocalFilesystemBackend) archiveFileInfo(id, relative string) (os.FileInfo, error) {
 	_, err := s.safePath(id, relative)
 	if err != nil || !canonicalRelativePath(relative) {
 		return nil, errors.New("invalid archive path")
@@ -548,7 +548,7 @@ func (s *Store) archiveFileInfo(id, relative string) (os.FileInfo, error) {
 	return openedInfo, nil
 }
 
-func (s *Store) openArchiveFile(id, relative string) (*os.File, error) {
+func (s *LocalFilesystemBackend) openArchiveFile(id, relative string) (*os.File, error) {
 	if _, err := s.archiveFileInfo(id, relative); err != nil {
 		return nil, err
 	}

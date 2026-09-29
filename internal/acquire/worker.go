@@ -138,6 +138,60 @@ func fetchManifest(ctx context.Context, client *http.Client, uri string, headers
 	return nil, last
 }
 
+// fetchManifestBuffered keeps complete manifest bodies under the same bounded
+// volatile ingest budget as media objects. The caller owns the returned
+// payload until it queues the snapshot projection or releases it.
+func fetchManifestBuffered(ctx context.Context, client *http.Client, ingest *storage.IngestService, recordingID, uri string, headers map[string]string, manifestURL string, policy *adapterproto.RequestPolicy) (*storage.IngestPayload, error) {
+	var last *FetchError
+	for attempt := 0; attempt < manifestAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
+		if err != nil {
+			return nil, newFetchError("manifest", 0, false, false)
+		}
+		request.Header.Set("Accept", "application/vnd.apple.mpegurl, application/x-mpegURL, */*")
+		response, err := doMediaRequest(client, request, headers, manifestURL, policy)
+		if err == nil {
+			if response.StatusCode != http.StatusOK {
+				status := response.StatusCode
+				response.Body.Close()
+				last = newFetchError("manifest", status, isRetryableStatus(status), true)
+			} else if hasNonIdentityContentEncoding(response.Header) {
+				response.Body.Close()
+				return nil, newFetchError("manifest", 0, false, false)
+			} else if response.ContentLength > hls.MaxManifestBytes {
+				response.Body.Close()
+				return nil, newFetchError("manifest", 0, false, false)
+			} else {
+				payload, readErr := ingest.ReadPayload(ctx, recordingID, response.Body, hls.MaxManifestBytes, -1, response.ContentLength)
+				_ = response.Body.Close()
+				if readErr == nil {
+					return payload, nil
+				}
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				last = newFetchError("manifest", 0, !errors.Is(readErr, storage.ErrIngestTooLarge) && !errors.Is(readErr, storage.ErrIngestClosed), false)
+			}
+		} else {
+			last = newFetchError("manifest", 0, true, false)
+		}
+		if last != nil && last.Retryable && attempt+1 < manifestAttempts {
+			if err = retryWait(ctx, attempt); err != nil {
+				return nil, err
+			}
+		} else {
+			break
+		}
+	}
+	if last == nil {
+		last = newFetchError("manifest", 0, false, false)
+	}
+	return nil, last
+}
+
 func (m *Manager) process(e *entry, ctx context.Context, playlist hls.MediaPlaylist) (bool, error) {
 	return m.processWithScheduler(e, ctx, playlist, true)
 }
@@ -261,20 +315,31 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	if len(playlist.Segments) == 0 {
 		return true, nil
 	}
+	scheduler := activeScheduler(e)
 	var protectedByEpoch map[uint64]map[uint64]bool
-	if scheduler := activeScheduler(e); scheduler != nil {
+	if scheduler != nil {
 		protectedByEpoch = scheduler.protectedByEpoch()
 	}
+	e.persistMu.Lock()
+	persistLocked := true
+	defer func() {
+		if persistLocked {
+			e.persistMu.Unlock()
+		}
+	}()
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.mediaGeneration != generation {
+	if e.deleted || e.mediaGeneration != generation {
+		e.mu.Unlock()
 		return false, nil
 	}
 	r := clone(e.recording)
+	e.mu.Unlock()
 	if r == nil {
+		e.mu.Lock()
 		if e.terminalErr == nil {
 			e.terminalErr = errors.New("recording state persistence failed")
 		}
+		e.mu.Unlock()
 		return false, errors.New("recording state could not be copied")
 	}
 	if err := func() error {
@@ -395,39 +460,70 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 	}(); err != nil {
 		return false, err
 	}
-	if err := m.store.SaveRecording(r); err != nil {
-		if e.terminalErr == nil {
-			e.terminalErr = errors.New("recording metadata persistence failed")
+	e.mu.Lock()
+	if e.deleted || e.mediaGeneration != generation {
+		e.mu.Unlock()
+		return false, nil
+	}
+	asyncCommit := scheduler != nil && !scheduler.directMode
+	if asyncCommit {
+		// Publish only the in-memory observation before discovery. The queued
+		// writer persists the latest root projection after any earlier segment
+		// commit, keeping the network poller independent from filesystem latency.
+		e.recording = r
+		e.mu.Unlock()
+		e.persistMu.Unlock()
+		persistLocked = false
+		if err := scheduler.queueRecordingCommit(); err != nil {
+			return false, err
 		}
+		return true, nil
+	}
+	e.mu.Unlock()
+	if err := m.store.SaveRecording(r); err != nil {
 		return false, errors.New("recording metadata persistence failed")
 	}
+	e.mu.Lock()
+	if e.deleted || e.mediaGeneration != generation {
+		e.mu.Unlock()
+		return false, nil
+	}
 	e.recording = r
+	e.mu.Unlock()
 	return true, nil
 }
 
 func (m *Manager) updateAtMediaGeneration(e *entry, generation uint64, fn func(*domain.Recording) error) (bool, error) {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.mediaGeneration != generation {
+	if e.deleted || e.mediaGeneration != generation {
+		e.mu.Unlock()
 		return false, nil
 	}
 	next := clone(e.recording)
+	e.mu.Unlock()
 	if next == nil {
+		e.mu.Lock()
 		if e.terminalErr == nil {
 			e.terminalErr = errors.New("recording state persistence failed")
 		}
+		e.mu.Unlock()
 		return false, errors.New("recording state could not be copied")
 	}
 	if err := fn(next); err != nil {
 		return false, err
 	}
 	if err := m.store.SaveRecording(next); err != nil {
-		if e.terminalErr == nil {
-			e.terminalErr = errors.New("recording metadata persistence failed")
-		}
 		return false, errors.New("recording metadata persistence failed")
 	}
+	e.mu.Lock()
+	if e.deleted || e.mediaGeneration != generation {
+		e.mu.Unlock()
+		return false, nil
+	}
 	e.recording = next
+	e.mu.Unlock()
 	return true, nil
 }
 
@@ -520,6 +616,80 @@ func (m *Manager) acquireMediaOnce(ctx context.Context, e *entry, source hls.Med
 		return m.downloadObjectOnceAtGeneration(ctx, uri, byteRange, recordingID, relative, media, e, expectedGeneration)
 	}
 	return m.acquireMediaUsing(ctx, e, source, epoch, ordinal, initID, firstInEpoch, media, download)
+}
+
+// acquireMediaBuffered fetches source bytes into the bounded volatile ingest
+// buffer. It deliberately performs no archive write; the scheduler submits
+// the completed payload to the independent storage writer.
+func (m *Manager) acquireMediaBuffered(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, media adapterproto.MediaSource, expectedGeneration uint64) (domain.Segment, *storage.IngestPayload, error) {
+	recordingID := recordingID(e)
+	relative := fmt.Sprintf("tracks/main/%020d%s", ordinal, extensionFor(source.URI))
+	payload, err := m.downloadObjectBufferedOnceAtGeneration(ctx, source.URI, source.ByteRange, recordingID, media, e, expectedGeneration)
+	if err != nil {
+		return domain.Segment{}, nil, err
+	}
+	segment := domain.Segment{ID: fmt.Sprintf("seg-%020d", ordinal), TrackID: "main", Sequence: source.Sequence, SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence, ArchiveOrdinal: ordinal, SourceURI: source.URI, Duration: source.Duration, ProgramDateTime: source.ProgramTime, InitSegmentID: initID, ByteRange: cloneRange(source.ByteRange), Discontinuity: source.Discontinuity, StoragePath: relative}
+	return segment, payload, nil
+}
+
+func (m *Manager) downloadObjectBufferedOnceAtGeneration(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64) (*storage.IngestPayload, error) {
+	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
+		return nil, newFetchError("segment", 0, false, false)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
+	if err != nil {
+		return nil, newFetchError("segment", 0, false, false)
+	}
+	if byteRange != nil {
+		end := byteRange.Offset + byteRange.Length - 1
+		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange.Offset, end))
+	}
+	response, err := doMediaRequestAtGeneration(m.client, request, media.Headers, media.ManifestURL, media.RequestPolicy, e, expectedGeneration, m.fetchBoundaryHook)
+	if err != nil {
+		if errors.Is(err, errStaleMediaGeneration) {
+			return nil, errStaleMediaGeneration
+		}
+		return nil, newFetchError("segment", 0, true, false)
+	}
+	expectedStatus := http.StatusOK
+	expectedSize := int64(-1)
+	if byteRange != nil {
+		expectedStatus = http.StatusPartialContent
+		expectedSize = int64(byteRange.Length)
+	}
+	if response.StatusCode != expectedStatus {
+		status := response.StatusCode
+		response.Body.Close()
+		return nil, newFetchError("segment", status, isRetryableStatus(status), true)
+	}
+	if hasNonIdentityContentEncoding(response.Header) {
+		response.Body.Close()
+		return nil, newFetchError("segment", 0, false, false)
+	}
+	if byteRange != nil {
+		if err = validateContentRange(response.Header.Get("Content-Range"), *byteRange); err != nil {
+			response.Body.Close()
+			return nil, newFetchError("segment", response.StatusCode, false, false)
+		}
+	}
+	if response.ContentLength > maxPayloadBytes {
+		response.Body.Close()
+		return nil, newFetchError("segment", 0, false, false)
+	}
+	reservationHint := response.ContentLength
+	if byteRange != nil {
+		reservationHint = expectedSize
+	}
+	payload, readErr := m.ingest.ReadPayload(ctx, recordingID, response.Body, maxPayloadBytes, expectedSize, reservationHint)
+	_ = response.Body.Close()
+	if readErr != nil {
+		if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
+			return nil, readErr
+		}
+		retryable := !errors.Is(readErr, storage.ErrIngestTooLarge)
+		return nil, newFetchError("segment", 0, retryable, false)
+	}
+	return payload, nil
 }
 
 func (m *Manager) acquireMediaUsing(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, firstInEpoch bool, media adapterproto.MediaSource, download func(context.Context, string, *domain.ByteRange, string, string, adapterproto.MediaSource) (storage.PayloadResult, error)) (domain.Segment, error) {
@@ -674,7 +844,7 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			}
 			return nil
 		}); err != nil {
-			m.setTerminalError(e, errors.New("recording could not be stopped durably"))
+			m.setTerminalError(e, err)
 		}
 	}()
 
@@ -718,9 +888,16 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 		}
 
 		fetchGeneration := generation
-		body, err := fetchManifest(ctx, m.client, selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
+		manifestPayload, err := fetchManifestBuffered(ctx, m.client, m.ingest, recordingID(e), selectedURL, media.Headers, media.ManifestURL, media.RequestPolicy)
+		var body []byte
+		if manifestPayload != nil {
+			body = manifestPayload.Bytes()
+		}
 		latestMedia, currentGeneration := currentMediaVersion(e)
 		if currentGeneration != fetchGeneration {
+			if manifestPayload != nil {
+				manifestPayload.Release()
+			}
 			// Another segment worker refreshed the source while this manifest
 			// request was in flight. Neither a stale successful body nor its
 			// stale fetch error may affect snapshots, discovery, or refresh policy.
@@ -763,42 +940,75 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			m.fail(e, err)
 			return
 		}
-		if err = m.saveSnapshot(e, "main", selectedURL, body); err != nil {
-			m.fail(e, err)
-			return
-		}
 		if firstPlaylist && hls.IsMasterPlaylist(body) {
 			master, parseErr := hlsParseMaster(body, selectedURL)
 			if parseErr != nil {
+				if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					m.fail(e, err)
+					return
+				}
+				body = nil
 				m.fail(e, parseErr)
 				return
 			}
 			variant, selectErr := selectVariant(master)
 			if selectErr != nil {
+				if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					m.fail(e, err)
+					return
+				}
+				body = nil
 				m.fail(e, selectErr)
 				return
 			}
-			selectedURL = variant.URI
-			if err = m.update(e, func(r *domain.Recording) error {
+			variantURL := variant.URI
+			if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, func(r *domain.Recording) error {
 				t := r.Tracks["main"]
 				if t == nil {
 					return errors.New("main track is missing")
 				}
-				t.SourcePlaylistURL = selectedURL
+				t.SourcePlaylistURL = variantURL
 				t.Bandwidth = variant.Bandwidth
 				return nil
 			}); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				m.fail(e, err)
 				return
 			}
+			body = nil
+			selectedURL = variantURL
 			continue
 		}
 		firstPlaylist = false
 		playlist, err := hlsParseMedia(body, selectedURL)
 		if err != nil {
+			if queueErr := scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); queueErr != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				m.fail(e, queueErr)
+				return
+			}
+			body = nil
 			m.fail(e, err)
 			return
 		}
+		if err = scheduler.queueSnapshot(fetchGeneration, "main", selectedURL, manifestPayload, nil); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			m.fail(e, err)
+			return
+		}
+		body = nil
 		done, err := m.processWithSchedulerGeneration(e, ctx, playlist, false, fetchGeneration)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -931,12 +1141,20 @@ func (m *Manager) refreshMediaAtGeneration(ctx context.Context, e *entry, curren
 		}
 	}
 	copy := cloneMediaSource(candidate)
+	e.persistMu.Lock()
 	e.mu.Lock()
+	if e.deleted || e.mediaGeneration != expectedGeneration {
+		latest, generation := cloneMediaSource(e.media), e.mediaGeneration
+		e.mu.Unlock()
+		e.persistMu.Unlock()
+		return latest, generation, nil
+	}
 	e.media = copy
 	e.mediaGeneration++
 	generation := e.mediaGeneration
 	scheduler := e.scheduler
 	e.mu.Unlock()
+	e.persistMu.Unlock()
 	if scheduler != nil {
 		scheduler.noteMediaGeneration(generation)
 	}

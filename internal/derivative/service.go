@@ -654,7 +654,7 @@ func (s *Service) prepareInputs(ctx context.Context, recording *domain.Recording
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		file, err := s.store.OpenPayload(recording.ID, object.Path)
+		file, err := s.store.OpenPayloadReader(recording.ID, object.Path)
 		if err != nil {
 			return nil, err
 		}

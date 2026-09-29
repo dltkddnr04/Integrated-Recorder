@@ -1027,21 +1027,19 @@ func liveDiscontinuityBefore(recording *domain.Recording, trackID string, segmen
 func (s *Server) livePayloadsAvailable(recording *domain.Recording, track *domain.Track, segments []domain.Segment) bool {
 	store := s.manager.Store()
 	for _, segment := range segments {
-		file, err := store.OpenPayload(recording.ID, segment.StoragePath)
-		if err != nil {
+		info, err := store.StatPayload(recording.ID, segment.StoragePath)
+		if err != nil || !info.Regular || info.Size != segment.PayloadSize {
 			return false
 		}
-		_ = file.Close()
 		if segment.InitSegmentID != "" {
 			init, ok := findInit(track, segment.InitSegmentID)
 			if !ok {
 				return false
 			}
-			file, err := store.OpenPayload(recording.ID, init.StoragePath)
-			if err != nil {
+			info, err := store.StatPayload(recording.ID, init.StoragePath)
+			if err != nil || !info.Regular || info.Size != init.PayloadSize {
 				return false
 			}
-			_ = file.Close()
 		}
 	}
 	return true
@@ -1066,21 +1064,19 @@ func (s *Server) playableTrackPayloadsAvailable(recording *domain.Recording, tra
 		return false
 	}
 	for _, segment := range track.Segments {
-		file, err := store.OpenPayload(recording.ID, segment.StoragePath)
-		if err != nil {
+		info, err := store.StatPayload(recording.ID, segment.StoragePath)
+		if err != nil || !info.Regular || info.Size != segment.PayloadSize {
 			return false
 		}
-		_ = file.Close()
 		if segment.InitSegmentID != "" {
 			init, ok := findInit(track, segment.InitSegmentID)
 			if !ok {
 				return false
 			}
-			file, err := store.OpenPayload(recording.ID, init.StoragePath)
-			if err != nil {
+			info, err := store.StatPayload(recording.ID, init.StoragePath)
+			if err != nil || !info.Regular || info.Size != init.PayloadSize {
 				return false
 			}
-			_ = file.Close()
 		}
 	}
 	return true
@@ -1116,7 +1112,7 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := s.manager.Store().OpenPayload(recording.ID, found.StoragePath)
+	f, err := s.manager.Store().OpenPayloadReader(recording.ID, found.StoragePath)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "stored payload is unavailable")
 		return

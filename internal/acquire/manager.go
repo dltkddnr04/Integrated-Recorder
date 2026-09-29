@@ -40,8 +40,12 @@ type RefreshPreparer interface {
 type SourceValidator func(context.Context, string) error
 
 type entry struct {
+	// persistMu serializes durable root-document writes and archive deletion.
+	// Callers always acquire it before mu, and never hold mu across storage I/O.
+	persistMu       sync.Mutex
 	mu              sync.Mutex
 	recording       *domain.Recording
+	deleted         bool
 	cancel          context.CancelFunc
 	done            chan struct{}
 	media           adapterproto.MediaSource
@@ -55,6 +59,7 @@ type entry struct {
 
 type Manager struct {
 	store      *storage.Store
+	ingest     *storage.IngestService
 	client     *http.Client
 	resolver   Resolver
 	validate   SourceValidator
@@ -68,6 +73,18 @@ type Manager struct {
 	// fetchBoundaryHook is a deterministic test seam for scheduler-owned
 	// generation checks. It is configured before recording goroutines start.
 	fetchBoundaryHook func(uri string)
+	// storageWriteHook is a deterministic test seam used to block asynchronous
+	// canonical writes without coupling HTTP body reads to filesystem latency.
+	storageWriteHook func()
+	// storageSnapshotWriteHook is a deterministic test seam for manifest
+	// snapshot persistence; production leaves it nil.
+	storageSnapshotWriteHook func()
+	// storageMetadataWriteHook blocks queued root metadata writes in deterministic
+	// storage-delay tests. Production leaves it nil.
+	storageMetadataWriteHook func()
+	// storageWriteFailureHook injects deterministic persistence failures for
+	// retry/no-redownload tests. Production leaves it nil.
+	storageWriteFailureHook func() error
 }
 
 var errManagerClosed = errors.New("recording manager is closed")
@@ -94,10 +111,14 @@ func NewManager(store *storage.Store, client *http.Client, resolver Resolver, va
 	if err != nil {
 		return nil, err
 	}
+	ingest, err := store.IngestService()
+	if err != nil {
+		return nil, err
+	}
 	if resolver == nil {
 		resolver = unavailableResolver{}
 	}
-	m := &Manager{store: store, client: client, resolver: resolver, validate: validate, entries: map[string]*entry{}, startsDone: make(chan struct{})}
+	m := &Manager{store: store, ingest: ingest, client: client, resolver: resolver, validate: validate, entries: map[string]*entry{}, startsDone: make(chan struct{})}
 	for _, recording := range loaded {
 		m.entries[recording.ID] = &entry{recording: recording, done: closedChannel()}
 	}
@@ -266,9 +287,9 @@ func (m *Manager) Stop(id string) (*domain.Recording, error) {
 }
 
 // Delete removes one inactive recording from the manager registry and its
-// archive. The registry lock keeps concurrent list/get/start operations from
-// observing a half-removed entry; the entry lock serializes against worker
-// metadata commits. Active acquisitions must be stopped explicitly first.
+// archive. persistMu serializes deletion against root metadata writes while mu
+// is held only for state checks/publication. Active acquisitions must be
+// stopped explicitly first.
 func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -278,12 +299,23 @@ func (m *Manager) Delete(id string) error {
 		// interrupted previous delete.
 		return m.store.DeleteRecordingData(id)
 	}
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	if e.deleted {
+		e.mu.Unlock()
+		return nil
+	}
 	if e.recording == nil || e.recording.State == domain.StateRecording {
+		e.mu.Unlock()
 		return ErrActiveRecording
 	}
+	e.deleted = true
+	e.mu.Unlock()
 	if err := m.store.DeleteRecordingData(id); err != nil {
+		e.mu.Lock()
+		e.deleted = false
+		e.mu.Unlock()
 		return err
 	}
 	delete(m.entries, id)
@@ -334,6 +366,13 @@ func (m *Manager) Close(ctx context.Context) error {
 			cancel()
 		}
 		waits = append(waits, workerWait{e: e, done: done})
+	}
+	// Start closing ingest admission immediately after cancelling acquisitions.
+	// IngestService.Close starts its bounded drain coordinator before honoring
+	// this caller's deadline; that coordinator also wakes Submit calls which
+	// have completed their bodies but have not yet acquired a queue slot.
+	if err := m.ingest.Close(ctx); err != nil {
+		return err
 	}
 	for _, worker := range waits {
 		select {
@@ -462,25 +501,32 @@ func (m *Manager) entry(id string) (*entry, bool) {
 }
 
 func (m *Manager) update(e *entry, fn func(*domain.Recording) error) error {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	if e.deleted {
+		e.mu.Unlock()
+		return errors.New("recording was deleted")
+	}
 	next := clone(e.recording)
+	e.mu.Unlock()
 	if next == nil {
+		e.mu.Lock()
 		if e.terminalErr == nil {
 			e.terminalErr = errors.New("recording state persistence failed")
 		}
+		e.mu.Unlock()
 		return errors.New("recording state could not be copied")
 	}
 	if err := fn(next); err != nil {
 		return err
 	}
 	if err := m.store.SaveRecording(next); err != nil {
-		if e.terminalErr == nil {
-			e.terminalErr = errors.New("recording metadata persistence failed")
-		}
 		return errors.New("recording metadata persistence failed")
 	}
+	e.mu.Lock()
 	e.recording = next
+	e.mu.Unlock()
 	return nil
 }
 
@@ -491,7 +537,20 @@ func (m *Manager) run(ctx context.Context, e *entry, media adapterproto.MediaSou
 func (m *Manager) fail(e *entry, err error) {
 	safe := safeFailureDescription(err)
 	if updateErr := m.update(e, func(r *domain.Recording) error {
-		m.finalizePending(r, "recording ended with uncaptured media")
+		if errors.Is(err, errStorageCommit) {
+			// A source body was already fetched; failure to persist it is not a
+			// source gap. Clear pending observations instead of misclassifying
+			// backend failure as missing media.
+			for _, track := range r.Tracks {
+				if track == nil {
+					continue
+				}
+				track.PendingSequences = nil
+				track.PendingSegments = nil
+			}
+		} else {
+			m.finalizePending(r, "recording ended with uncaptured media")
+		}
 		r.State = domain.StateInterrupted
 		r.LastError = safe
 		now := time.Now().UTC()
@@ -516,6 +575,9 @@ func (m *Manager) setTerminalError(e *entry, err error) {
 }
 
 func safeFailureDescription(err error) string {
+	if errors.Is(err, errStorageCommit) {
+		return "recording storage commit failed"
+	}
 	var fetchErr *FetchError
 	if errors.As(err, &fetchErr) {
 		return fetchErr.Error()
@@ -524,18 +586,6 @@ func safeFailureDescription(err error) string {
 		return "recording stopped"
 	}
 	return "recording acquisition failed"
-}
-
-func (m *Manager) saveSnapshot(e *entry, trackID, source string, data []byte) error {
-	var id string
-	e.mu.Lock()
-	id = e.recording.ID
-	e.mu.Unlock()
-	snapshot, err := m.store.SaveSnapshot(id, trackID, source, data, time.Now().UTC())
-	if err != nil {
-		return err
-	}
-	return m.update(e, func(r *domain.Recording) error { r.Snapshots = append(r.Snapshots, snapshot); return nil })
 }
 
 // clone ensures API callers cannot mutate state protected by the manager.

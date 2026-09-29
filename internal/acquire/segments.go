@@ -1,7 +1,10 @@
 package acquire
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -11,6 +14,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/hls"
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 const (
@@ -29,6 +33,8 @@ type segmentTaskState uint8
 const (
 	segmentTaskQueued segmentTaskState = iota
 	segmentTaskInFlight
+	segmentTaskBuffered
+	segmentTaskPersisting
 	segmentTaskRefreshing
 	segmentTaskRetryWait
 	segmentTaskAwaitManifest
@@ -52,10 +58,17 @@ type segmentTask struct {
 }
 
 type initFlight struct {
-	done chan struct{}
-	id   string
-	err  error
+	queued   chan struct{}
+	done     chan struct{}
+	id       string
+	queueErr error
+	err      error
 }
+
+var (
+	errPersistQueued = errors.New("canonical payload persistence queued")
+	errStorageCommit = errors.New("canonical storage commit failed")
+)
 
 type epochMarker struct {
 	ordinal             uint64
@@ -79,6 +92,8 @@ type segmentScheduler struct {
 	busy                     int
 	closed                   bool
 	fatal                    error
+	pendingSnapshots         int
+	pendingMetadata          int
 	ending                   bool
 	endingGeneration         uint64
 	latestManifestGeneration uint64
@@ -223,6 +238,155 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 		}
 	}
 	return s.manifestGenerationCurrent(generation), nil
+}
+
+// queueSnapshot sends an already-fetched manifest body through the same
+// bounded writer as media payloads. The manifest poller returns as soon as
+// the body is admitted; only the writer performs durable payload, sidecar,
+// and recording.json writes. A stale generation may leave an unreferenced
+// snapshot object, but can never mutate the current recording projection.
+func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source string, payload *storage.IngestPayload, after func(*domain.Recording) error) error {
+	if payload == nil {
+		return errors.New("manifest snapshot payload is nil")
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		payload.Release()
+		return errors.New("segment scheduler is closed")
+	}
+	s.pendingSnapshots++
+	s.wg.Add(1)
+	s.signalLocked()
+	s.mu.Unlock()
+
+	id := recordingID(s.e)
+	at := time.Now().UTC()
+	err := s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+		if _, current := currentMediaVersion(s.e); current != generation {
+			return payload.Result(), nil
+		}
+		if s.manager.storageSnapshotWriteHook != nil {
+			s.manager.storageSnapshotWriteHook()
+		}
+
+		s.commitMu.Lock()
+		defer s.commitMu.Unlock()
+		snapshot, err := s.manager.store.SaveSnapshot(id, trackID, source, data, at)
+		if err != nil {
+			return storage.PayloadResult{}, err
+		}
+		updated, err := s.manager.updateAtMediaGeneration(s.e, generation, func(r *domain.Recording) error {
+			for _, existing := range r.Snapshots {
+				if existing.StoragePath == snapshot.StoragePath {
+					if after != nil {
+						return after(r)
+					}
+					return nil
+				}
+			}
+			r.Snapshots = append(r.Snapshots, snapshot)
+			if after != nil {
+				return after(r)
+			}
+			return nil
+		})
+		if err != nil {
+			return storage.PayloadResult{}, err
+		}
+		// A concurrent source refresh invalidated this snapshot while it was
+		// being written. Keep its payload unreferenced rather than applying stale
+		// observation or master-variant metadata to the new generation.
+		_ = updated
+		return storage.PayloadResult{Size: snapshot.Size, SHA256: snapshot.SHA256}, nil
+	}, func(_ storage.PayloadResult, persistErr error) {
+		defer s.wg.Done()
+		s.mu.Lock()
+		s.pendingSnapshots--
+		s.signalLocked()
+		s.mu.Unlock()
+		if persistErr != nil {
+			s.failStorage()
+		}
+	})
+	if err != nil {
+		s.wg.Done()
+		s.mu.Lock()
+		s.pendingSnapshots--
+		s.signalLocked()
+		s.mu.Unlock()
+		payload.Release()
+		if s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			if ctxErr := s.ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+		return fmt.Errorf("%w: manifest snapshot persistence queue unavailable", errStorageCommit)
+	}
+	return nil
+}
+
+// queueRecordingCommit persists the newest in-memory root projection on the
+// storage writer. It intentionally captures no recording clone: earlier
+// queued segment commits may update the root before this operation executes.
+func (s *segmentScheduler) queueRecordingCommit() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("segment scheduler is closed")
+	}
+	s.pendingMetadata++
+	s.wg.Add(1)
+	s.signalLocked()
+	s.mu.Unlock()
+
+	err := s.manager.ingest.SubmitCommit(s.ctx, recordingID(s.e), func() error {
+		if s.manager.storageMetadataWriteHook != nil {
+			s.manager.storageMetadataWriteHook()
+		}
+		s.e.persistMu.Lock()
+		defer s.e.persistMu.Unlock()
+		s.e.mu.Lock()
+		if s.e.deleted {
+			s.e.mu.Unlock()
+			return errors.New("recording was deleted")
+		}
+		current := clone(s.e.recording)
+		s.e.mu.Unlock()
+		if current == nil {
+			return errors.New("recording state could not be copied")
+		}
+		if err := s.manager.store.SaveRecording(current); err != nil {
+			return errors.New("recording metadata persistence failed")
+		}
+		return nil
+	}, func(commitErr error) {
+		defer s.wg.Done()
+		s.mu.Lock()
+		s.pendingMetadata--
+		s.signalLocked()
+		s.mu.Unlock()
+		if commitErr != nil {
+			s.failStorage()
+		}
+	})
+	if err == nil {
+		return nil
+	}
+	s.wg.Done()
+	s.mu.Lock()
+	s.pendingMetadata--
+	s.signalLocked()
+	s.mu.Unlock()
+	if s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		if ctxErr := s.ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+	return fmt.Errorf("%w: recording metadata queue unavailable", errStorageCommit)
 }
 
 func (s *segmentScheduler) recordingSnapshot() *domain.Recording {
@@ -478,6 +642,16 @@ func (s *segmentScheduler) worker(burst bool) {
 			s.mu.Unlock()
 			continue
 		}
+		if errors.Is(err, errPersistQueued) {
+			s.signalLocked()
+			s.mu.Unlock()
+			continue
+		}
+		if errors.Is(err, errStorageCommit) {
+			s.mu.Unlock()
+			s.failStorage()
+			continue
+		}
 		if err == nil {
 			delete(s.tasks, task.key)
 			s.signalLocked()
@@ -668,31 +842,120 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 		source.Init = &initCopy
 	}
 	epoch, ordinal := task.key.epoch, task.ordinal
-	firstInEpoch := false // synthetic epoch markers are assigned at metadata commit order
 	refreshCycles := task.refreshCycles
 	s.e.mu.Unlock()
 	s.mu.Unlock()
 	initID := ""
+	var initDependency *initFlight
 	if source.Init != nil {
 		var err error
-		initID, err = s.acquireInit(source, epoch, media, generation)
+		initID, initDependency, err = s.acquireInit(source, epoch, media, generation)
 		if err != nil {
+			if errors.Is(err, storage.ErrIngestClosed) {
+				// Shutdown rejected a completed init payload before queue admission.
+				// Do not turn the in-flight source sequence into a gap.
+				s.removeTask(task)
+				return nil
+			}
 			if errors.Is(err, errStaleMediaGeneration) {
 				return s.awaitCurrentGeneration(task)
 			}
 			return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 		}
 	}
-	segment, err := s.manager.acquireMediaOnce(s.ctx, s.e, source, epoch, ordinal, initID, firstInEpoch, media, generation)
+	segment, payload, err := s.manager.acquireMediaBuffered(s.ctx, s.e, source, epoch, ordinal, initID, media, generation)
 	if err != nil {
 		if errors.Is(err, errStaleMediaGeneration) {
 			return s.awaitCurrentGeneration(task)
 		}
 		return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 	}
+	result := payload.Result()
+	segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
+	s.mu.Lock()
+	if s.tasks[task.key] == task {
+		task.state = segmentTaskBuffered
+		s.signalLocked()
+	}
+	s.mu.Unlock()
+	s.wg.Add(1)
+	err = s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+		return s.persistSegment(segment, initDependency, data)
+	}, func(_ storage.PayloadResult, persistErr error) {
+		defer s.wg.Done()
+		if persistErr != nil {
+			s.failStorage()
+			return
+		}
+		s.mu.Lock()
+		if s.tasks[task.key] == task {
+			delete(s.tasks, task.key)
+			s.signalLocked()
+		}
+		s.mu.Unlock()
+	})
+	if err != nil {
+		s.wg.Done()
+		payload.Release()
+		if errors.Is(err, storage.ErrIngestClosed) {
+			// The bytes were complete but service shutdown closed admission before
+			// this job entered its durable queue. Discard the volatile observation
+			// without classifying it as a source gap.
+			s.removeTask(task)
+			return nil
+		}
+		if s.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return err
+		}
+		return fmt.Errorf("%w: persistence queue unavailable", errStorageCommit)
+	}
+	s.mu.Lock()
+	if s.tasks[task.key] == task {
+		task.state = segmentTaskPersisting
+		s.signalLocked()
+	}
+	s.mu.Unlock()
+	return errPersistQueued
+}
+
+func (s *segmentScheduler) removeTask(task *segmentTask) {
+	if task == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.tasks[task.key] == task {
+		delete(s.tasks, task.key)
+		s.signalLocked()
+	}
+	s.mu.Unlock()
+}
+
+func (s *segmentScheduler) persistSegment(segment domain.Segment, initDependency *initFlight, data []byte) (storage.PayloadResult, error) {
+	// Init jobs are submitted before the referencing media task to the same
+	// FIFO service. Wait for the durable init sidecar/root metadata before
+	// publishing a media segment that refers to it.
+	if initDependency != nil {
+		<-initDependency.done
+		if initDependency.err != nil {
+			return storage.PayloadResult{}, errStorageCommit
+		}
+	}
+	if s.manager.storageWriteHook != nil {
+		s.manager.storageWriteHook()
+	}
+	if s.manager.storageWriteFailureHook != nil {
+		if err := s.manager.storageWriteFailureHook(); err != nil {
+			return storage.PayloadResult{}, err
+		}
+	}
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
-	sourceDiscontinuity := source.Discontinuity
+	result, err := s.manager.store.SavePayload(recordingID(s.e), segment.StoragePath, bytes.NewReader(data), maxPayloadBytes)
+	if err != nil {
+		return storage.PayloadResult{}, err
+	}
+	segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
+	sourceDiscontinuity := segment.Discontinuity
 	root := s.recordingSnapshot()
 	var previousUpdate *domain.Segment
 	var plannedMarker *epochMarker
@@ -733,11 +996,11 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	// Sidecars, including a moved synthetic epoch marker, are durable before
 	// the root metadata references their final projection.
 	if err = s.manager.store.SaveSidecar(recordingID(s.e), segment.StoragePath, segment); err != nil {
-		return err
+		return storage.PayloadResult{}, err
 	}
 	if previousUpdate != nil {
 		if err = s.manager.store.SaveSidecar(recordingID(s.e), previousUpdate.StoragePath, *previousUpdate); err != nil {
-			return err
+			return storage.PayloadResult{}, err
 		}
 	}
 	if err = s.manager.update(s.e, func(r *domain.Recording) error {
@@ -778,12 +1041,12 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 		r.LastError = ""
 		return nil
 	}); err != nil {
-		return err
+		return storage.PayloadResult{}, err
 	}
 	if plannedMarker != nil && segment.SourceEpoch > 0 {
 		s.epochMarkers[segment.SourceEpoch] = *plannedMarker
 	}
-	return nil
+	return result, nil
 }
 
 var errAwaitManifest = errors.New("segment retry awaits refreshed manifest")
@@ -856,31 +1119,121 @@ func (s *segmentScheduler) markRefreshing(task *segmentTask) bool {
 	return true
 }
 
-func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64) (string, error) {
+func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64) (string, *initFlight, error) {
 	source := *segment.Init
 	key := initIdentity(source, epoch, segment.DiscontinuitySequence)
+	digest := sha256.Sum256([]byte(key))
+	id := "init-" + hex.EncodeToString(digest[:8])
+	if initExists(s.recordingSnapshot(), id) {
+		return id, nil, nil
+	}
 	s.mu.Lock()
 	if flight := s.init[key]; flight != nil {
-		done := flight.done
 		s.mu.Unlock()
 		select {
 		case <-s.ctx.Done():
-			return "", s.ctx.Err()
-		case <-done:
-			return flight.id, flight.err
+			return "", nil, s.ctx.Err()
+		case <-flight.queued:
+			if flight.queueErr != nil {
+				return "", nil, flight.queueErr
+			}
+			return flight.id, flight, nil
 		}
 	}
-	flight := &initFlight{done: make(chan struct{})}
+	flight := &initFlight{queued: make(chan struct{}), done: make(chan struct{})}
 	s.init[key] = flight
 	s.mu.Unlock()
 
-	id, err := s.manager.acquireInitOnce(s.ctx, s.e, source, epoch, segment.DiscontinuitySequence, media, generation)
+	recording := s.recordingSnapshot()
+	payload, err := s.manager.downloadObjectBufferedOnceAtGeneration(s.ctx, source.URI, source.ByteRange, recording.ID, media, s.e, generation)
+	if err != nil {
+		s.resolveInitQueueError(key, flight, err)
+		return "", nil, err
+	}
+	asset := domain.Segment{ID: id, TrackID: "main", SourceEpoch: epoch, DiscontinuitySequence: segment.DiscontinuitySequence, SourceURI: source.URI, ByteRange: cloneRange(source.ByteRange), StoragePath: "tracks/main/" + id + extensionFor(source.URI), PayloadSize: payload.Result().Size, SHA256: payload.Result().SHA256, IsInit: true}
+	s.wg.Add(1)
+	err = s.manager.ingest.Submit(s.ctx, payload, func(data []byte) (storage.PayloadResult, error) {
+		if s.manager.storageWriteHook != nil {
+			s.manager.storageWriteHook()
+		}
+		if s.manager.storageWriteFailureHook != nil {
+			if hookErr := s.manager.storageWriteFailureHook(); hookErr != nil {
+				return storage.PayloadResult{}, hookErr
+			}
+		}
+		s.commitMu.Lock()
+		defer s.commitMu.Unlock()
+		result, persistErr := s.manager.store.SavePayload(recording.ID, asset.StoragePath, bytes.NewReader(data), maxPayloadBytes)
+		if persistErr != nil {
+			return storage.PayloadResult{}, persistErr
+		}
+		asset.PayloadSize, asset.SHA256 = result.Size, result.SHA256
+		if persistErr = s.manager.store.SaveSidecar(recording.ID, asset.StoragePath, asset); persistErr != nil {
+			return storage.PayloadResult{}, persistErr
+		}
+		if persistErr = s.manager.update(s.e, func(r *domain.Recording) error {
+			track := r.Tracks["main"]
+			for _, previous := range track.InitSegments {
+				if previous.ID == id {
+					return nil
+				}
+			}
+			track.InitSegments = append(track.InitSegments, asset)
+			return nil
+		}); persistErr != nil {
+			return storage.PayloadResult{}, persistErr
+		}
+		return result, nil
+	}, func(_ storage.PayloadResult, persistErr error) {
+		defer s.wg.Done()
+		s.mu.Lock()
+		flight.err = persistErr
+		if s.init[key] == flight {
+			delete(s.init, key)
+		}
+		close(flight.done)
+		s.signalLocked()
+		s.mu.Unlock()
+		if persistErr != nil {
+			s.failStorage()
+		}
+	})
+	if err != nil {
+		s.wg.Done()
+		payload.Release()
+		s.resolveInitQueueError(key, flight, err)
+		return "", nil, err
+	}
 	s.mu.Lock()
-	flight.id, flight.err = id, err
-	delete(s.init, key)
-	close(flight.done)
+	flight.id = id
+	close(flight.queued)
+	s.signalLocked()
 	s.mu.Unlock()
-	return id, err
+	return id, flight, nil
+}
+
+func initExists(recording *domain.Recording, id string) bool {
+	if recording == nil || recording.Tracks["main"] == nil {
+		return false
+	}
+	for _, init := range recording.Tracks["main"].InitSegments {
+		if init.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *segmentScheduler) resolveInitQueueError(key string, flight *initFlight, err error) {
+	s.mu.Lock()
+	flight.queueErr, flight.err = err, err
+	if s.init[key] == flight {
+		delete(s.init, key)
+	}
+	close(flight.queued)
+	close(flight.done)
+	s.signalLocked()
+	s.mu.Unlock()
 }
 
 func initIdentity(source hls.Map, epoch, discontinuity uint64) string {
@@ -915,6 +1268,10 @@ func (s *segmentScheduler) failFatal(err error) {
 	s.cancel()
 }
 
+func (s *segmentScheduler) failStorage() {
+	s.failFatal(errStorageCommit)
+}
+
 func (s *segmentScheduler) drain(ctx context.Context) error {
 	for {
 		s.mu.Lock()
@@ -923,7 +1280,7 @@ func (s *segmentScheduler) drain(ctx context.Context) error {
 			s.mu.Unlock()
 			return err
 		}
-		if len(s.tasks) == 0 {
+		if len(s.tasks) == 0 && s.pendingSnapshots == 0 && s.pendingMetadata == 0 {
 			s.mu.Unlock()
 			return nil
 		}
@@ -957,7 +1314,7 @@ func (s *segmentScheduler) drainEndList(ctx context.Context, generation uint64) 
 			s.mu.Unlock()
 			return false, nil
 		}
-		if len(s.tasks) == 0 {
+		if len(s.tasks) == 0 && s.pendingSnapshots == 0 && s.pendingMetadata == 0 {
 			s.mu.Unlock()
 			return true, nil
 		}

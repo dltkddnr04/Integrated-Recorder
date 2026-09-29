@@ -4,6 +4,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -30,8 +31,50 @@ var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 // ordinary local I/O errors remain distinguishable and are not retried.
 var ErrPayloadSizeMismatch = errors.New("payload size mismatch")
 
+// StorageBackend is the set of canonical archive operations currently needed
+// by the application. Store is the stable archive facade; New currently wires
+// exactly one implementation, LocalFilesystemBackend.
+//
+// The methods speak recording IDs and logical recording-relative paths. Root
+// is retained for internal diagnostics and existing tests only; it is not a
+// canonical locator and must never be included in API responses.
+type StorageBackend interface {
+	RecoveryIssues() []RecoveryIssue
+	HasCanonicalPayloadIssue(string) bool
+	NewRecordingDir(string) error
+	CreateRecording(*domain.Recording) error
+	SaveRecording(*domain.Recording) error
+	LoadAll() ([]*domain.Recording, error)
+	SavePayload(string, string, io.Reader, int64) (PayloadResult, error)
+	SavePayloadExact(string, string, io.Reader, int64, int64) (PayloadResult, error)
+	SaveSidecar(string, string, any) error
+	SaveSnapshot(string, string, string, []byte, time.Time) (domain.ManifestSnapshot, error)
+	OpenPayloadReader(string, string) (io.ReadCloser, error)
+	StatPayload(string, string) (ObjectInfo, error)
+	ArchiveIndex(*domain.Recording) ([]ArchiveEntry, error)
+	RecordingDirectoryBytes(string) (int64, error)
+	VerifyRecording(*domain.Recording) IntegrityResult
+	VerifyRecordingContext(context.Context, *domain.Recording) IntegrityResult
+	StorageStats() (StorageStats, error)
+	DeleteRecordingData(string) error
+	PoolMetrics() PoolSnapshot
+}
+
+// Store is the archive storage facade. The embedding preserves the public
+// method surface while allowing callers and tests to depend on the facade
+// rather than the local filesystem implementation.
 type Store struct {
-	root string
+	StorageBackend
+	root     string // internal/test compatibility only; never part of API models
+	ingestMu sync.RWMutex
+	ingest   *IngestService
+}
+
+// LocalFilesystemBackend owns physical filesystem paths and crash-safe local
+// publication. Canonical metadata stores only logical relative paths.
+type LocalFilesystemBackend struct {
+	root      string
+	telemetry *telemetry
 
 	issuesMu sync.RWMutex
 	issues   []RecoveryIssue
@@ -60,14 +103,80 @@ func New(root string) (*Store, error) {
 	if err = os.Chmod(filepath.Join(abs, "recordings"), 0700); err != nil {
 		return nil, err
 	}
-	return &Store{root: abs}, nil
+	backend := &LocalFilesystemBackend{root: abs}
+	backend.telemetry = newTelemetry()
+	return &Store{StorageBackend: backend, root: abs}, nil
 }
 
 func (s *Store) Root() string { return s.root }
 
+// OpenPayload is a local-filesystem compatibility helper for existing tests
+// and callers that still need an *os.File. Production storage consumers should
+// use the backend-neutral OpenPayloadReader and StatPayload methods instead.
+func (s *Store) OpenPayload(id, relativePath string) (*os.File, error) {
+	backend, ok := s.StorageBackend.(*LocalFilesystemBackend)
+	if !ok {
+		return nil, errors.New("concrete file access is unavailable for this storage backend")
+	}
+	return backend.OpenPayload(id, relativePath)
+}
+
+var _ StorageBackend = (*LocalFilesystemBackend)(nil)
+
+// recordingDir remains an unexported test-compatibility helper. Production
+// consumers use logical IDs and paths through StorageBackend operations.
+func (s *Store) recordingDir(id string) string { return filepath.Join(s.root, "recordings", id) }
+
+// IngestService returns the single bounded local commit service for this
+// archive facade. The service is lazy so read-only storage users do not spawn
+// workers they do not need.
+func (s *Store) IngestService() (*IngestService, error) {
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if s.ingest != nil {
+		return s.ingest, nil
+	}
+	service, err := NewIngestService(s, DefaultIngestOptions())
+	if err != nil {
+		return nil, err
+	}
+	s.ingest = service
+	return service, nil
+}
+
+// PoolMetrics returns one coherent local-primary pool snapshot, including the
+// volatile ingest service when acquisition has started.
+func (s *Store) PoolMetrics() PoolSnapshot {
+	s.ingestMu.RLock()
+	service := s.ingest
+	s.ingestMu.RUnlock()
+	if service != nil {
+		return service.PoolMetrics()
+	}
+	return s.StorageBackend.PoolMetrics()
+}
+
+// PoolMetricsWindow returns bounded in-memory samples from at most the most
+// recent 24 hours. The current snapshot is always included.
+func (s *Store) PoolMetricsWindow(window time.Duration) PoolSnapshot {
+	if window <= 0 || window > 24*time.Hour {
+		window = 24 * time.Hour
+	}
+	pool := s.PoolMetrics()
+	cutoff := time.Now().Add(-window)
+	first := 0
+	for first < len(pool.Samples) && pool.Samples[first].At.Before(cutoff) {
+		first++
+	}
+	pool.Samples = append([]PoolSample(nil), pool.Samples[first:]...)
+	return pool
+}
+
+func (s *LocalFilesystemBackend) recordStorageError() { s.telemetry.recordError() }
+
 // RecoveryIssues returns a snapshot of the most recent LoadAll recovery
 // findings. Issues contain only safe identifiers and fixed messages.
-func (s *Store) RecoveryIssues() []RecoveryIssue {
+func (s *LocalFilesystemBackend) RecoveryIssues() []RecoveryIssue {
 	s.issuesMu.RLock()
 	defer s.issuesMu.RUnlock()
 	return append([]RecoveryIssue(nil), s.issues...)
@@ -77,7 +186,7 @@ func (s *Store) RecoveryIssues() []RecoveryIssue {
 // integrity-mismatched payload referenced by this recording's canonical media
 // timeline. It performs no filesystem reads and is intended for fail-closed
 // playback projection checks.
-func (s *Store) HasCanonicalPayloadIssue(recordingID string) bool {
+func (s *LocalFilesystemBackend) HasCanonicalPayloadIssue(recordingID string) bool {
 	s.issuesMu.RLock()
 	defer s.issuesMu.RUnlock()
 	for _, issue := range s.issues {
@@ -88,19 +197,19 @@ func (s *Store) HasCanonicalPayloadIssue(recordingID string) bool {
 	return false
 }
 
-func (s *Store) setRecoveryIssues(issues []RecoveryIssue) {
+func (s *LocalFilesystemBackend) setRecoveryIssues(issues []RecoveryIssue) {
 	s.issuesMu.Lock()
 	s.issues = append([]RecoveryIssue(nil), issues...)
 	s.issuesMu.Unlock()
 }
 
-func (s *Store) addRecoveryIssue(issue RecoveryIssue) {
+func (s *LocalFilesystemBackend) addRecoveryIssue(issue RecoveryIssue) {
 	s.issuesMu.Lock()
 	s.issues = append(s.issues, issue)
 	s.issuesMu.Unlock()
 }
 
-func (s *Store) NewRecordingDir(id string) error {
+func (s *LocalFilesystemBackend) NewRecordingDir(id string) error {
 	if !recordingIDPattern.MatchString(id) {
 		return fmt.Errorf("invalid recording id")
 	}
@@ -121,7 +230,16 @@ func (s *Store) NewRecordingDir(id string) error {
 // initial self-describing root document exists. A crash before the final
 // rename leaves an identifiable hidden staging directory for LoadAll to
 // report; it never exposes a half-created final recording directory.
-func (s *Store) CreateRecording(recording *domain.Recording) error {
+func (s *LocalFilesystemBackend) CreateRecording(recording *domain.Recording) (err error) {
+	started := time.Now()
+	var written uint64
+	defer func() {
+		if err != nil {
+			s.telemetry.recordError()
+		} else {
+			s.telemetry.recordWrite(written, time.Since(started))
+		}
+	}()
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return fmt.Errorf("invalid recording")
 	}
@@ -155,6 +273,7 @@ func (s *Store) CreateRecording(recording *domain.Recording) error {
 	if err != nil {
 		return err
 	}
+	written = uint64(len(data) + 1)
 	rootPath := filepath.Join(stage, "recording.json")
 	if err = atomicWrite(rootPath, append(data, '\n'), 0600); err != nil {
 		return err
@@ -172,7 +291,8 @@ func (s *Store) CreateRecording(recording *domain.Recording) error {
 	return syncDirectory(base)
 }
 
-func (s *Store) SaveRecording(recording *domain.Recording) error {
+func (s *LocalFilesystemBackend) SaveRecording(recording *domain.Recording) error {
+	started := time.Now()
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return fmt.Errorf("invalid recording")
 	}
@@ -180,10 +300,17 @@ func (s *Store) SaveRecording(recording *domain.Recording) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(s.recordingDir(recording.ID), "recording.json"), append(data, '\n'), 0600)
+	data = append(data, '\n')
+	err = atomicWrite(filepath.Join(s.recordingDir(recording.ID), "recording.json"), data, 0600)
+	if err != nil {
+		s.telemetry.recordError()
+	} else {
+		s.telemetry.recordWrite(uint64(len(data)), time.Since(started))
+	}
+	return err
 }
 
-func (s *Store) LoadAll() ([]*domain.Recording, error) {
+func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 	s.setRecoveryIssues(nil)
 	base := filepath.Join(s.root, "recordings")
 	if err := os.Chmod(base, 0700); err != nil {
@@ -313,7 +440,7 @@ func (s *Store) LoadAll() ([]*domain.Recording, error) {
 	return recordings, nil
 }
 
-func (s *Store) reconcileRecording(recording *domain.Recording) (bool, error) {
+func (s *LocalFilesystemBackend) reconcileRecording(recording *domain.Recording) (bool, error) {
 	root := s.recordingDir(recording.ID)
 	knownPaths := make(map[string]struct{})
 	for _, snapshot := range recording.Snapshots {
@@ -409,7 +536,7 @@ func (s *Store) reconcileRecording(recording *domain.Recording) (bool, error) {
 			issue(unavailableCode, "canonical payload reference is invalid or unavailable; metadata was preserved")
 			return
 		}
-		file, err := s.OpenPayload(recording.ID, relative)
+		file, err := s.OpenPayloadReader(recording.ID, relative)
 		if err != nil {
 			issue(unavailableCode, "canonical payload is unavailable; metadata was preserved")
 			return
@@ -439,7 +566,7 @@ func (s *Store) reconcileRecording(recording *domain.Recording) (bool, error) {
 	return changed, walkErr
 }
 
-func (s *Store) reconcileManifestSidecar(recording *domain.Recording, sidecarRel, payloadRel string, knownPaths *map[string]struct{}, changed *bool) {
+func (s *LocalFilesystemBackend) reconcileManifestSidecar(recording *domain.Recording, sidecarRel, payloadRel string, knownPaths *map[string]struct{}, changed *bool) {
 	issue := func(code, message string) {
 		s.addRecoveryIssue(RecoveryIssue{ID: recording.ID, Code: code, Message: message})
 	}
@@ -466,7 +593,7 @@ func (s *Store) reconcileManifestSidecar(recording *domain.Recording, sidecarRel
 		issue("manifest_path_invalid", "manifest storage path is invalid")
 		return
 	}
-	file, err := s.OpenPayload(recording.ID, payloadRel)
+	file, err := s.OpenPayloadReader(recording.ID, payloadRel)
 	if err != nil {
 		issue("manifest_payload_unavailable", "manifest payload for committed metadata is unavailable")
 		return
@@ -495,7 +622,7 @@ func (s *Store) reconcileManifestSidecar(recording *domain.Recording, sidecarRel
 	*changed = true
 }
 
-func (s *Store) reconcileSidecar(recording *domain.Recording, sidecarRel, payloadRel string, knownPaths *map[string]struct{}, changed *bool) {
+func (s *LocalFilesystemBackend) reconcileSidecar(recording *domain.Recording, sidecarRel, payloadRel string, knownPaths *map[string]struct{}, changed *bool) {
 	issue := func(code, message string) {
 		s.addRecoveryIssue(RecoveryIssue{ID: recording.ID, Code: code, Message: message})
 	}
@@ -527,7 +654,7 @@ func (s *Store) reconcileSidecar(recording *domain.Recording, sidecarRel, payloa
 		issue("sidecar_path_invalid", "segment metadata storage path is invalid")
 		return
 	}
-	file, err := s.OpenPayload(recording.ID, payloadRel)
+	file, err := s.OpenPayloadReader(recording.ID, payloadRel)
 	if err != nil {
 		issue("sidecar_payload_unavailable", "segment payload for committed metadata is unavailable")
 		return
@@ -581,17 +708,31 @@ type PayloadResult struct {
 
 // SavePayload writes exactly the bytes read from src and publishes them only
 // after a complete write. The hash is calculated over those same bytes.
-func (s *Store) SavePayload(id, relativePath string, src io.Reader, limit int64) (PayloadResult, error) {
-	return s.savePayload(id, relativePath, src, limit, -1)
+func (s *LocalFilesystemBackend) SavePayload(id, relativePath string, src io.Reader, limit int64) (PayloadResult, error) {
+	started := time.Now()
+	result, err := s.savePayload(id, relativePath, src, limit, -1)
+	s.recordPayloadWrite(result, started, err)
+	return result, err
 }
 
 // SavePayloadExact also requires a specific byte count before publishing the
 // file, which is used for HLS byte-range responses.
-func (s *Store) SavePayloadExact(id, relativePath string, src io.Reader, limit, expectedSize int64) (PayloadResult, error) {
-	return s.savePayload(id, relativePath, src, limit, expectedSize)
+func (s *LocalFilesystemBackend) SavePayloadExact(id, relativePath string, src io.Reader, limit, expectedSize int64) (PayloadResult, error) {
+	started := time.Now()
+	result, err := s.savePayload(id, relativePath, src, limit, expectedSize)
+	s.recordPayloadWrite(result, started, err)
+	return result, err
 }
 
-func (s *Store) savePayload(id, relativePath string, src io.Reader, limit, expectedSize int64) (PayloadResult, error) {
+func (s *LocalFilesystemBackend) recordPayloadWrite(result PayloadResult, started time.Time, err error) {
+	if err != nil {
+		s.telemetry.recordError()
+		return
+	}
+	s.telemetry.recordWrite(uint64(result.Size), time.Since(started))
+}
+
+func (s *LocalFilesystemBackend) savePayload(id, relativePath string, src io.Reader, limit, expectedSize int64) (PayloadResult, error) {
 	destination, err := s.safePath(id, relativePath)
 	if err != nil {
 		return PayloadResult{}, err
@@ -642,7 +783,8 @@ func (s *Store) savePayload(id, relativePath string, src io.Reader, limit, expec
 	return PayloadResult{Size: n, SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
-func (s *Store) SaveSidecar(id, relativePath string, v any) error {
+func (s *LocalFilesystemBackend) SaveSidecar(id, relativePath string, v any) error {
+	started := time.Now()
 	path, err := s.safePath(id, relativePath)
 	if err != nil {
 		return err
@@ -651,10 +793,17 @@ func (s *Store) SaveSidecar(id, relativePath string, v any) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(path+".json", append(data, '\n'), 0600)
+	data = append(data, '\n')
+	err = atomicWrite(path+".json", data, 0600)
+	if err != nil {
+		s.telemetry.recordError()
+	} else {
+		s.telemetry.recordWrite(uint64(len(data)), time.Since(started))
+	}
+	return err
 }
 
-func (s *Store) SaveSnapshot(id, trackID, sourceURI string, data []byte, at time.Time) (domain.ManifestSnapshot, error) {
+func (s *LocalFilesystemBackend) SaveSnapshot(id, trackID, sourceURI string, data []byte, at time.Time) (domain.ManifestSnapshot, error) {
 	if len(data) > 4<<20 {
 		return domain.ManifestSnapshot{}, fmt.Errorf("manifest exceeds size limit")
 	}
@@ -671,35 +820,129 @@ func (s *Store) SaveSnapshot(id, trackID, sourceURI string, data []byte, at time
 	return snapshot, nil
 }
 
-func (s *Store) OpenPayload(id, relativePath string) (*os.File, error) {
+func (s *LocalFilesystemBackend) OpenPayload(id, relativePath string) (*os.File, error) {
+	f, _, err := s.openPayload(id, relativePath)
+	if err != nil {
+		s.telemetry.recordError()
+		return nil, err
+	}
+	return f, nil
+}
+
+// ObjectInfo is a filesystem-independent view of one canonical object.
+type ObjectInfo struct {
+	Size       int64     `json:"size"`
+	ModifiedAt time.Time `json:"modified_at"`
+	Regular    bool      `json:"regular"`
+}
+
+func (s *LocalFilesystemBackend) StatPayload(id, relativePath string) (ObjectInfo, error) {
 	path, err := s.safePath(id, relativePath)
 	if err != nil {
-		return nil, err
+		return ObjectInfo{}, err
 	}
 	resolvedRoot, err := filepath.EvalSymlinks(s.recordingDir(id))
 	if err != nil {
-		return nil, err
+		return ObjectInfo{}, err
 	}
 	resolvedPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return nil, err
+		return ObjectInfo{}, err
 	}
 	if !within(resolvedRoot, resolvedPath) {
-		return nil, fmt.Errorf("payload path escapes recording directory")
+		return ObjectInfo{}, fmt.Errorf("payload path escapes recording directory")
 	}
 	info, err := os.Stat(resolvedPath)
 	if err != nil {
-		return nil, err
+		return ObjectInfo{}, err
 	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("payload is not a regular file")
-	}
-	return os.Open(resolvedPath)
+	return ObjectInfo{Size: info.Size(), ModifiedAt: info.ModTime(), Regular: info.Mode().IsRegular()}, nil
 }
 
-func (s *Store) recordingDir(id string) string { return filepath.Join(s.root, "recordings", id) }
+func (s *LocalFilesystemBackend) OpenPayloadReader(id, relativePath string) (io.ReadCloser, error) {
+	f, _, err := s.openPayload(id, relativePath)
+	if err != nil {
+		s.telemetry.recordError()
+		return nil, err
+	}
+	return &meteredReadCloser{File: f, telemetry: s.telemetry}, nil
+}
 
-func (s *Store) safePath(id, relative string) (string, error) {
+type meteredReadCloser struct {
+	*os.File
+	telemetry *telemetry
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *meteredReadCloser) Read(p []byte) (int, error) {
+	started := time.Now()
+	n, err := r.File.Read(p)
+	if n > 0 {
+		// Record each successful filesystem read immediately so active playback
+		// and export throughput is visible before the reader is closed. Only the
+		// OS Read call is timed; consumer think time between calls is excluded.
+		r.telemetry.recordRead(uint64(n), 1, time.Since(started))
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.telemetry.recordError()
+	}
+	return n, err
+}
+
+// WriteTo deliberately funnels optimized io.Copy calls back through Read so
+// bytes remain observable. Embedding *os.File otherwise promotes its native
+// WriteTo implementation, which bypasses this wrapper's Read method.
+func (r *meteredReadCloser) WriteTo(dst io.Writer) (int64, error) {
+	return io.Copy(dst, meteredReadOnly{reader: r})
+}
+
+type meteredReadOnly struct{ reader io.Reader }
+
+func (r meteredReadOnly) Read(p []byte) (int, error) { return r.reader.Read(p) }
+
+func (r *meteredReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.File.Close()
+		if r.closeErr != nil {
+			r.telemetry.recordError()
+		}
+	})
+	return r.closeErr
+}
+
+func (s *LocalFilesystemBackend) openPayload(id, relativePath string) (*os.File, os.FileInfo, error) {
+	path, err := s.safePath(id, relativePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(s.recordingDir(id))
+	if err != nil {
+		return nil, nil, err
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !within(resolvedRoot, resolvedPath) {
+		return nil, nil, fmt.Errorf("payload path escapes recording directory")
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("payload is not a regular file")
+	}
+	f, err := os.Open(resolvedPath)
+	return f, info, err
+}
+
+func (s *LocalFilesystemBackend) recordingDir(id string) string {
+	return filepath.Join(s.root, "recordings", id)
+}
+
+func (s *LocalFilesystemBackend) safePath(id, relative string) (string, error) {
 	if !recordingIDPattern.MatchString(id) {
 		return "", fmt.Errorf("invalid recording id")
 	}
@@ -750,7 +993,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	return syncDirectory(filepath.Dir(path))
 }
 
-func (s *Store) syncRecordingDirectories(id, leaf string) error {
+func (s *LocalFilesystemBackend) syncRecordingDirectories(id, leaf string) error {
 	root := s.recordingDir(id)
 	for dir := leaf; ; dir = filepath.Dir(dir) {
 		if !within(root, dir) {

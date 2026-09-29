@@ -76,6 +76,14 @@ Media sequence는 source identifier일 뿐 archive identity가 아닙니다. Cor
 
 Segment와 manifest payload 저장 후 각각 sidecar를 만들고 root recording metadata를 갱신합니다. 시작 시 유효 sidecar가 있으면 crash 직전에 root document에서 누락된 segment 또는 manifest snapshot을 복원할 수 있습니다. Sidecar 없는 payload는 orphan으로 보존하고 보고합니다. 손상되거나 충돌하는 sidecar는 조용히 attach하지 않고 보고합니다. Incomplete/corrupt recording은 보존하고 보고하지만 나머지 정상 recording은 계속 읽습니다. 비정상 종료 후 active recording은 `interrupted`가 되고 pending segment는 명시적인 gap으로 기록됩니다.
 
+Storage facade는 논리 archive 경로와 물리 배치를 분리합니다. `StoragePath`는 계속 `tracks/main/00000042.m4s` 같은 recording 상대 경로이며, 물리 경로 변환은 local filesystem backend만 담당합니다. 현재 pool은 `local-primary` 하나이고 다중 위치 배치 catalog나 자동 tier 이동은 구현하지 않았습니다. 향후 pool이 추가되어도 canonical recording identity는 바뀌지 않습니다.
+
+미디어 수집은 durable write와 분리됩니다. Network worker는 완전히 수신해 크기와 해시를 확인한 응답을 제한된 volatile RAM ingest buffer에 넣고, 소유권을 제한된 storage queue로 넘긴 뒤 acquisition으로 복귀합니다. 고정된 local writer가 해당 buffer를 저장하며 storage 오류는 source를 다시 내려받지 않고 같은 메모리 payload로 재시도합니다. 기본 제한은 전역 1 GiB, recording당 payload 및 재할당 예약 합계 768 MiB(단일 payload 최대 512 MiB), 대기 object 최대 128개, local writer 1개입니다. `Content-Length`는 reservation 힌트일 뿐이며 실제로 읽는 byte도 계속 제한됩니다. **buffered는 committed가 아닙니다.** payload 내구성 보장, sidecar 내구성 보장, `recording.json` 내구성 갱신이 모두 끝난 뒤에만 preview, playback, integrity, canonical timeline에서 object를 볼 수 있습니다. 짧은 storage 지연은 RAM으로 흡수하고 지속적인 과부하는 bounded backpressure로 처리합니다.
+
+정상 종료는 신규 recording admission을 막고, network acquisition을 취소한 뒤 이미 수락한 ingest 작업을 호출자 deadline 안에서 drain합니다. RAM에만 있는 byte는 휘발성이며 canonical로 표시하지 않습니다. storage가 deadline 이후에도 막혀 있으면 manager는 무한 대기하지 않고 context 오류를 반환합니다.
+
+Storage 관측 정보는 `local-primary` management projection입니다. Recorder 읽기/쓰기 속도는 Integrated Recorder storage facade를 통해 발생한 I/O만 측정하며 OS 장치 전체 사용량을 뜻하지 않습니다. Capacity는 best-effort filesystem 통계입니다. 5초마다 sample을 만들고 최대 24시간 동안 bounded memory에 보관합니다. 관측 상한은 충분한 비유휴 sample이 생기기 전까지 알 수 없음으로 표시합니다. 인증이 필요한 `/api/storage/pools` 및 `/api/storage/pools/{pool_id}/metrics` API는 절대 filesystem 경로를 노출하지 않습니다. SSD/HDD/NAS/cloud/LTO 배치, 이동, 복제, eviction, restore는 구현하지 않았습니다.
+
 `internal/domain` archive type은 protocol wire type과 분리되어 있습니다. 기존 JSON field 이름을 유지하고 epoch, ordinal, provenance, URI classification은 optional이므로 구 recording도 읽을 수 있습니다. Adapter ID/version/protocol version/fingerprint는 provenance이며 credential, header, adapter state는 recording metadata에 복사하지 않습니다. Source URL과 raw manifest snapshot은 credential이 포함된 경우에도 원본 canonical data로 보존합니다. 따라서 recording directory 권한을 제한하고 public list/detail 응답에서는 URL을 제거합니다.
 
 ## Preview Frame Index
