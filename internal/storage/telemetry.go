@@ -17,6 +17,28 @@ const (
 
 const minCeilingObservation = 5 * time.Minute
 
+// MinimumMetricsRetention returns the shortest sample history that can retain
+// enough non-idle observation time and directional samples for an observed
+// throughput ceiling. The five-minute window is rounded up to whole sampling
+// intervals because retention capacity is a whole-sample count. Sampling
+// intervals are validated by the caller before this helper is used for
+// configuration acceptance.
+func MinimumMetricsRetention(sampleInterval time.Duration) time.Duration {
+	if sampleInterval <= 0 {
+		return minCeilingObservation
+	}
+	observationSamples := minCeilingObservation / sampleInterval
+	if minCeilingObservation%sampleInterval != 0 {
+		observationSamples++
+	}
+	minimumForObservation := observationSamples * sampleInterval
+	minimumForDirections := sampleInterval * minDirectionSamples
+	if minimumForDirections < minimumForObservation {
+		return minimumForObservation
+	}
+	return minimumForDirections
+}
+
 // PoolSnapshot describes I/O performed through Integrated Recorder's local
 // archive boundary. It is not an OS-wide device throughput measurement.
 // Physical paths are intentionally absent.

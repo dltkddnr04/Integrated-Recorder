@@ -264,7 +264,24 @@ test('actual Go backend: storage ingest settings persist, show restart state, an
   expect(stored.effective_storage.observability.sampling_interval_ms).toBe(5_000)
   expect(stored.restart_required).toContain('storage.observability.sampling_interval_ms')
 
+  await page.getByLabel('측정 간격').fill('60')
+  const minimumRetentionHours = Number(await page.getByLabel('측정 기록 보존 기간').getAttribute('min'))
+  expect(minimumRetentionHours).toBeCloseTo(20 / 60, 6)
+
   const session = await getJSON<{ csrf_token: string }>(page, '/api/auth/session')
+  const unreachableObservability: StorageSettingsWire = {
+    ...stored.settings.storage,
+    observability: { sampling_interval_ms: 60_000, metrics_retention_ms: 300_000 },
+  }
+  const unreachable = await page.request.put('/api/settings', { headers: { 'X-CSRF-Token': session.csrf_token }, data: { storage: unreachableObservability } })
+  expect(unreachable.status()).toBe(400)
+  const unreachableBody = await unreachable.json() as { error?: unknown; message?: unknown }
+  const unreachableMessage = typeof unreachableBody.error === 'string' ? unreachableBody.error : unreachableBody.message
+  expect(unreachableMessage).toContain('at least 20 minutes')
+  const afterRejectedUpdate = await getJSON<{ settings: { storage: StorageSettingsWire } }>(page, '/api/settings')
+  expect(afterRejectedUpdate.settings.storage.observability.sampling_interval_ms).toBe(10_000)
+  expect(afterRejectedUpdate.settings.storage.observability.metrics_retention_ms).toBe(86_400_000)
+
   const invalidStorage: StorageSettingsWire = {
     ...stored.settings.storage,
     ingest_memory: { ...stored.settings.storage.ingest_memory, global_buffer_bytes: 64 * 1024 * 1024, per_recording_buffer_bytes: 65 * 1024 * 1024, max_payload_bytes: 32 * 1024 * 1024 },

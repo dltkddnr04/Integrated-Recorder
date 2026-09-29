@@ -45,6 +45,71 @@ func TestObservedCeilingRequiresSustainedRecorderTraffic(t *testing.T) {
 	}
 }
 
+func TestMinimumMetricsRetentionMatchesCeilingEligibility(t *testing.T) {
+	tests := []struct {
+		interval time.Duration
+		want     time.Duration
+	}{
+		{time.Second, 5 * time.Minute},
+		{5 * time.Second, 5 * time.Minute},
+		{7 * time.Second, 5*time.Minute + time.Second},
+		{10 * time.Second, 5 * time.Minute},
+		{time.Minute, 20 * time.Minute},
+		{time.Hour, 20 * time.Hour},
+	}
+	for _, test := range tests {
+		if got := MinimumMetricsRetention(test.interval); got != test.want {
+			t.Errorf("MinimumMetricsRetention(%s) = %s, want %s", test.interval, got, test.want)
+		}
+	}
+}
+
+func TestTelemetryReachesCeilingAtMinimumRetention(t *testing.T) {
+	configurations := []struct {
+		name     string
+		interval time.Duration
+	}{
+		{"1s", time.Second},
+		{"5s", 5 * time.Second},
+		{"10s", 10 * time.Second},
+		{"7s cadence rounds observation to a complete sample interval", 7 * time.Second},
+		{"1m", time.Minute},
+		{"1h", time.Hour},
+	}
+	for _, configuration := range configurations {
+		t.Run(configuration.name, func(t *testing.T) {
+			retention := MinimumMetricsRetention(configuration.interval)
+			telemetry := newTelemetryWithRetention(configuration.interval, retention)
+			wantSamples := int(minCeilingObservation / configuration.interval)
+			if remainder := minCeilingObservation % configuration.interval; remainder != 0 {
+				wantSamples++
+			}
+			if wantSamples < minDirectionSamples {
+				wantSamples = minDirectionSamples
+			}
+			if telemetry.maxSamples < minDirectionSamples {
+				t.Fatalf("minimum retention holds %d samples, need at least %d", telemetry.maxSamples, minDirectionSamples)
+			}
+
+			start := time.Unix(300, 0).UTC()
+			telemetry.sample(start, IngestSnapshot{})
+			for i := 1; i <= wantSamples; i++ {
+				// Keep the rate non-zero even when one sample spans an hour.
+				telemetry.recordRead(1<<30, 1, time.Millisecond)
+				telemetry.recordWrite(2<<30, time.Millisecond)
+				telemetry.sample(start.Add(time.Duration(i)*configuration.interval), IngestSnapshot{})
+			}
+			_, _, samples := telemetry.sample(start.Add(time.Duration(wantSamples)*configuration.interval), IngestSnapshot{})
+			if len(samples) < minDirectionSamples {
+				t.Fatalf("retained %d samples, want at least %d", len(samples), minDirectionSamples)
+			}
+			if got := estimateCeiling(samples); got.Source != "observed" || got.ReadBytesPerSecond == 0 || got.WriteBytesPerSecond == 0 {
+				t.Fatalf("minimum retention did not make observed ceiling reachable: %#v (samples=%d capacity=%d)", got, len(samples), telemetry.maxSamples)
+			}
+		})
+	}
+}
+
 func TestObservedCeilingCountsOnlyActualActiveIntervals(t *testing.T) {
 	samples := make([]PoolSample, 19)
 	for i := range samples {
@@ -225,7 +290,7 @@ func TestDirectIngestConstructorConfiguresTelemetry(t *testing.T) {
 	}
 	options := DefaultIngestOptions()
 	options.SampleInterval = 2 * time.Second
-	options.MetricsRetention = 10 * time.Second
+	options.MetricsRetention = 5 * time.Minute
 	service, err := NewIngestService(store, options)
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +299,7 @@ func TestDirectIngestConstructorConfiguresTelemetry(t *testing.T) {
 	backend.telemetry.mu.Lock()
 	interval, retention, maxSamples := backend.telemetry.sampleInterval, backend.telemetry.retention, backend.telemetry.maxSamples
 	backend.telemetry.mu.Unlock()
-	if interval != options.SampleInterval || retention != options.MetricsRetention || maxSamples != 5 {
+	if interval != options.SampleInterval || retention != options.MetricsRetention || maxSamples != 150 {
 		t.Fatalf("configured telemetry = interval %s retention %s max %d", interval, retention, maxSamples)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

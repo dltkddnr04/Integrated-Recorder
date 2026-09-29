@@ -107,10 +107,55 @@ func ValidateIngestOptions(options IngestOptions) error {
 	if options.SampleInterval < time.Second || options.SampleInterval > time.Hour {
 		return errors.New("storage metrics sampling interval must be between 1 s and 1 hour")
 	}
-	if options.MetricsRetention < options.SampleInterval || options.MetricsRetention > 24*time.Hour {
-		return errors.New("storage metrics retention must be at least the sampling interval and at most 24 hours")
+	minimumRetention := MinimumMetricsRetention(options.SampleInterval)
+	if options.MetricsRetention < minimumRetention || options.MetricsRetention > 24*time.Hour {
+		return fmt.Errorf("storage metrics retention must be at least %s for a sampling interval of %s and at most 24 hours", compactDuration(minimumRetention), compactDuration(options.SampleInterval))
 	}
 	return nil
+}
+
+func compactDuration(value time.Duration) string {
+	if value%time.Hour == 0 {
+		return englishCount(value/time.Hour, "hour")
+	}
+	if value%time.Minute == 0 {
+		hours, minutes := value/time.Hour, (value%time.Hour)/time.Minute
+		if hours > 0 && minutes > 0 {
+			return englishCount(hours, "hour") + " " + englishCount(minutes, "minute")
+		}
+		if hours > 0 {
+			return englishCount(hours, "hour")
+		}
+		return englishCount(minutes, "minute")
+	}
+	if value%time.Second == 0 {
+		hours, minutes, seconds := value/time.Hour, (value%time.Hour)/time.Minute, (value%time.Minute)/time.Second
+		if hours > 0 {
+			result := englishCount(hours, "hour")
+			if minutes > 0 {
+				result += " " + englishCount(minutes, "minute")
+			}
+			if seconds > 0 {
+				result += " " + englishCount(seconds, "second")
+			}
+			return result
+		}
+		if minutes > 0 && seconds > 0 {
+			return englishCount(minutes, "minute") + " " + englishCount(seconds, "second")
+		}
+		if minutes > 0 {
+			return englishCount(minutes, "minute")
+		}
+		return englishCount(seconds, "second")
+	}
+	return value.String()
+}
+
+func englishCount(count time.Duration, unit string) string {
+	if count != 1 {
+		unit += "s"
+	}
+	return fmt.Sprintf("%d %s", count, unit)
 }
 
 type IngestSnapshot struct {

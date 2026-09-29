@@ -52,7 +52,10 @@ describe('storage ingest settings UI', () => {
     expect(screen.getByLabelText('녹화별 버퍼 한도')).toHaveValue(768)
     expect(screen.getByLabelText('단일 페이로드 최대 크기')).toHaveValue(512)
     expect(screen.getByLabelText('측정 간격')).toHaveValue(5)
-    expect(screen.getByLabelText('측정 기록 보존 기간')).toHaveValue(24)
+    const retention = screen.getByLabelText('측정 기록 보존 기간')
+    expect(retention).toHaveValue(24)
+    expect(Number(retention.getAttribute('min'))).toBeCloseTo(5 / 60, 6)
+    expect(screen.getByText('관측 상한 계산에는 최소 5분의 비유휴 기록과 방향별 20개 샘플이 필요합니다.')).toBeInTheDocument()
     expect(screen.getByLabelText('총 저장 시도 횟수')).toHaveValue(5)
     expect(screen.getByText('최초 저장 시도를 포함한 최대 시도 횟수입니다.')).toBeInTheDocument()
     expect(screen.getByLabelText('저장 작업 동시 실행 수')).toBeDisabled()
@@ -68,6 +71,12 @@ describe('storage ingest settings UI', () => {
     expect(await screen.findByText(/서버를 재시작해야 적용됩니다/)).toBeInTheDocument()
     expect(within(screen.getByTestId('effective-storage-settings')).getByText('5초')).toBeInTheDocument()
     expect(screen.getByLabelText('측정 간격')).toHaveValue(10)
+
+    fireEvent.change(screen.getByLabelText('측정 간격'), { target: { value: '60' } })
+    expect(Number(retention.getAttribute('min'))).toBeCloseTo(1 / 3, 6)
+
+    fireEvent.change(screen.getByLabelText('측정 간격'), { target: { value: '7' } })
+    expect(Number(retention.getAttribute('min'))).toBeCloseTo(301_000 / 3_600_000, 6)
   })
 
   it('shows an authoritative server validation error for invalid related limits', async () => {

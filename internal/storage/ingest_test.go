@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -150,6 +151,61 @@ func TestIngestOptionsRequireMaximumReallocationPeak(t *testing.T) {
 	}
 }
 
+func TestValidateIngestOptionsRequiresReachableMetricsRetention(t *testing.T) {
+	valid := []struct {
+		name      string
+		interval  time.Duration
+		retention time.Duration
+	}{
+		{"1s/5m", time.Second, 5 * time.Minute},
+		{"5s/5m", 5 * time.Second, 5 * time.Minute},
+		{"7s/5m1s", 7 * time.Second, 5*time.Minute + time.Second},
+		{"10s/5m", 10 * time.Second, 5 * time.Minute},
+		{"1m/20m", time.Minute, 20 * time.Minute},
+		{"1h/20h", time.Hour, 20 * time.Hour},
+		{"1h/24h", time.Hour, 24 * time.Hour},
+	}
+	for _, test := range valid {
+		t.Run(test.name+" valid", func(t *testing.T) {
+			options := DefaultIngestOptions()
+			options.SampleInterval, options.MetricsRetention = test.interval, test.retention
+			if err := ValidateIngestOptions(options); err != nil {
+				t.Fatalf("ValidateIngestOptions() = %v, want valid configuration", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name      string
+		interval  time.Duration
+		retention time.Duration
+		want      string
+	}{
+		{"1s/1s", time.Second, time.Second, "at least 5 minutes"},
+		{"7s/5m", 7 * time.Second, 5 * time.Minute, "at least 5 minutes 1 second"},
+		{"7s/5m1s-minus-1ms", 7 * time.Second, 5*time.Minute + time.Second - time.Millisecond, "at least 5 minutes 1 second"},
+		{"1s/5m-minus-1ms", time.Second, 5*time.Minute - time.Millisecond, "at least 5 minutes"},
+		{"5s/5m-minus-1ms", 5 * time.Second, 5*time.Minute - time.Millisecond, "at least 5 minutes"},
+		{"10s/5m-minus-1ms", 10 * time.Second, 5*time.Minute - time.Millisecond, "at least 5 minutes"},
+		{"1m/5m", time.Minute, 5 * time.Minute, "at least 20 minutes"},
+		{"1m/20m-minus-1ms", time.Minute, 20*time.Minute - time.Millisecond, "at least 20 minutes"},
+		{"1h/1h", time.Hour, time.Hour, "at least 20 hours"},
+		{"1m cadence message is singular", time.Minute, 5 * time.Minute, "for a sampling interval of 1 minute"},
+		{"1m/19m59s", time.Minute, 19*time.Minute + 59*time.Second, "at least 20 minutes"},
+		{"1h/20h-minus-1ms", time.Hour, 20*time.Hour - time.Millisecond, "at least 20 hours"},
+		{"1h/19h59m59s", time.Hour, 19*time.Hour + 59*time.Minute + 59*time.Second, "at least 20 hours"},
+	}
+	for _, test := range invalid {
+		t.Run(test.name+" invalid", func(t *testing.T) {
+			options := DefaultIngestOptions()
+			options.SampleInterval, options.MetricsRetention = test.interval, test.retention
+			if err := ValidateIngestOptions(options); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ValidateIngestOptions() error = %v, want message containing %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestStoreIngestOptionsApplyBeforeConstructionAndCannotResizeService(t *testing.T) {
 	store, err := New(t.TempDir())
 	if err != nil {
@@ -161,7 +217,7 @@ func TestStoreIngestOptionsApplyBeforeConstructionAndCannotResizeService(t *test
 	options.PerRecordingBytes = 8 << 20
 	options.MaxPayloadBytes = 4 << 20
 	options.SampleInterval = time.Second
-	options.MetricsRetention = 2 * time.Second
+	options.MetricsRetention = 5 * time.Minute
 	if err := store.ConfigureIngestOptions(options); err != nil {
 		t.Fatal(err)
 	}

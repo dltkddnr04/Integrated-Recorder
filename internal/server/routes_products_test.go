@@ -520,6 +520,20 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 		t.Fatalf("invalid storage settings response=%d %s", invalidStorageResponse.Code, invalidStorageResponse.Body.String())
 	}
 
+	belowReachableRetention := settings.Current().Storage
+	belowReachableRetention.Observability.SamplingIntervalMS = 60_000
+	belowReachableRetention.Observability.MetricsRetentionMS = 300_000
+	belowReachableBody, _ := json.Marshal(map[string]any{"storage": belowReachableRetention})
+	beforeInvalidObservability := settings.Current().Storage
+	belowReachableResponse := httptest.NewRecorder()
+	handler.ServeHTTP(belowReachableResponse, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(belowReachableBody)))
+	if belowReachableResponse.Code != http.StatusBadRequest || !strings.Contains(belowReachableResponse.Body.String(), "at least 20 minutes") {
+		t.Fatalf("unreachable metrics retention response=%d %s", belowReachableResponse.Code, belowReachableResponse.Body.String())
+	}
+	if got := settings.Current().Storage; got != beforeInvalidObservability {
+		t.Fatal("invalid observability settings changed stored state")
+	}
+
 	invalid := httptest.NewRecorder()
 	handler.ServeHTTP(invalid, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(`{"ui":{"theme":"dark"},"unknown":true}`)))
 	if invalid.Code != http.StatusBadRequest {

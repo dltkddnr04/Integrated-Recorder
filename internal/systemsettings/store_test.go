@@ -255,6 +255,73 @@ func TestStorageSettingsRejectInvalidLimits(t *testing.T) {
 	}
 }
 
+func TestStorageSettingsMetricsRetentionReachability(t *testing.T) {
+	valid := []struct {
+		name        string
+		samplingMS  int64
+		retentionMS int64
+	}{
+		{"1s/5m", 1_000, 300_000},
+		{"5s/5m", 5_000, 300_000},
+		{"7s/5m1s", 7_000, 301_000},
+		{"10s/5m", 10_000, 300_000},
+		{"1m/20m", 60_000, 1_200_000},
+		{"1h/20h", 3_600_000, 72_000_000},
+		{"1h/24h", 3_600_000, 86_400_000},
+	}
+	for _, test := range valid {
+		t.Run(test.name+" accepted", func(t *testing.T) {
+			store, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := defaultStorageSettings()
+			candidate.Observability.SamplingIntervalMS = test.samplingMS
+			candidate.Observability.MetricsRetentionMS = test.retentionMS
+			if _, err := store.Update(Patch{Storage: &candidate}); err != nil {
+				t.Fatalf("Update() rejected reachable boundary: %v", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name        string
+		samplingMS  int64
+		retentionMS int64
+		want        string
+	}{
+		{"1s/1s", 1_000, 1_000, "at least 5 minutes"},
+		{"7s/5m", 7_000, 300_000, "at least 5 minutes 1 second"},
+		{"7s/5m1s minus 1ms", 7_000, 300_999, "at least 5 minutes 1 second"},
+		{"1s/5m minus 1ms", 1_000, 299_999, "at least 5 minutes"},
+		{"5s/5m minus 1ms", 5_000, 299_999, "at least 5 minutes"},
+		{"10s/5m minus 1ms", 10_000, 299_999, "at least 5 minutes"},
+		{"1m/5m", 60_000, 300_000, "at least 20 minutes"},
+		{"1h/1h", 3_600_000, 3_600_000, "at least 20 hours"},
+		{"1m/one millisecond below", 60_000, 1_199_999, "at least 20 minutes"},
+		{"1h/one millisecond below", 3_600_000, 71_999_999, "at least 20 hours"},
+	}
+	for _, test := range invalid {
+		t.Run(test.name+" rejected", func(t *testing.T) {
+			store, err := Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := defaultStorageSettings()
+			candidate.Observability.SamplingIntervalMS = test.samplingMS
+			candidate.Observability.MetricsRetentionMS = test.retentionMS
+			before := store.Current().Storage
+			_, err = store.Update(Patch{Storage: &candidate})
+			if !errors.Is(err, ErrInvalidSettings) || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Update() error = %v, want invalid settings containing %q", err, test.want)
+			}
+			if got := store.Current().Storage; got != before {
+				t.Fatalf("invalid observability settings changed stored state")
+			}
+		})
+	}
+}
+
 func TestOpenRejectsUnknownAndTrailingJSON(t *testing.T) {
 	for _, test := range []struct {
 		name string

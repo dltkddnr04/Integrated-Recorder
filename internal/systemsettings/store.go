@@ -247,8 +247,8 @@ func validate(settings Settings) error {
 	if storageSettings.Observability.SamplingIntervalMS < 1_000 || storageSettings.Observability.SamplingIntervalMS > 3_600_000 {
 		return fmt.Errorf("%w: storage metrics sampling interval must be between 1 s and 1 hour", ErrInvalidSettings)
 	}
-	if storageSettings.Observability.MetricsRetentionMS < storageSettings.Observability.SamplingIntervalMS || storageSettings.Observability.MetricsRetentionMS > 86_400_000 {
-		return fmt.Errorf("%w: storage metrics retention must be at least the sampling interval and at most 24 hours", ErrInvalidSettings)
+	if storageSettings.Observability.MetricsRetentionMS < 1 || storageSettings.Observability.MetricsRetentionMS > 86_400_000 {
+		return fmt.Errorf("%w: storage metrics retention must be between 1 ms and 24 hours", ErrInvalidSettings)
 	}
 	if err := storage.ValidateIngestOptions(settings.Storage.IngestOptions()); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidSettings, err)
