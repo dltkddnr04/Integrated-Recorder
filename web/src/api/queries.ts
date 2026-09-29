@@ -1,8 +1,9 @@
 import { queryOptions } from '@tanstack/react-query'
-import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery } from './index'
+import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, storageAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
 
 export const qk = {
   session: ['auth', 'session'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
+  storagePools: ['storage', 'pools'] as const, storageMetrics: (poolId: string, window: StorageMetricWindow) => ['storage', 'pool', poolId, 'metrics', window] as const,
   settings: ['settings'] as const, recordings: (query: RecordingQuery) => ['recordings', query] as const,
   recording: (id: string) => ['recording', id] as const, tags: (id: string) => ['recording', id, 'tags'] as const,
   previews: (id: string, query: PreviewQuery) => ['recording', id, 'previews', query] as const,
@@ -18,6 +19,11 @@ export const qk = {
 export const sessionQuery = queryOptions({ queryKey: qk.session, queryFn: authAPI.session, retry: false, staleTime: 10_000 })
 export const adaptersQuery = queryOptions({ queryKey: qk.adapters, queryFn: adaptersAPI.list, staleTime: 15_000, refetchInterval: 20_000, refetchIntervalInBackground: false })
 export const dashboardQuery = queryOptions({ queryKey: qk.dashboard, queryFn: dashboardAPI.get, staleTime: 10_000, refetchInterval: 15_000, refetchIntervalInBackground: false })
+export const storagePoolsQuery = queryOptions({ queryKey: qk.storagePools, queryFn: storageAPI.pools, staleTime: 2_000, refetchInterval: 5_000, refetchIntervalInBackground: false })
+export const storageMetricsQuery = (poolId: string, window: StorageMetricWindow, enabled = true) => queryOptions({
+  queryKey: qk.storageMetrics(poolId, window), queryFn: () => storageAPI.metrics(poolId, window), enabled: enabled && Boolean(poolId),
+  staleTime: 2_000, refetchInterval: 5_000, refetchIntervalInBackground: false,
+})
 export const notificationsQuery = queryOptions({ queryKey: qk.notifications, queryFn: productAPI.notifications, staleTime: 15_000, refetchInterval: 30_000, refetchIntervalInBackground: false })
 export const workflowsQuery = queryOptions({ queryKey: qk.workflows, queryFn: workflowsAPI.list, staleTime: 5_000, refetchInterval: query => query.state.data?.some(workflow => workflow.in_progress) ? 8_000 : false, refetchIntervalInBackground: false })
 const watchIsActive = (state: string) => state === 'checking' || state === 'starting' || state === 'recording' || state === 'backoff'

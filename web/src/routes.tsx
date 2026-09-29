@@ -15,6 +15,8 @@ const SettingsPage = lazy(() => import('@/routes/settings').then(module => ({ de
 const WatchesPage = lazy(() => import('@/routes/watches').then(module => ({ default: module.WatchesPage })))
 const WatchNewPage = lazy(() => import('@/routes/watch-new').then(module => ({ default: module.WatchNewPage })))
 const WatchDetailPage = lazy(() => import('@/routes/watch-detail').then(module => ({ default: module.WatchDetailPage })))
+const StoragePage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StoragePage })))
+const StoragePoolDetailPage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StoragePoolDetailPage })))
 const LoginPage = lazy(() => import('@/routes/login').then(module => ({ default: module.LoginPage })))
 import { NotFoundPage } from '@/routes/not-found'
 import { isRecordingState } from '@/types/api'
@@ -55,7 +57,9 @@ const settingsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/set
 const watchesRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches', component: WatchesPage })
 const watchNewRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches/new', component: WatchNewPage })
 const watchDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/watches/$watchId', component: WatchDetailPage })
+const storageRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage', component: StoragePage })
+const storagePoolRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage/$poolId', component: StoragePoolDetailPage })
 
-const routeTree = rootRoute.addChildren([loginRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([loginRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, storageRoute, storagePoolRoute, settingsRoute])
 export const router = createRouter({ routeTree, context: { queryClient: undefined! }, defaultPreload: 'intent', defaultPreloadStaleTime: 0 })
 declare module '@tanstack/react-router' { interface Register { router: typeof router } }

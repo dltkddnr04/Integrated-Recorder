@@ -103,6 +103,19 @@ export type Dashboard = {
   watches?: { total: number; enabled: number; recording: number; offline: number; backoff: number; attention_required: number }
 }
 export type StorageInfo = { archive_root: string; filesystem_total_bytes: number; filesystem_used_bytes: number; filesystem_available_bytes: number; recordings_bytes: number; recording_count: number; segment_count: number; init_segment_count: number; manifest_count: number }
+export type StoragePool = {
+  id: string; display_name: string; kind: string; role: string; health: string;
+  capacity: { total_bytes: number; used_bytes: number; available_bytes: number; usage_ratio: number };
+  throughput: { read_bytes_per_second: number; write_bytes_per_second: number; read_bytes_total: number; write_bytes_total: number; read_latency_ms: number; write_latency_ms: number };
+  estimated_ceiling: { read_bytes_per_second?: number; write_bytes_per_second?: number; source: 'observed' | 'unknown' | 'configured' | 'benchmarked' };
+  buffer: { used_bytes: number; capacity_bytes: number; utilization: number };
+  queue: { objects: number; bytes: number; oldest_age_seconds: number };
+  writers: { active: number; limit: number };
+  errors_total: number
+}
+export type StorageMetricSample = { at: string; read_bytes_per_second: number; write_bytes_per_second: number; buffer_used_bytes: number; persist_queue_bytes: number }
+export type StoragePoolsResponse = { items: StoragePool[] }
+export type StorageMetricsResponse = { pool_id: string; sample_interval_seconds: number; items: StorageMetricSample[] }
 export type SystemInfo = { version: string; commit: string; go_version: string; goos: string; goarch: string; started_at: string; uptime_seconds: number; export_available: boolean }
 export type SystemSettings = { settings: { ui: { theme: 'system' | 'light' | 'dark' }; integrity: { concurrency: number }; retention: { enabled: boolean; completed_after_days: number } }; restart_required: string[] }
 export type SearchResult = { type: 'recording' | 'adapter' | 'resource' | 'workflow'; id?: string; workflow_id?: string; adapter_id?: string; resource_type?: string; resource_id?: string; title?: string; name?: string; display_name?: string; state?: string; resource?: ResourceRef }

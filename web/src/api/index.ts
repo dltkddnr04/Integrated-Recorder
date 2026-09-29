@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingPage, RecordingSummary, Resource, ResourceRef, Schema, SearchResult, StorageInfo, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingPage, RecordingSummary, Resource, ResourceRef, Schema, SearchResult, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -9,6 +9,11 @@ export const authAPI = {
 }
 export const dashboardAPI = {
   get: () => api<Dashboard>('/api/dashboard'), storage: () => api<StorageInfo>('/api/system/storage'), info: () => api<SystemInfo>('/api/system/info'),
+}
+export type StorageMetricWindow = '1h' | '6h' | '24h'
+export const storageAPI = {
+  pools: () => api<StoragePoolsResponse>('/api/storage/pools'),
+  metrics: (poolId: string, window: StorageMetricWindow) => api<StorageMetricsResponse>(`/api/storage/pools/${encodeURIComponent(poolId)}/metrics${queryString({ window })}`),
 }
 export type RecordingQuery = { q?: string; state?: string; adapter?: string; resource_type?: string; started_after?: string; started_before?: string; has_gaps?: string; integrity?: string; tag?: string; sort?: string; limit?: number; cursor?: string }
 export type PreviewQuery = { sampling: 'uniform' | 'recent' | 'nearest'; limit: number; time_seconds?: number }

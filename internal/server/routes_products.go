@@ -44,6 +44,8 @@ func (s *Server) registerProductRoutes() {
 	s.mux.HandleFunc("GET /api/v2/recordings", s.recordingsQuery)
 	s.mux.HandleFunc("GET /api/dashboard", s.dashboard)
 	s.mux.HandleFunc("GET /api/system/storage", s.systemStorage)
+	s.mux.HandleFunc("GET /api/storage/pools", s.storagePools)
+	s.mux.HandleFunc("GET /api/storage/pools/{pool_id}/metrics", s.storagePoolMetrics)
 	s.mux.HandleFunc("GET /api/system/info", s.systemInfo)
 	s.mux.HandleFunc("GET /api/recordings/{id}/tags", s.recordingTagsGet)
 	s.mux.HandleFunc("PUT /api/recordings/{id}/tags", s.recordingTagsPut)

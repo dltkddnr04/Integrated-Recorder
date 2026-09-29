@@ -1,0 +1,162 @@
+package server
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+)
+
+type storagePoolsResponse struct {
+	Items []storagePoolView `json:"items"`
+}
+
+type storagePoolView struct {
+	ID               string                `json:"id"`
+	DisplayName      string                `json:"display_name"`
+	Kind             string                `json:"kind"`
+	Role             string                `json:"role"`
+	Health           string                `json:"health"`
+	Capacity         storage.PoolCapacity  `json:"capacity"`
+	Throughput       storageThroughputView `json:"throughput"`
+	EstimatedCeiling storageCeilingView    `json:"estimated_ceiling"`
+	Buffer           storageBufferView     `json:"buffer"`
+	Queue            storageQueueView      `json:"queue"`
+	Writers          storageWritersView    `json:"writers"`
+	ErrorsTotal      uint64                `json:"errors_total"`
+}
+
+type storageThroughputView struct {
+	ReadBytesPerSecond  uint64  `json:"read_bytes_per_second"`
+	WriteBytesPerSecond uint64  `json:"write_bytes_per_second"`
+	ReadBytesTotal      uint64  `json:"read_bytes_total"`
+	WriteBytesTotal     uint64  `json:"write_bytes_total"`
+	ReadLatencyMillis   float64 `json:"read_latency_ms"`
+	WriteLatencyMillis  float64 `json:"write_latency_ms"`
+}
+
+type storageCeilingView struct {
+	ReadBytesPerSecond  uint64 `json:"read_bytes_per_second,omitempty"`
+	WriteBytesPerSecond uint64 `json:"write_bytes_per_second,omitempty"`
+	Source              string `json:"source"`
+}
+
+type storageBufferView struct {
+	UsedBytes                 int64   `json:"used_bytes"`
+	CapacityBytes             int64   `json:"capacity_bytes"`
+	PerRecordingCapacityBytes int64   `json:"per_recording_capacity_bytes"`
+	ReservedBytes             int64   `json:"reserved_bytes"`
+	Utilization               float64 `json:"utilization"`
+}
+
+type storageQueueView struct {
+	Objects          int     `json:"objects"`
+	Bytes            int64   `json:"bytes"`
+	OldestAgeSeconds float64 `json:"oldest_age_seconds"`
+}
+
+type storageWritersView struct {
+	Active int `json:"active"`
+	Limit  int `json:"limit"`
+}
+
+type storageMetricsResponse struct {
+	PoolID                string                `json:"pool_id"`
+	SampleIntervalSeconds int                   `json:"sample_interval_seconds"`
+	Items                 []storageMetricSample `json:"items"`
+}
+
+type storageMetricSample struct {
+	At                  time.Time `json:"at"`
+	ReadBytesPerSecond  uint64    `json:"read_bytes_per_second"`
+	WriteBytesPerSecond uint64    `json:"write_bytes_per_second"`
+	BufferUsedBytes     int64     `json:"buffer_used_bytes"`
+	PersistQueueBytes   int64     `json:"persist_queue_bytes"`
+}
+
+func (s *Server) storagePools(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil || s.manager.Store() == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage_unavailable"})
+		return
+	}
+	snapshot := s.manager.Store().PoolMetrics()
+	writeJSON(w, http.StatusOK, storagePoolsResponse{Items: []storagePoolView{poolView(snapshot)}})
+}
+
+func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.manager == nil || s.manager.Store() == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage_unavailable"})
+		return
+	}
+	poolID := r.PathValue("pool_id")
+	if poolID != storage.PoolIDLocalPrimary {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "storage_pool_not_found"})
+		return
+	}
+	window, interval, ok := storageMetricsWindow(r.URL.Query().Get("window"))
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_storage_metrics_window"})
+		return
+	}
+	snapshot := s.manager.Store().PoolMetricsWindow(window)
+	items := make([]storageMetricSample, 0, len(snapshot.Samples))
+	for _, sample := range snapshot.Samples {
+		items = append(items, storageMetricSample{
+			At: sample.At, ReadBytesPerSecond: sample.ReadBytesPerSecond,
+			WriteBytesPerSecond: sample.WriteBytesPerSecond,
+			BufferUsedBytes:     sample.BufferUsedBytes, PersistQueueBytes: sample.PersistQueueBytes,
+		})
+	}
+	writeJSON(w, http.StatusOK, storageMetricsResponse{PoolID: poolID, SampleIntervalSeconds: interval, Items: items})
+}
+
+func storageMetricsWindow(value string) (time.Duration, int, bool) {
+	switch value {
+	case "", "1h":
+		return time.Hour, 5, true
+	case "6h":
+		return 6 * time.Hour, 5, true
+	case "24h":
+		return 24 * time.Hour, 5, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func poolView(snapshot storage.PoolSnapshot) storagePoolView {
+	utilization := 0.0
+	if snapshot.Buffer.CapacityBytes > 0 {
+		utilization = float64(snapshot.Buffer.UsedBytes) / float64(snapshot.Buffer.CapacityBytes)
+	}
+	return storagePoolView{
+		ID: snapshot.ID, DisplayName: snapshot.DisplayName, Kind: snapshot.Kind,
+		Role: snapshot.Role, Health: snapshot.Health, Capacity: snapshot.Capacity,
+		Throughput: storageThroughputView{
+			ReadBytesPerSecond:  snapshot.Throughput.ReadBytesPerSecond,
+			WriteBytesPerSecond: snapshot.Throughput.WriteBytesPerSecond,
+			ReadBytesTotal:      snapshot.Throughput.ReadBytesTotal,
+			WriteBytesTotal:     snapshot.Throughput.WriteBytesTotal,
+			ReadLatencyMillis:   snapshot.Throughput.ReadLatencyMillis,
+			WriteLatencyMillis:  snapshot.Throughput.WriteLatencyMillis,
+		},
+		EstimatedCeiling: storageCeilingView{
+			ReadBytesPerSecond:  snapshot.EstimatedCeiling.ReadBytesPerSecond,
+			WriteBytesPerSecond: snapshot.EstimatedCeiling.WriteBytesPerSecond,
+			Source:              snapshot.EstimatedCeiling.Source,
+		},
+		Buffer: storageBufferView{
+			UsedBytes:                 snapshot.Buffer.UsedBytes,
+			CapacityBytes:             snapshot.Buffer.CapacityBytes,
+			PerRecordingCapacityBytes: snapshot.Buffer.PerRecordingCapacityBytes,
+			ReservedBytes:             snapshot.Buffer.ReservedBytes,
+			Utilization:               utilization,
+		},
+		Queue: storageQueueView{
+			Objects:          snapshot.Queue.Objects,
+			Bytes:            snapshot.Queue.Bytes,
+			OldestAgeSeconds: snapshot.Queue.OldestAgeSeconds,
+		},
+		Writers:     storageWritersView{Active: snapshot.Writers.Active, Limit: snapshot.Writers.Limit},
+		ErrorsTotal: snapshot.ErrorsTotal,
+	}
+}

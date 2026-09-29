@@ -80,11 +80,21 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   await expectOwncastLogo(page)
   expect(requests.some(path => path.includes('bootstrap-token'))).toBe(false)
 
-  for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/owncast', '/workflows', '/settings']) {
+  for (const route of ['/', '/recordings', '/new', '/adapters', '/adapters/owncast', '/workflows', '/settings', '/storage', '/storage/local-primary']) {
     await page.goto(route)
     await assertResponsive(page)
     await assertNoCSPViolations(cspViolations)
   }
+  await page.goto('/storage')
+  await expect(page.getByRole('heading', { name: '저장소', exact: true })).toBeVisible()
+  await expect(page.getByText('local-primary', { exact: false }).first()).toBeVisible()
+  await page.goto('/storage/local-primary')
+  await expect(page.getByRole('heading', { name: '기본 보관 저장소' })).toBeVisible()
+  const noMetricHistory = page.getByText('표시할 측정 기록이 없습니다.').first()
+  const throughputChart = page.getByTestId('metric-chart-throughput')
+  await expect.poll(async () => (await noMetricHistory.count()) > 0 || (await throughputChart.count()) > 0).toBe(true)
+  if (await noMetricHistory.count()) await expect(noMetricHistory).toBeVisible()
+  else await expect(throughputChart.locator('svg')).toBeVisible()
   await page.goto('/recordings')
   const recordingState = page.getByRole('combobox', { name: '상태 필터' })
   const recordingAdapter = page.getByRole('combobox', { name: '어댑터 필터' })
@@ -180,7 +190,20 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   await expect(page).toHaveURL(new RegExp(`/recordings/${recordingID}$`))
   await expectOwncastLogo(page)
 
+  await page.goto('/storage/local-primary')
+  await expect.poll(async () => {
+    const response = await page.request.get('/api/storage/pools/local-primary/metrics?window=1h')
+    if (!response.ok()) return 0
+    const body = await response.json() as { items?: unknown[] }
+    return body.items?.length ?? 0
+  }, { timeout: 20_000 }).toBeGreaterThan(0)
+  await expect(page.getByTestId('metric-chart-throughput').locator('svg')).toBeVisible()
+  await expect(page.getByTestId('metric-chart-backlog').locator('svg')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Recorder 읽기/쓰기', exact: true })).toBeVisible()
   await assertResponsive(page)
+
+  await page.goto(`/recordings/${recordingID}`)
+  await expect(page.getByRole('heading', { name: 'Browser E2E Owncast capture' })).toBeVisible()
 
   await page.getByRole('button', { name: '삭제' }).click()
   await expect(page.getByRole('alertdialog')).toContainText('되돌릴 수 없습니다')
@@ -197,7 +220,7 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   await expect(page.getByText('Browser E2E Owncast capture')).toHaveCount(0)
   expect((await page.request.get(`/api/recordings/${recordingID}`)).status()).toBe(404)
 
-  for (const path of ['/login', '/', '/recordings', '/recordings/demo', '/new', '/adapters', '/adapters/owncast', '/workflows', '/workflows/demo', '/settings']) {
+  for (const path of ['/login', '/', '/recordings', '/recordings/demo', '/new', '/adapters', '/adapters/owncast', '/workflows', '/workflows/demo', '/settings', '/storage', '/storage/local-primary']) {
     const response = await page.request.get(path, { headers: { accept: 'text/html' } })
     expect(response.status(), `${path} should be served as an SPA route`).toBe(200)
     expect(response.headers()['content-type']).toContain('text/html')
