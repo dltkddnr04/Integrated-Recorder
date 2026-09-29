@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { Timeline } from './recording-detail'
+import { MetadataTimeline, Timeline } from './recording-detail'
 
 describe('recording capture timeline', () => {
   it('orders each track by source epoch and sequence, not by source sequence alone', () => {
@@ -21,5 +21,32 @@ describe('recording capture timeline', () => {
     ])
     const gap = screen.getByTitle('누락 · 세대 1 · 순번 2–3')
     expect(gap).toHaveStyle({ flexGrow: '2' })
+  })
+})
+
+describe('source metadata timeline', () => {
+  it('shows the empty state when an older recording has no metadata history', () => {
+    render(<MetadataTimeline data={{ items: [], truncated: false }} loading={false} error={undefined} retry={() => undefined} />)
+    expect(screen.getByText('수집된 방송 메타데이터가 없습니다.')).toBeTruthy()
+  })
+
+  it('renders source text as text, preserves empty values, and shows chronological revisions', () => {
+    const untrustedText = '<script>do not execute</script>'
+    const observedAt = '2026-09-29T12:00:00Z'
+    const laterAt = '2026-09-29T12:30:00Z'
+    const { container } = render(<MetadataTimeline data={{
+      current: { observed_at: laterAt, title: 'Updated title', description: '' },
+      items: [
+        { observed_at: observedAt, title: untrustedText, description: 'plain description' },
+        { observed_at: laterAt, title: 'Updated title', description: '' },
+      ],
+      truncated: true,
+    }} loading={false} error={undefined} retry={() => undefined} />)
+
+    expect(screen.getByText(untrustedText)).toBeTruthy()
+    expect(container.querySelector('script')).toBeNull()
+    expect(screen.getAllByText('— (비어 있음)').length).toBeGreaterThan(0)
+    expect(screen.getByText('메타데이터 변경 기록')).toBeTruthy()
+    expect(screen.getByText(/보존 한도에 도달/)).toBeTruthy()
   })
 })

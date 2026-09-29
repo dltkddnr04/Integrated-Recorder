@@ -53,7 +53,7 @@ The first live acceptance test used the public Owncast TV example stream: 90 seg
 
 Not supported yet:
 
-- chat and broadcast-metadata timeline;
+- chat timeline;
 - finalized TAR/index archive format;
 - HDD/NAS/LTO storage lifecycle;
 - additional platform adapters;
@@ -163,7 +163,7 @@ go vet ./...
 - [x] Original segment acquisition + restart-safe VOD playback
 - [x] Platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
 - [x] Resource discovery, configuration inheritance, and challenge/resume foundation
-- [ ] Broadcast metadata + chat timeline
+- [ ] Chat timeline
 - [ ] Finalized archive packaging + random-access index
 - [x] React management SPA and connected product API foundation
 - [ ] Additional platform adapters such as CHZZK, SOOP, and Twitch

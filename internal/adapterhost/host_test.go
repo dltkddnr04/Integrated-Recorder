@@ -95,6 +95,14 @@ func runHelperAdapter() int {
 			if mode == "refresh" {
 				capabilities = append(capabilities, adapterproto.CapabilityRefresh)
 			}
+			if mode == "metadata" {
+				capabilities = append(capabilities, adapterproto.CapabilityMetadata)
+				configurationSchema.Fields = []adapterproto.Field{
+					{Key: "label", Control: "text", Label: "Label", Inherit: true},
+					{Key: "token", Control: "secret", Label: "Token", Inherit: true},
+				}
+				resourceTypes = []adapterproto.ResourceType{{Type: "alpha"}}
+			}
 			if mode == "watch" || strings.HasPrefix(mode, "watch_error_") {
 				capabilities = append(capabilities, adapterproto.CapabilityWatch)
 				if mode == "watch" {
@@ -312,6 +320,24 @@ func runHelperAdapter() int {
 				break
 			}
 			response, _ = adapterproto.Success(request.ID, adapterproto.RefreshResult{Media: adapterproto.MediaSource{Type: "hls", ManifestURL: "https://refresh.example/new.m3u8"}, State: []adapterproto.StateMutation{{Secrets: map[string]string{"session": "refresh-state-sentinel"}}}})
+		case adapterproto.MethodMetadata:
+			if mode != "metadata" {
+				response = adapterproto.Failure(request.ID, "unsupported_method", "unsupported", nil)
+				break
+			}
+			var params adapterproto.MetadataParams
+			if json.Unmarshal(request.Params, &params) != nil {
+				response = adapterproto.Failure(request.ID, "invalid_metadata_context", "invalid metadata context", nil)
+				break
+			}
+			checks := []bool{params.Resource != nil && params.Resource.ID == "child", params.Configuration["label"] != nil && string(params.Configuration["label"]) == `"stored"`, params.Secrets["token"] == "private-config-secret", params.Current.ManifestURL == "https://current.example/live.m3u8", hasStateSecret(params.State, "session", "private-state-secret")}
+			if checks[0] && checks[1] && checks[2] && checks[3] && checks[4] {
+				title, description := "fixture title", ""
+				response, _ = adapterproto.Success(request.ID, adapterproto.MetadataResult{Metadata: adapterproto.StreamMetadata{Title: &title, Description: &description}, StateMutations: []adapterproto.StateMutation{{Secrets: map[string]string{"session": "metadata-updated-secret"}}}})
+			} else {
+				title := fmt.Sprintf("context checks %v", checks)
+				response, _ = adapterproto.Success(request.ID, adapterproto.MetadataResult{Metadata: adapterproto.StreamMetadata{Title: &title}})
+			}
 		case adapterproto.MethodShutdown:
 			if mode == "hang_shutdown" {
 				time.Sleep(30 * time.Second)
@@ -333,6 +359,15 @@ func runHelperAdapter() int {
 			return 0
 		}
 	}
+}
+
+func hasStateSecret(documents []adapterproto.StateDocument, key, value string) bool {
+	for _, document := range documents {
+		if document.Secrets[key] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDiscoverExecutableAndIgnoresNonExecutable(t *testing.T) {
@@ -1666,6 +1701,83 @@ func TestWatchCheckUsesSeparatedInputSecretAndLegacyResolveKeepsInlineSecret(t *
 	}
 	if media.ManifestURL != "https://legacy.example/live.m3u8" {
 		t.Fatalf("legacy resolve media = %#v", media)
+	}
+}
+
+func TestPrepareMetadataUsesEffectiveContextAndDefersStateMutation(t *testing.T) {
+	dir := t.TempDir()
+	writeAdapter(t, dir, binaryPrefix+"metadata", "metadata", "metadata", true)
+	configStore, secretStore, state, err := pluginconfig.NewTypedFileStoresAndState(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configs, err := pluginconfig.NewService(configStore, secretStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := DiscoverWithState(context.Background(), dir, configs, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	descriptor, err := host.Descriptor("metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = configs.Put(pluginconfig.Scope{PluginID: "metadata"}, descriptor.ConfigurationSchema,
+		map[string]json.RawMessage{"label": json.RawMessage(`"stored"`)},
+		map[string]string{"token": "private-config-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = state.Apply([]pluginconfig.StateMutation{{Scope: pluginconfig.Scope{PluginID: "metadata"}, Secrets: map[string]string{"session": "private-state-secret"}}}); err != nil {
+		t.Fatal(err)
+	}
+	resource := &adapterproto.ResourceRef{Type: "alpha", ID: "child"}
+	current := adapterproto.MediaSource{Type: "hls", ManifestURL: "https://current.example/live.m3u8"}
+	result, commit, supported, err := host.PrepareMetadata(context.Background(), "metadata", resource, current)
+	if err != nil || !supported || result.Metadata.Title == nil || *result.Metadata.Title != "fixture title" || result.Metadata.Description == nil || *result.Metadata.Description != "" || commit == nil {
+		var title string
+		if result.Metadata.Title != nil {
+			title = *result.Metadata.Title
+		}
+		t.Fatalf("prepared metadata=%#v title=%q supported=%v err=%v", result, title, supported, err)
+	}
+	doc, err := state.Get(pluginconfig.Scope{PluginID: "metadata"})
+	if err != nil || doc.Secrets["session"] != "private-state-secret" {
+		t.Fatalf("metadata state mutation committed before canonical caller: %#v, %v", doc.Secrets, err)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	doc, err = state.Get(pluginconfig.Scope{PluginID: "metadata"})
+	if err != nil || doc.Secrets["session"] != "metadata-updated-secret" {
+		t.Fatalf("metadata state mutation was not applied: %#v, %v", doc.Secrets, err)
+	}
+
+	entry, err := host.entryFor("metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry.stateMu.Lock()
+	process := entry.process
+	entry.stateMu.Unlock()
+	process.kill()
+	if _, _, supported, err = host.PrepareMetadata(context.Background(), "metadata", resource, current); err != nil || !supported {
+		t.Fatalf("metadata call after adapter restart: supported=%v err=%v", supported, err)
+	}
+}
+
+func TestPrepareMetadataReportsUnsupportedCapabilityWithoutCallingAdapter(t *testing.T) {
+	dir := t.TempDir()
+	writeAdapter(t, dir, binaryPrefix+"plain", "normal", "plain", true)
+	host, err := Discover(context.Background(), dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	_, _, supported, err := host.PrepareMetadata(context.Background(), "plain", nil, adapterproto.MediaSource{Type: "hls", ManifestURL: "https://plain.example/live.m3u8"})
+	if err != nil || supported {
+		t.Fatalf("metadata unsupported result supported=%v err=%v", supported, err)
 	}
 }
 

@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingPage, RecordingSummary, Resource, ResourceRef, Schema, SearchResult, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, Schema, SearchResult, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -28,6 +28,7 @@ export const recordingsAPI = {
   setTags: (id: string, tags: string[]) => api<{ tags: string[] }>(`/api/recordings/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: { tags } }),
   archive: (id: string) => api<{ recording_id: string; entries: ArchiveEntry[] }>(`/api/recordings/${encodeURIComponent(id)}/archive/index`),
   events: (id: string) => api<{ items: RecordingEvent[] }>(`/api/recordings/${encodeURIComponent(id)}/events`),
+  metadata: (id: string) => api<RecordingMetadata>(`/api/recordings/${encodeURIComponent(id)}/metadata`),
   previews: (id: string, query: PreviewQuery) => api<PreviewFramesResponse>(`/api/recordings/${encodeURIComponent(id)}/previews${queryString(query)}`),
   previewFrame: (id: string, ordinal: number) => `/api/recordings/${encodeURIComponent(id)}/previews/${encodeURIComponent(String(ordinal))}`,
   enablePreviews: (id: string) => api<import('@/types/api').PreviewSummary>(`/api/recordings/${encodeURIComponent(id)}/previews`, { method: 'POST', body: { mode: 'segment' } }),

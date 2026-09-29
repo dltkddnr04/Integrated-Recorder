@@ -32,6 +32,11 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	recording := writeProductRecording(t, store, strings.Repeat("a", 32), domain.StateCompleted)
+	sourceTitle, sourceDescription := "source title sentinel", "plain source description"
+	recording.MetadataTimeline = []domain.MetadataRevision{{ObservedAt: time.Date(2026, 9, 28, 14, 0, 0, 0, time.UTC), Title: &sourceTitle, Description: &sourceDescription}}
+	if err := store.SaveRecording(recording); err != nil {
+		t.Fatal(err)
+	}
 	manager, err := acquire.NewManager(store, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -79,7 +84,16 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 	if index.Code != http.StatusOK || strings.Contains(index.Body.String(), "private.invalid") || strings.Contains(index.Body.String(), root) || !strings.Contains(index.Body.String(), "tracks/main/00000001.ts") {
 		t.Fatalf("archive index=%d %s", index.Code, index.Body.String())
 	}
-
+	metadata := httptest.NewRecorder()
+	handler.ServeHTTP(metadata, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID+"/metadata", nil))
+	if metadata.Code != http.StatusOK || !strings.Contains(metadata.Body.String(), sourceTitle) || !strings.Contains(metadata.Body.String(), sourceDescription) || strings.Contains(metadata.Body.String(), "private.invalid") || strings.Contains(metadata.Body.String(), root) || strings.Contains(metadata.Body.String(), "manifest_url") || !strings.Contains(metadata.Body.String(), `"items":[`) {
+		t.Fatalf("metadata projection=%d %s", metadata.Code, metadata.Body.String())
+	}
+	detailResponse := httptest.NewRecorder()
+	handler.ServeHTTP(detailResponse, httptest.NewRequest(http.MethodGet, "/api/recordings/"+recording.ID, nil))
+	if detailResponse.Code != http.StatusOK || strings.Contains(detailResponse.Body.String(), "metadata_timeline") || strings.Contains(detailResponse.Body.String(), sourceTitle) {
+		t.Fatalf("regular recording detail leaked metadata history: %d %s", detailResponse.Code, detailResponse.Body.String())
+	}
 	verify := httptest.NewRecorder()
 	handler.ServeHTTP(verify, httptest.NewRequest(http.MethodPost, "/api/recordings/"+recording.ID+"/integrity/verify", nil))
 	if verify.Code != http.StatusAccepted {
@@ -113,6 +127,25 @@ func TestRecordingManagementAPIsUseCanonicalArchive(t *testing.T) {
 	}
 	if got := products.Audit(10); len(got) != 2 || got[0].Type != "integrity_requested" || got[1].Type != "recording_tags_updated" {
 		t.Fatalf("tag audit=%+v", got)
+	}
+}
+
+func TestRecordingMetadataAPIUsesEmptyArrayForLegacyArchive(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := writeProductRecording(t, store, strings.Repeat("b", 32), domain.StateCompleted)
+	manager, err := acquire.NewManager(store, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(manager, nil, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/recordings/"+legacy.ID+"/metadata", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"items":[]`) || strings.Contains(response.Body.String(), `"items":null`) {
+		t.Fatalf("legacy recording metadata response=%d %s, want an empty array", response.Code, response.Body.String())
 	}
 }
 

@@ -1376,6 +1376,58 @@ func (h *Host) PrepareRefresh(ctx context.Context, id string, resource *adapterp
 	return result.Media, commit, nil
 }
 
+// PrepareMetadata observes adapter-defined source title/description using the
+// current media snapshot. State mutations are validated here but committed by
+// the caller only after its canonical recording update is durable.
+func (h *Host) PrepareMetadata(ctx context.Context, id string, resource *adapterproto.ResourceRef, current adapterproto.MediaSource) (adapterproto.MetadataResult, func() error, bool, error) {
+	d, err := h.Descriptor(id)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, false, err
+	}
+	if !hasCapability(d, adapterproto.CapabilityMetadata) {
+		return adapterproto.MetadataResult{}, nil, false, nil
+	}
+	if err := adapterproto.ValidateResourceRefForDescriptor(d, resource); err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("invalid resource reference")
+	}
+	if err := adapterproto.ValidateMediaSource(current, d.MediaTypes); err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("current media source is invalid")
+	}
+	effective, err := h.effective(id, resource)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("adapter configuration unavailable")
+	}
+	schema, err := h.Schema(id, resource)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("adapter configuration schema unavailable")
+	}
+	configuration, secrets, err := effectiveConfiguration(schema, effective, true)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("effective adapter configuration is invalid")
+	}
+	state, err := h.stateDocuments(id, resource)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("adapter state is unavailable")
+	}
+	params := adapterproto.MetadataParams{
+		Resource: cloneResourceRef(resource), Current: current,
+		Configuration: configuration, Secrets: secrets, State: state,
+	}
+	raw, err := h.call(ctx, id, adapterproto.MethodMetadata, params)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, true, err
+	}
+	var result adapterproto.MetadataResult
+	if !utf8.Valid(raw) || json.Unmarshal(raw, &result) != nil || result.Validate() != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("adapter returned invalid metadata")
+	}
+	commit, err := h.prepareStateMutations(id, resource, result.StateMutations)
+	if err != nil {
+		return adapterproto.MetadataResult{}, nil, true, fmt.Errorf("adapter state mutation is invalid")
+	}
+	return result, commit, true, nil
+}
+
 func (h *Host) Close() {
 	h.mu.Lock()
 	if h.closed {

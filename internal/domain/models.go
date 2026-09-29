@@ -21,15 +21,27 @@ type Recording struct {
 	Resource                *ResourceReference `json:"resource,omitempty"`
 	SourceURIClassification string             `json:"source_uri_classification,omitempty"`
 	// SourceURL is retained only to read and report pre-adapter recordings.
-	SourceURL string             `json:"source_url,omitempty"`
-	State     RecordingState     `json:"state"`
-	CreatedAt time.Time          `json:"created_at"`
-	StartedAt time.Time          `json:"started_at"`
-	StoppedAt *time.Time         `json:"stopped_at,omitempty"`
-	Tracks    map[string]*Track  `json:"tracks"`
-	Gaps      []Gap              `json:"gaps,omitempty"`
-	Snapshots []ManifestSnapshot `json:"manifest_snapshots,omitempty"`
-	LastError string             `json:"last_error,omitempty"`
+	SourceURL                 string             `json:"source_url,omitempty"`
+	State                     RecordingState     `json:"state"`
+	CreatedAt                 time.Time          `json:"created_at"`
+	StartedAt                 time.Time          `json:"started_at"`
+	StoppedAt                 *time.Time         `json:"stopped_at,omitempty"`
+	Tracks                    map[string]*Track  `json:"tracks"`
+	Gaps                      []Gap              `json:"gaps,omitempty"`
+	Snapshots                 []ManifestSnapshot `json:"manifest_snapshots,omitempty"`
+	LastError                 string             `json:"last_error,omitempty"`
+	MetadataTimeline          []MetadataRevision `json:"metadata_timeline,omitempty"`
+	MetadataTimelineTruncated bool               `json:"metadata_timeline_truncated,omitempty"`
+}
+
+// MetadataRevision records a canonical snapshot of the known source title and
+// description at the time Core observed a semantic change. Nil means unknown;
+// a pointer to an empty string is an explicitly known empty value.
+type MetadataRevision struct {
+	ObservedAt      time.Time  `json:"observed_at"`
+	SourceUpdatedAt *time.Time `json:"source_updated_at,omitempty"`
+	Title           *string    `json:"title,omitempty"`
+	Description     *string    `json:"description,omitempty"`
 }
 
 type Track struct {

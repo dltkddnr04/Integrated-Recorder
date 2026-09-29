@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -38,11 +39,13 @@ import (
 const segmentPayload = "integrated-recorder-browser-e2e-source-segment"
 
 type sourceFixture struct {
-	mu       sync.RWMutex
-	playlist []byte
-	segments map[string][]byte
-	online   bool
-	endList  bool
+	mu                sync.RWMutex
+	playlist          []byte
+	segments          map[string][]byte
+	online            bool
+	endList           bool
+	streamTitle       string
+	streamDescription string
 }
 
 func main() {
@@ -71,6 +74,7 @@ func run() error {
 	}{
 		{name: "integrated-recorder-adapter-owncast", pkg: "./cmd/adapters/owncast"},
 		{name: "integrated-recorder-adapter-workflow-fixture", pkg: "./web/e2e/fixture_adapter"},
+		{name: "integrated-recorder-adapter-metadata-fixture", pkg: "./web/e2e/metadata_fixture_adapter"},
 	} {
 		command := exec.Command("go", "build", "-trimpath", "-o", filepath.Join(adapterDir, build.name), build.pkg)
 		command.Dir = root
@@ -265,7 +269,7 @@ func repositoryRoot() string {
 }
 
 func buildSourceFixture(dataDir string) (*sourceFixture, string) {
-	fallback := &sourceFixture{playlist: []byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:1.5,browser fixture\nsegment-7.ts\n"), segments: map[string][]byte{"segment-7.ts": []byte(segmentPayload)}}
+	fallback := &sourceFixture{playlist: []byte("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:1.5,browser fixture\nsegment-7.ts\n"), segments: map[string][]byte{"segment-7.ts": []byte(segmentPayload)}, streamTitle: "Fixture broadcast title", streamDescription: "Initial fixture description"}
 	_ = os.WriteFile(filepath.Join(dataDir, "e2e-source-segment"), fallback.segments["segment-7.ts"], 0600)
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -360,9 +364,43 @@ func (fixture *sourceFixture) serveHTTP(w http.ResponseWriter, r *http.Request) 
 	if r.URL.Path == "/api/status" {
 		fixture.mu.RLock()
 		online := fixture.online
+		title := fixture.streamTitle
 		fixture.mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"online":%t,"lastConnectTime":"2026-09-28T00:00:00Z"}`, online)
+		_ = json.NewEncoder(w).Encode(map[string]any{"online": online, "lastConnectTime": "2026-09-28T00:00:00Z", "streamTitle": title})
+		return
+	}
+	if r.URL.Path == "/e2e/set-title" {
+		title := r.URL.Query().Get("value")
+		if len(title) > 4096 {
+			http.Error(w, "title is too long", http.StatusBadRequest)
+			return
+		}
+		fixture.mu.Lock()
+		fixture.streamTitle = title
+		fixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.URL.Path == "/e2e/metadata" {
+		fixture.mu.RLock()
+		title, description := fixture.streamTitle, fixture.streamDescription
+		fixture.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"title": title, "description": description})
+		return
+	}
+	if r.URL.Path == "/e2e/set-metadata" {
+		title := r.URL.Query().Get("title")
+		description := r.URL.Query().Get("description")
+		if len(title) > 4096 || len(description) > 64<<10 {
+			http.Error(w, "metadata is too long", http.StatusBadRequest)
+			return
+		}
+		fixture.mu.Lock()
+		fixture.streamTitle, fixture.streamDescription = title, description
+		fixture.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.URL.Path == "/e2e/set-online" {

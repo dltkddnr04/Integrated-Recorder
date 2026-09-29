@@ -711,6 +711,9 @@ type recordingStatistics struct {
 
 func detail(r *domain.Recording) recordingDetail {
 	projected := *r
+	// Source metadata history is served through its dedicated bounded endpoint.
+	projected.MetadataTimeline = nil
+	projected.MetadataTimelineTruncated = false
 	projected.SourceURL = ""
 	projected.LastError = publicLastError(projected.LastError)
 	if projected.SourceURIClassification == "" {

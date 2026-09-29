@@ -53,7 +53,7 @@ React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 
 
 아직 미지원:
 
-- 방송 metadata + chat timeline
+- chat timeline
 - finalized TAR/index archive format
 - HDD/NAS/LTO storage lifecycle
 - 추가 platform adapter
@@ -163,7 +163,7 @@ go vet ./...
 - [x] 원본 segment acquisition + restart-safe VOD playback
 - [x] platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
 - [x] resource discovery, configuration inheritance, and challenge/resume foundation
-- [ ] 방송 metadata + chat timeline
+- [ ] chat timeline
 - [ ] Finalized archive packaging + random-access index
 - [x] management browser UI v2 및 실제 product API 기초
 - [ ] CHZZK, SOOP, Twitch 등 추가 platform adapter

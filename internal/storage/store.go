@@ -282,6 +282,9 @@ func (s *LocalFilesystemBackend) CreateRecording(recording *domain.Recording) (e
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return fmt.Errorf("invalid recording")
 	}
+	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
+		return fmt.Errorf("invalid recording metadata timeline")
+	}
 	base := filepath.Join(s.root, "recordings")
 	final := s.recordingDir(recording.ID)
 	if _, err := os.Lstat(final); err == nil {
@@ -334,6 +337,9 @@ func (s *LocalFilesystemBackend) SaveRecording(recording *domain.Recording) erro
 	started := time.Now()
 	if recording == nil || !recordingIDPattern.MatchString(recording.ID) {
 		return fmt.Errorf("invalid recording")
+	}
+	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
+		return fmt.Errorf("invalid recording metadata timeline")
 	}
 	data, err := json.MarshalIndent(recording, "", "  ")
 	if err != nil {
@@ -418,10 +424,21 @@ func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_id_mismatch", Message: "recording metadata identity does not match its directory"})
 			continue
 		}
+		changed := false
+		if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
+			// Preserve the media archive if a source-controlled projection is
+			// malformed or over-bound. Drop only that projection and surface a
+			// recovery issue instead of interpreting it as valid history.
+			recording.MetadataTimeline = nil
+			recording.MetadataTimelineTruncated = true
+			changed = true
+			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "metadata_timeline_invalid", Message: "source metadata timeline was invalid and could not be restored"})
+		}
 		if recording.Tracks == nil {
 			recording.Tracks = map[string]*domain.Track{}
 		}
-		changed, reconcileErr := s.reconcileRecording(&recording)
+		reconcileChanged, reconcileErr := s.reconcileRecording(&recording)
+		changed = changed || reconcileChanged
 		if reconcileErr != nil {
 			s.addRecoveryIssue(RecoveryIssue{ID: id, Code: "reconciliation_incomplete", Message: "recording payload reconciliation was incomplete"})
 		}

@@ -848,6 +848,20 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			m.setTerminalError(e, err)
 		}
 	}()
+	if _, ok := m.resolver.(MetadataPreparer); ok {
+		metadataCtx, cancelMetadata := context.WithCancel(ctx)
+		metadataDone := make(chan struct{})
+		go func() {
+			defer close(metadataDone)
+			m.runMetadataMonitor(metadataCtx, e)
+		}()
+		// This defer is registered after scheduler cleanup, so the monitor is
+		// canceled and joined before acquisition shutdown drains the scheduler.
+		defer func() {
+			cancelMetadata()
+			<-metadataDone
+		}()
+	}
 
 	selectedURL := media.ManifestURL
 	firstPlaylist := true

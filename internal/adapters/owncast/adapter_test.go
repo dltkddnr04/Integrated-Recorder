@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +53,7 @@ func TestWatchCheckUsesStatusAPIAndReturnsMediaFastPath(t *testing.T) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method = %s", r.Method)
 		}
-		_, _ = io.WriteString(w, `{"online":true,"lastConnectTime":"2026-09-28T01:02:03Z"}`)
+		_, _ = io.WriteString(w, `{"online":true,"lastConnectTime":"2026-09-28T01:02:03Z","streamTitle":"Broadcast title"}`)
 	}))
 	defer server.Close()
 	validated := ""
@@ -70,6 +71,48 @@ func TestWatchCheckUsesStatusAPIAndReturnsMediaFastPath(t *testing.T) {
 	}
 	if result.State != "live" || result.Media == nil || result.Media.ManifestURL != server.URL+StreamPath || result.SessionRef != "2026-09-28T01:02:03Z" || result.StartedAt == nil {
 		t.Fatalf("live result = %#v", result)
+	}
+	if result.Title != "Broadcast title" {
+		t.Fatalf("initial Watch title = %q", result.Title)
+	}
+}
+
+func TestMetadataUsesStatusStreamTitleAndPreservesKnownEmpty(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != statusPath {
+			t.Errorf("request path = %q", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"online":true,"streamTitle":""}`)
+	}))
+	defer server.Close()
+	result, err := MetadataWith(adapterproto.MediaSource{Type: "hls", ManifestURL: server.URL + StreamPath}, server.Client(), func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || result.Metadata.Title == nil || *result.Metadata.Title != "" || result.Metadata.Description != nil || result.SourceUpdatedAt != nil {
+		t.Fatalf("metadata=%#v calls=%d", result, calls)
+	}
+	if !slices.Contains(Describe().Capabilities, adapterproto.CapabilityMetadata) {
+		t.Fatal("Owncast descriptor does not declare metadata capability")
+	}
+}
+
+func TestOversizedOptionalStreamTitleDoesNotTurnLiveWatchIntoFailure(t *testing.T) {
+	title := strings.Repeat("x", 4<<10+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"online": true, "streamTitle": title})
+	}))
+	defer server.Close()
+	input := json.RawMessage(`{"source_url":"` + server.URL + `"}`)
+	validate := func(context.Context, string) error { return nil }
+	result, err := WatchCheckWith(input, server.Client(), validate)
+	if err != nil || result.State != "live" || result.Media == nil || result.Title != "" {
+		t.Fatalf("invalid optional title blocked live detection: result=%#v err=%v", result, err)
+	}
+	if _, err := MetadataWith(*result.Media, server.Client(), validate); err == nil {
+		t.Fatal("oversized source metadata title was accepted")
 	}
 }
 

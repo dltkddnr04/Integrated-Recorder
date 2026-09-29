@@ -104,6 +104,8 @@ Watch는 “이 adapter-defined source의 앞으로 시작할 방송을 계속 �
 
 Watch scheduler는 enabled Watch를 bounded queue와 고정 worker pool에서 확인합니다. 정상 offline 확인은 Watch polling 간격을 따르고 오류는 지수 backoff를 사용합니다. 작은 jitter로 startup/polling herd를 줄이고 수동·예약 확인은 Watch별 single-flight로 합칩니다. 확인 실패는 offline으로 표현하지 않습니다. `live` 이후 자동 시작은 기존 `Manager.StartResolved`를 사용하며 Watch 하나당 active Recording을 하나로 제한합니다. Active Recording 중에는 불필요한 live check를 멈추고, Recording이 끝나면 다시 확인합니다. 같은 session의 완료/수동 중지 결과를 dedupe/suppression 상태로 보존하고, interrupted 결과는 같은 session의 다음 part로 복구할 수 있습니다. Watch를 끄거나 삭제해도 연결된 active Recording을 중지하지 않습니다.
 
+활성 Recording은 Watch 확인과 독립적으로 adapter의 optional metadata capability를 관찰할 수 있습니다. Canonical `recording.json` timeline에는 현재 source `title`과 `description`만 저장합니다. Core가 값을 검증한 시각을 `observed_at`으로 기록하고 adapter가 신뢰 가능한 `source_updated_at`을 제공하면 함께 보존합니다. 알려진 제목/설명의 반복 관측은 중복 저장하지 않습니다. `null`은 adapter가 해당 필드를 제공하지 않았다는 뜻이고 빈 문자열은 알고 있는 빈 값입니다. `Recording.Title`은 녹화 시작 시 정해지는 기존 호환/표시 제목으로 유지합니다. Metadata polling은 즉시 시작한 뒤 30초 간격으로 수행하고 실패 시 제한된 backoff를 적용하며, 실패가 media 수집 중단이나 gap을 만들지 않습니다. Metadata capability를 선언한 adapter만 polling합니다. Owncast는 `/api/status`의 `streamTitle`을 제공하지만 이 endpoint에서는 description이나 source update timestamp를 지원하지 않습니다. Chat timeline 수집은 아직 구현되지 않았습니다.
+
 ## Management API와 projection
 
 `internal/recordquery`는 canonical recording snapshot에서 필터, 검색, 정렬, stable cursor pagination, 크기·segment·gap statistics를 계산합니다. `/api/v2/recordings`와 dashboard는 매 요청마다 archive를 다시 해석하지만 기록을 수정하지 않습니다. 계산 근거가 없는 gap duration은 `null`입니다. List/dashboard에는 작은 preview summary만 포함하고 frame index 전체를 포함하거나 recording마다 별도 status query를 요청하지 않습니다. 태그, workflow history, recording event projection, audit, notification, adapter enable preference는 `internal/management`의 별도 제한된 JSON store에 기록합니다. 이 데이터가 없어도 canonical recording을 해석할 수 있습니다.
@@ -136,7 +138,7 @@ Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 �
 
 중지/완료/interrupted recording의 저장 segment를 참조하는 finite HLS VOD manifest를 생성합니다. Segment endpoint는 저장된 원본 byte를 직접 반환하며 파일을 이어 붙이거나 remux하지 않습니다. 재생 가능한 codec인지 여부는 browser 지원에 달려 있습니다.
 
-미구현: chat/metadata timeline, 비동기 adapter notification runtime, 실제 platform authentication flow, Owncast 외 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export transcoding/추가 format, multi-user/role authorization, adapter sandbox, adapter hot reload. Watch 감지는 polling 기반이며 webhook/push 알림은 구현하지 않았습니다.
+미구현: chat timeline, 비동기 adapter notification runtime, 실제 platform authentication flow, Owncast 외 추가 platform adapter, Core 재시작을 넘는 workflow persistence, encrypted HLS, external rendition 동기화, DASH, TAR/archive finalization, LTO, export transcoding/추가 format, multi-user/role authorization, adapter sandbox, adapter hot reload. Watch 감지는 polling 기반이며 webhook/push 알림은 구현하지 않았습니다.
 
 ## Web application
 

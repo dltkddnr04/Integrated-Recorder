@@ -37,6 +37,14 @@ type RefreshPreparer interface {
 	PrepareRefresh(context.Context, string, *adapterproto.ResourceRef, adapterproto.MediaSource) (adapterproto.MediaSource, func() error, error)
 }
 
+// MetadataPreparer is optional so protocol-v1 adapters without metadata
+// support keep working without a polling loop. The returned state commit is
+// applied only after Core accepts the observation for the current media
+// generation and durably stores any canonical revision.
+type MetadataPreparer interface {
+	PrepareMetadata(context.Context, string, *adapterproto.ResourceRef, adapterproto.MediaSource) (adapterproto.MetadataResult, func() error, bool, error)
+}
+
 type SourceValidator func(context.Context, string) error
 
 type entry struct {
@@ -85,6 +93,11 @@ type Manager struct {
 	// storageWriteFailureHook injects deterministic persistence failures for
 	// retry/no-redownload tests. Production leaves it nil.
 	storageWriteFailureHook func() error
+	// Metadata polling is fixed policy in production; the interval seam keeps
+	// lifecycle tests deterministic without waiting for the production cadence.
+	metadataPollInterval time.Duration
+	// metadataClock is a deterministic test seam. Production leaves it nil.
+	metadataClock func() time.Time
 }
 
 var errManagerClosed = errors.New("recording manager is closed")

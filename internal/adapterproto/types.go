@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/streammeta"
 )
 
 type Descriptor struct {
@@ -330,6 +332,47 @@ type RefreshParams struct {
 type RefreshResult struct {
 	Media MediaSource     `json:"media"`
 	State []StateMutation `json:"state,omitempty"`
+}
+
+// MetadataParams asks an adapter to observe generic source metadata using the
+// current resolved media and the same effective configuration/state context
+// used by other adapter operations. Core does not interpret Current.
+type MetadataParams struct {
+	Resource      *ResourceRef               `json:"resource,omitempty"`
+	Current       MediaSource                `json:"current"`
+	Configuration map[string]json.RawMessage `json:"configuration,omitempty"`
+	Secrets       map[string]string          `json:"secrets,omitempty"`
+	State         []StateDocument            `json:"state,omitempty"`
+}
+
+// StreamMetadata contains only source title and description in v1. A nil
+// field means the adapter cannot provide a current value; a pointer to an
+// empty string is an explicit known-empty value.
+type StreamMetadata struct {
+	Title       *string `json:"title,omitempty"`
+	Description *string `json:"description,omitempty"`
+}
+
+type MetadataResult struct {
+	Metadata        StreamMetadata  `json:"metadata"`
+	SourceUpdatedAt *time.Time      `json:"source_updated_at,omitempty"`
+	StateMutations  []StateMutation `json:"state_mutations,omitempty"`
+}
+
+func (result MetadataResult) Validate() error {
+	if err := streammeta.ValidateText(result.Metadata.Title, streammeta.MaxTitleBytes); err != nil {
+		return fmt.Errorf("metadata title is invalid")
+	}
+	if err := streammeta.ValidateText(result.Metadata.Description, streammeta.MaxDescriptionBytes); err != nil {
+		return fmt.Errorf("metadata description is invalid")
+	}
+	if err := streammeta.ValidateTimestamp(result.SourceUpdatedAt); err != nil {
+		return err
+	}
+	if len(result.StateMutations) > 64 {
+		return fmt.Errorf("metadata state mutation list exceeds limit")
+	}
+	return nil
 }
 
 // ArchivePolicy classifies canonical source URI provenance. Fetch URLs and

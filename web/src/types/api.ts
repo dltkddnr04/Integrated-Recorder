@@ -71,6 +71,8 @@ export type RecordingDetail = {
   manifest_snapshots?: { storage_path?: string; size?: number; sha256?: string; captured_at?: string }[];
   last_error?: string; statistics?: RecordingStatistics; integrity?: IntegrityStatus; preview?: PreviewSummary
 }
+export type SourceMetadataRevision = { observed_at: string; source_updated_at?: string; title?: string | null; description?: string | null }
+export type RecordingMetadata = { current?: SourceMetadataRevision; items: SourceMetadataRevision[]; truncated: boolean }
 export type IntegrityStatus = 'unknown' | 'verifying' | 'verified' | 'degraded' | 'failed'
 export type RecordingStatistics = {
   duration_seconds?: number; archive_size_bytes?: number; media_payload_size_bytes?: number;

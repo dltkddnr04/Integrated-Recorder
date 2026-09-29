@@ -25,6 +25,7 @@ type StorageSettingsWire = {
 }
 type PreviewWire = { mode: string; state: string; available: boolean; frame_count: number; image_archive_ordinal?: number }
 type PreviewFramesWire = { state: string; available: boolean; frame_count: number; items: { archive_ordinal: number; frame_time_seconds: number; generated_at: string }[] }
+type MetadataWire = { current?: { title?: string | null; description?: string | null; observed_at: string }; items: { title?: string | null; description?: string | null; observed_at: string }[]; truncated: boolean }
 type CSPViolation = { effectiveDirective: string; violatedDirective: string; blockedURI: string; sourceFile: string }
 
 test.describe.configure({ mode: 'serial' })
@@ -240,6 +241,35 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
   expect(staticAssetFailures).toEqual([])
   expect(unexpectedRequestFailures).toEqual([])
   expect(expectedAPIResponseFailures).toEqual([])
+})
+
+test('actual Go backend: metadata fixture changes are archived and rendered as a timeline', async ({ page }) => {
+  test.setTimeout(120_000)
+  await login(page)
+  const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
+  await page.goto('/new')
+  await page.getByRole('button', { name: /Metadata Fixture/ }).click()
+  await page.getByRole('button', { name: '입력 설정' }).click()
+  await page.getByLabel('Fixture source URL').fill(sourceURL)
+  await page.getByLabel('녹화 제목').fill('Metadata timeline E2E')
+  await page.getByRole('button', { name: '입력 확인' }).click()
+  await page.getByRole('button', { name: '녹화 시작' }).click()
+  await expect(page).toHaveURL(/\/recordings\/[a-f0-9]{32}$/)
+  const recordingID = page.url().split('/').at(-1)!
+  const metadataPath = `/api/recordings/${encodeURIComponent(recordingID)}/metadata`
+  await expect.poll(async () => (await getJSON<MetadataWire>(page, metadataPath)).current?.title, { timeout: 15_000 }).toBe('Fixture broadcast title')
+  const changed = await page.request.get(`${new URL(sourceURL).origin}/e2e/set-metadata?title=${encodeURIComponent('Changed fixture source title')}&description=${encodeURIComponent('Updated fixture description')}`)
+  expect(changed.status()).toBe(204)
+  await expect.poll(async () => (await getJSON<MetadataWire>(page, metadataPath)).current?.title, { timeout: 45_000 }).toBe('Changed fixture source title')
+  const history = await getJSON<MetadataWire>(page, metadataPath)
+  expect(history.items.map(item => item.title)).toEqual(['Fixture broadcast title', 'Changed fixture source title'])
+  expect(history.items.map(item => item.description)).toEqual(['Initial fixture description', 'Updated fixture description'])
+  await page.reload()
+  await expect(page.getByRole('heading', { name: '방송 메타데이터' })).toBeVisible()
+  await expect(page.getByRole('list').getByText('Updated fixture description', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: '중지', exact: true }).click()
+  await page.getByRole('alertdialog').getByRole('button', { name: '중지', exact: true }).click()
+  await expect.poll(async () => (await getJSON<RecordingWire>(page, `/api/recordings/${encodeURIComponent(recordingID)}`)).state).toBe('stopped')
 })
 
 test('actual Go backend: storage ingest settings persist, show restart state, and reject invalid values', async ({ page }) => {

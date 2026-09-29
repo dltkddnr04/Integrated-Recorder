@@ -14,9 +14,11 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/network"
+	"github.com/dltkddnr04/integrated-recorder/internal/streammeta"
 )
 
 const StreamPath = "/hls/stream.m3u8"
@@ -42,7 +44,7 @@ var owncastLogo []byte
 func Describe() adapterproto.Descriptor {
 	return adapterproto.Descriptor{
 		ID: "owncast", Name: "Owncast", Version: "0.1.0", ProtocolVersion: adapterproto.Version,
-		Capabilities:        []string{adapterproto.CapabilityResolve, adapterproto.CapabilityWatch},
+		Capabilities:        []string{adapterproto.CapabilityResolve, adapterproto.CapabilityWatch, adapterproto.CapabilityMetadata},
 		InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Owncast 인스턴스 URL", Description: "Owncast 인스턴스의 기본 URL입니다.", Required: true}}},
 		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}}, ResourceTypes: []adapterproto.ResourceType{}, MediaTypes: []string{"hls"},
 		Branding: &adapterproto.Branding{Icon: &adapterproto.BrandIcon{MediaType: "image/png", Data: append([]byte(nil), owncastLogo...)}},
@@ -65,50 +67,22 @@ func WatchCheckWith(input json.RawMessage, client *http.Client, validate func(co
 	if err != nil {
 		return adapterproto.WatchCheckResult{}, err
 	}
-	manifest, err := url.Parse(media.ManifestURL)
-	if err != nil {
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("invalid source URL")
-	}
-	statusURL := *manifest
-	statusURL.Path = strings.TrimSuffix(strings.TrimSuffix(statusURL.Path, StreamPath), "/") + statusPath
-	statusURL.RawPath = ""
-	statusURL.RawQuery = ""
-	statusURL.Fragment = ""
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	if err := validate(ctx, statusURL.String()); err != nil {
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("status URL is not allowed")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL.String(), nil)
+	status, err := fetchStatus(ctx, media.ManifestURL, client, validate)
 	if err != nil {
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("status request could not be created")
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("status request failed")
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-			return adapterproto.WatchCheckResult{}, &watchCheckError{code: "authentication_required"}
-		}
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("status service returned an error")
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxStatusBytes+1))
-	if err != nil || len(data) > maxStatusBytes {
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("status response is invalid")
-	}
-	var status struct {
-		Online          *bool           `json:"online"`
-		LastConnectTime json.RawMessage `json:"lastConnectTime,omitempty"`
-	}
-	if err := json.Unmarshal(data, &status); err != nil || status.Online == nil {
-		return adapterproto.WatchCheckResult{}, fmt.Errorf("status response is invalid")
+		return adapterproto.WatchCheckResult{}, err
 	}
 	if !*status.Online {
 		return adapterproto.WatchCheckResult{State: "offline"}, nil
 	}
 	result := adapterproto.WatchCheckResult{State: "live", Media: &media}
+	// A malformed source title must not turn a valid live observation into an
+	// offline/error result or prevent automatic acquisition. Metadata polling
+	// validates the field strictly; the optional Watch title fallback omits it.
+	if status.StreamTitle != nil && streammeta.ValidateText(status.StreamTitle, streammeta.MaxTitleBytes) == nil {
+		result.Title = *status.StreamTitle
+	}
 	if len(status.LastConnectTime) > 0 && string(status.LastConnectTime) != "null" {
 		var value string
 		if json.Unmarshal(status.LastConnectTime, &value) != nil || len(value) > 128 {
@@ -126,6 +100,75 @@ func WatchCheckWith(input json.RawMessage, client *http.Client, validate func(co
 		return adapterproto.WatchCheckResult{}, fmt.Errorf("status response is invalid")
 	}
 	return result, nil
+}
+
+type owncastStatus struct {
+	Online          *bool           `json:"online"`
+	LastConnectTime json.RawMessage `json:"lastConnectTime,omitempty"`
+	StreamTitle     *string         `json:"streamTitle"`
+}
+
+func fetchStatus(ctx context.Context, manifestURL string, client *http.Client, validate func(context.Context, string) error) (owncastStatus, error) {
+	manifest, err := url.Parse(manifestURL)
+	if err != nil {
+		return owncastStatus{}, fmt.Errorf("invalid source URL")
+	}
+	statusURL := *manifest
+	statusURL.Path = strings.TrimSuffix(strings.TrimSuffix(statusURL.Path, StreamPath), "/") + statusPath
+	statusURL.RawPath = ""
+	statusURL.RawQuery = ""
+	statusURL.Fragment = ""
+	if err := validate(ctx, statusURL.String()); err != nil {
+		return owncastStatus{}, fmt.Errorf("status URL is not allowed")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL.String(), nil)
+	if err != nil {
+		return owncastStatus{}, fmt.Errorf("status request could not be created")
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return owncastStatus{}, fmt.Errorf("status request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			return owncastStatus{}, &watchCheckError{code: "authentication_required"}
+		}
+		return owncastStatus{}, fmt.Errorf("status service returned an error")
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxStatusBytes+1))
+	if err != nil || len(data) > maxStatusBytes || !utf8.Valid(data) {
+		return owncastStatus{}, fmt.Errorf("status response is invalid")
+	}
+	var status owncastStatus
+	if err := json.Unmarshal(data, &status); err != nil || status.Online == nil {
+		return owncastStatus{}, fmt.Errorf("status response is invalid")
+	}
+	return status, nil
+}
+
+// Metadata observes title from the already resolved Owncast media source. The
+// public /api/status endpoint does not reliably expose a broadcast description
+// or source metadata timestamp, so those fields remain unknown.
+func Metadata(current adapterproto.MediaSource) (adapterproto.MetadataResult, error) {
+	return MetadataWith(current, network.NewPublicHTTPClient(8*time.Second), network.ValidatePublicURL)
+}
+
+func MetadataWith(current adapterproto.MediaSource, client *http.Client, validate func(context.Context, string) error) (adapterproto.MetadataResult, error) {
+	if client == nil || validate == nil {
+		return adapterproto.MetadataResult{}, fmt.Errorf("Owncast status dependencies are unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	status, err := fetchStatus(ctx, current.ManifestURL, client, validate)
+	if err != nil {
+		return adapterproto.MetadataResult{}, err
+	}
+	result := adapterproto.MetadataResult{}
+	if status.StreamTitle != nil {
+		result.Metadata.Title = status.StreamTitle
+	}
+	return result, result.Validate()
 }
 
 func Resolve(input json.RawMessage) (adapterproto.MediaSource, error) {
@@ -195,6 +238,18 @@ func Serve(input io.Reader, output io.Writer) error {
 				result, checkErr := WatchCheck(params.Input)
 				if checkErr != nil {
 					response = watchCheckFailure(request.ID, checkErr)
+				} else {
+					response, _ = adapterproto.Success(request.ID, result)
+				}
+			}
+		case adapterproto.MethodMetadata:
+			var params adapterproto.MetadataParams
+			if err = json.Unmarshal(request.Params, &params); err != nil {
+				response = adapterproto.Failure(request.ID, "invalid_params", "metadata params are invalid", nil)
+			} else {
+				result, metadataErr := Metadata(params.Current)
+				if metadataErr != nil {
+					response = adapterproto.Failure(request.ID, "metadata_failed", "metadata observation failed", nil)
 				} else {
 					response, _ = adapterproto.Success(request.ID, result)
 				}

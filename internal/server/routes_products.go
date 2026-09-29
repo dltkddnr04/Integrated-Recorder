@@ -32,11 +32,12 @@ import (
 )
 
 const (
-	maxSearchQuery       = 128
-	maxSearchResults     = 50
-	defaultSearchResults = 20
-	maxGlobalSearchScan  = 10000
-	globalSearchTimeout  = 2 * time.Second
+	maxSearchQuery           = 128
+	maxSearchResults         = 50
+	defaultSearchResults     = 20
+	maxGlobalSearchScan      = 10000
+	metadataTimelineAPILimit = 256
+	globalSearchTimeout      = 2 * time.Second
 )
 
 func (s *Server) registerProductRoutes() {
@@ -62,6 +63,7 @@ func (s *Server) registerProductRoutes() {
 	s.mux.HandleFunc("GET /api/adapters/{id}/resources/search", s.resourceSearch)
 	s.mux.HandleFunc("GET /api/search", s.globalSearch)
 	s.mux.HandleFunc("GET /api/recordings/{id}/events", s.recordingEvents)
+	s.mux.HandleFunc("GET /api/recordings/{id}/metadata", s.recordingMetadataGet)
 	s.mux.HandleFunc("GET /api/audit", s.auditList)
 	s.mux.HandleFunc("GET /api/notifications", s.notificationList)
 	s.mux.HandleFunc("POST /api/notifications/sync", s.notificationSync)
@@ -917,6 +919,37 @@ func (s *Server) recordingEvents(w http.ResponseWriter, r *http.Request) {
 		events = events[:limit]
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": events})
+}
+
+type recordingMetadataResponse struct {
+	Current   *domain.MetadataRevision  `json:"current,omitempty"`
+	Items     []domain.MetadataRevision `json:"items"`
+	Truncated bool                      `json:"truncated"`
+}
+
+func (s *Server) recordingMetadataGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	lock := s.productLock(id)
+	lock.RLock()
+	defer lock.RUnlock()
+	recording, err := s.manager.Get(id)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	items := make([]domain.MetadataRevision, 0, len(recording.MetadataTimeline))
+	items = append(items, recording.MetadataTimeline...)
+	truncated := recording.MetadataTimelineTruncated
+	if len(items) > metadataTimelineAPILimit {
+		items = items[len(items)-metadataTimelineAPILimit:]
+		truncated = true
+	}
+	response := recordingMetadataResponse{Items: items, Truncated: truncated}
+	if len(recording.MetadataTimeline) > 0 {
+		current := recording.MetadataTimeline[len(recording.MetadataTimeline)-1]
+		response.Current = &current
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) auditList(w http.ResponseWriter, r *http.Request) {
