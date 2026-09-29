@@ -120,7 +120,7 @@ export type SystemInfo = { version: string; commit: string; go_version: string; 
 export type StorageSettings = {
   ingest_memory: { global_buffer_bytes: number; per_recording_buffer_bytes: number; max_payload_bytes: number }
   queue_writer: { pending_queue_capacity: number; writer_concurrency: number }
-  failure_handling: { retry_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
+  failure_handling: { persist_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
   observability: { sampling_interval_ms: number; metrics_retention_ms: number }
 }
 export type SystemSettings = {

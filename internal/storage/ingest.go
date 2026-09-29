@@ -96,7 +96,7 @@ func ValidateIngestOptions(options IngestOptions) error {
 		return errors.New("writer concurrency must be 1 to preserve canonical commit ordering")
 	}
 	if options.PersistAttempts < 1 || options.PersistAttempts > 10 {
-		return errors.New("storage retry attempts must be between 1 and 10")
+		return errors.New("storage persist attempts must be between 1 and 10")
 	}
 	if options.RetryBase < 10*time.Millisecond || options.RetryBase > 30*time.Second {
 		return errors.New("initial storage retry backoff must be between 10 ms and 30 s")

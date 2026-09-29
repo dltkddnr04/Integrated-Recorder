@@ -12,9 +12,10 @@ const (
 	PoolIDLocalPrimary  = "local-primary"
 	poolSamplePeriod    = DefaultPoolSampleInterval
 	maxPoolSamples      = int(DefaultPoolMetricsRetention / poolSamplePeriod)
-	minCeilingSamples   = 60 // five minutes of non-idle observation
 	minDirectionSamples = 20
 )
+
+const minCeilingObservation = 5 * time.Minute
 
 // PoolSnapshot describes I/O performed through Integrated Recorder's local
 // archive boundary. It is not an OS-wide device throughput measurement.
@@ -81,6 +82,7 @@ type PoolSample struct {
 	WriteBytesPerSecond uint64    `json:"write_bytes_per_second"`
 	BufferUsedBytes     int64     `json:"buffer_used_bytes"`
 	PersistQueueBytes   int64     `json:"persist_queue_bytes"`
+	observedFor         time.Duration
 }
 
 type telemetry struct {
@@ -194,7 +196,7 @@ func (t *telemetry) sample(now time.Time, ingest IngestSnapshot) (PoolThroughput
 			ReadLatencyMillis:  meanMillis(delta(t.readNanos, t.lastReadNanos), readOps),
 			WriteLatencyMillis: meanMillis(delta(t.writeNanos, t.lastWriteNanos), writeOps),
 		}
-		t.samples = append(t.samples, PoolSample{At: now.UTC(), ReadBytesPerSecond: t.current.ReadBytesPerSecond, WriteBytesPerSecond: t.current.WriteBytesPerSecond, BufferUsedBytes: ingest.BufferUsedBytes, PersistQueueBytes: ingest.QueueBytes})
+		t.samples = append(t.samples, PoolSample{At: now.UTC(), ReadBytesPerSecond: t.current.ReadBytesPerSecond, WriteBytesPerSecond: t.current.WriteBytesPerSecond, BufferUsedBytes: ingest.BufferUsedBytes, PersistQueueBytes: ingest.QueueBytes, observedFor: elapsed})
 		cutoff := now.Add(-t.retention)
 		first := 0
 		for first < len(t.samples) && t.samples[first].At.Before(cutoff) {
@@ -316,7 +318,7 @@ func (s *LocalFilesystemBackend) samplePool(ingest IngestSnapshot, now time.Time
 
 func estimateCeiling(samples []PoolSample) EstimatedCeiling {
 	reads, writes := make([]uint64, 0, len(samples)), make([]uint64, 0, len(samples))
-	activeSamples := 0
+	var activeObservation time.Duration
 	for _, sample := range samples {
 		if sample.ReadBytesPerSecond > 0 {
 			reads = append(reads, sample.ReadBytesPerSecond)
@@ -325,12 +327,20 @@ func estimateCeiling(samples []PoolSample) EstimatedCeiling {
 			writes = append(writes, sample.WriteBytesPerSecond)
 		}
 		if sample.ReadBytesPerSecond > 0 || sample.WriteBytesPerSecond > 0 {
-			activeSamples++
+			if sample.observedFor > 0 {
+				remaining := minCeilingObservation - activeObservation
+				if sample.observedFor >= remaining {
+					activeObservation = minCeilingObservation
+				} else {
+					activeObservation += sample.observedFor
+				}
+			}
 		}
 	}
 	// Require five minutes of non-idle intervals so one short spike cannot be
-	// presented as a pool's observed ceiling.
-	if activeSamples < minCeilingSamples {
+	// presented as a pool's observed ceiling. Sum actual elapsed intervals,
+	// rather than assuming every configured sample has the same cadence.
+	if activeObservation < minCeilingObservation {
 		return EstimatedCeiling{Source: "unknown"}
 	}
 	result := EstimatedCeiling{Source: "observed"}

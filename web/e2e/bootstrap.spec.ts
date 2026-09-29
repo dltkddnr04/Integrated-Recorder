@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test'
 const storageSettings = {
   ingest_memory: { global_buffer_bytes: 1073741824, per_recording_buffer_bytes: 805306368, max_payload_bytes: 536870912 },
   queue_writer: { pending_queue_capacity: 128, writer_concurrency: 1 },
-  failure_handling: { retry_attempts: 5, retry_initial_backoff_ms: 100, retry_max_backoff_ms: 800 },
+  failure_handling: { persist_attempts: 5, retry_initial_backoff_ms: 100, retry_max_backoff_ms: 800 },
   observability: { sampling_interval_ms: 5000, metrics_retention_ms: 86400000 },
 }
 function settingsResponse() {

@@ -10,7 +10,7 @@ import { SettingsPage } from './settings'
 const storageDefaults: StorageSettings = {
   ingest_memory: { global_buffer_bytes: 1024 ** 3, per_recording_buffer_bytes: 768 * 1024 ** 2, max_payload_bytes: 512 * 1024 ** 2 },
   queue_writer: { pending_queue_capacity: 128, writer_concurrency: 1 },
-  failure_handling: { retry_attempts: 5, retry_initial_backoff_ms: 100, retry_max_backoff_ms: 800 },
+  failure_handling: { persist_attempts: 5, retry_initial_backoff_ms: 100, retry_max_backoff_ms: 800 },
   observability: { sampling_interval_ms: 5000, metrics_retention_ms: 24 * 60 * 60 * 1000 },
 }
 const settingsDefaults: SystemSettings = {
@@ -53,6 +53,8 @@ describe('storage ingest settings UI', () => {
     expect(screen.getByLabelText('단일 페이로드 최대 크기')).toHaveValue(512)
     expect(screen.getByLabelText('측정 간격')).toHaveValue(5)
     expect(screen.getByLabelText('측정 기록 보존 기간')).toHaveValue(24)
+    expect(screen.getByLabelText('총 저장 시도 횟수')).toHaveValue(5)
+    expect(screen.getByText('최초 저장 시도를 포함한 최대 시도 횟수입니다.')).toBeInTheDocument()
     expect(screen.getByLabelText('저장 작업 동시 실행 수')).toBeDisabled()
     expect(screen.getByText(/높은 동시성이 항상 빠른 것은 아니며/)).toBeInTheDocument()
     expect(within(screen.getByTestId('effective-storage-settings')).getByText('5초')).toBeInTheDocument()

@@ -20,7 +20,7 @@ type RecordingListWire = { id: string; adapter_id: string; adapter_name: string;
 type StorageSettingsWire = {
   ingest_memory: { global_buffer_bytes: number; per_recording_buffer_bytes: number; max_payload_bytes: number }
   queue_writer: { pending_queue_capacity: number; writer_concurrency: number }
-  failure_handling: { retry_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
+  failure_handling: { persist_attempts: number; retry_initial_backoff_ms: number; retry_max_backoff_ms: number }
   observability: { sampling_interval_ms: number; metrics_retention_ms: number }
 }
 type PreviewWire = { mode: string; state: string; available: boolean; frame_count: number; image_archive_ordinal?: number }
@@ -247,8 +247,11 @@ test('actual Go backend: storage ingest settings persist, show restart state, an
   await page.goto('/settings')
   await page.getByRole('tab', { name: '저장소' }).click()
   await expect(page.getByRole('heading', { name: '고급 수집·저장 설정' })).toBeVisible()
+  await expect(page.getByLabel('총 저장 시도 횟수')).toHaveValue('5')
+  await expect(page.getByText('최초 저장 시도를 포함한 최대 시도 횟수입니다.')).toBeVisible()
   const before = await getJSON<{ settings: { storage: StorageSettingsWire } }>(page, '/api/settings')
   expect(before.settings.storage.observability.sampling_interval_ms).toBe(5000)
+  expect(before.settings.storage.failure_handling.persist_attempts).toBe(5)
 
   await page.getByLabel('측정 간격').fill('10')
   await page.getByRole('button', { name: '수집·저장 설정 저장' }).click()

@@ -11,16 +11,131 @@ import (
 )
 
 func TestObservedCeilingRequiresSustainedRecorderTraffic(t *testing.T) {
-	samples := make([]PoolSample, 59)
-	for i := range samples {
-		samples[i] = PoolSample{ReadBytesPerSecond: 1_000_000, WriteBytesPerSecond: 2_000_000}
+	active := func(interval time.Duration, count int) []PoolSample {
+		samples := make([]PoolSample, count)
+		for i := range samples {
+			samples[i] = PoolSample{ReadBytesPerSecond: 1_000_000, WriteBytesPerSecond: 2_000_000, observedFor: interval}
+		}
+		return samples
 	}
-	if got := estimateCeiling(samples); got.Source != "unknown" {
-		t.Fatalf("ceiling with insufficient samples = %#v", got)
+	tests := []struct {
+		name     string
+		samples  []PoolSample
+		observed bool
+	}{
+		{"default 5s below five minutes", active(5*time.Second, 59), false},
+		{"default 5s reaches five minutes", active(5*time.Second, 60), true},
+		{"1s cadence does not use sample count", active(time.Second, 60), false},
+		{"1s cadence reaches five minutes", active(time.Second, 300), true},
+		{"10s cadence reaches five minutes without 60 samples", active(10*time.Second, 30), true},
+		{"1m cadence reaches five minutes with enough directional samples", active(time.Minute, 20), true},
+		{"1h cadence fits 24h retention", active(time.Hour, 20), true},
 	}
-	samples = append(samples, PoolSample{ReadBytesPerSecond: 1_000_000, WriteBytesPerSecond: 2_000_000})
-	if got := estimateCeiling(samples); got.Source != "observed" || got.ReadBytesPerSecond != 1_000_000 || got.WriteBytesPerSecond != 2_000_000 {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := estimateCeiling(test.samples)
+			if (got.Source == "observed") != test.observed {
+				t.Fatalf("estimated ceiling = %#v, observed want %v", got, test.observed)
+			}
+		})
+	}
+	got := estimateCeiling(active(5*time.Second, 60))
+	if got.ReadBytesPerSecond != 1_000_000 || got.WriteBytesPerSecond != 2_000_000 {
 		t.Fatalf("sustained ceiling = %#v", got)
+	}
+}
+
+func TestObservedCeilingCountsOnlyActualActiveIntervals(t *testing.T) {
+	samples := make([]PoolSample, 19)
+	for i := range samples {
+		samples[i] = PoolSample{ReadBytesPerSecond: 500, observedFor: 15 * time.Second}
+	}
+	samples = append(samples, PoolSample{observedFor: time.Hour}) // Idle time must not qualify.
+	samples = append(samples, PoolSample{ReadBytesPerSecond: 500, observedFor: 15 * time.Second})
+	if got := estimateCeiling(samples); got.Source != "observed" || got.ReadBytesPerSecond != 500 {
+		t.Fatalf("active-time ceiling = %#v", got)
+	}
+	samples[len(samples)-1].observedFor = 14 * time.Second
+	if got := estimateCeiling(samples); got.Source != "unknown" {
+		t.Fatalf("idle interval incorrectly counted toward active observation: %#v", got)
+	}
+}
+
+func TestObservedCeilingKeepsDirectionalSampleMinimumAndPercentile(t *testing.T) {
+	var samples []PoolSample
+	for i := uint64(1); i <= minDirectionSamples; i++ {
+		samples = append(samples, PoolSample{ReadBytesPerSecond: i, WriteBytesPerSecond: i * 10, observedFor: 15 * time.Second})
+	}
+	got := estimateCeiling(samples)
+	if got.Source != "observed" || got.ReadBytesPerSecond != 19 || got.WriteBytesPerSecond != 190 {
+		t.Fatalf("directional p95 ceiling = %#v", got)
+	}
+	got = estimateCeiling(samples[:minDirectionSamples-1])
+	if got.Source != "unknown" {
+		t.Fatalf("insufficient observation and directional samples = %#v", got)
+	}
+	var longButSparse []PoolSample
+	for i := uint64(1); i < minDirectionSamples; i++ {
+		longButSparse = append(longButSparse, PoolSample{ReadBytesPerSecond: i, observedFor: 20 * time.Second})
+	}
+	if got := estimateCeiling(longButSparse); got.Source != "unknown" {
+		t.Fatalf("elapsed time bypassed the directional sample minimum: %#v", got)
+	}
+}
+
+func TestTelemetryUsesActualElapsedIntervalsForCeiling(t *testing.T) {
+	telemetry := newTelemetryWithRetention(time.Second, 24*time.Hour)
+	start := time.Unix(100, 0).UTC()
+	telemetry.sample(start, IngestSnapshot{})
+	for i := 0; i < 20; i++ {
+		telemetry.recordWrite(15000, time.Millisecond)
+		// Deliberately use 15s windows despite the 1s configured minimum cadence.
+		telemetry.sample(start.Add(time.Duration(i+1)*15*time.Second), IngestSnapshot{})
+	}
+	telemetry.mu.Lock()
+	samples := append([]PoolSample(nil), telemetry.samples...)
+	telemetry.mu.Unlock()
+	if len(samples) != 20 {
+		t.Fatalf("recorded telemetry samples = %d, want 20", len(samples))
+	}
+	for i, sample := range samples {
+		if sample.observedFor != 15*time.Second {
+			t.Fatalf("sample %d observed interval = %s, want 15s", i, sample.observedFor)
+		}
+	}
+	if got := estimateCeiling(samples); got.Source != "observed" {
+		t.Fatalf("ceiling ignored actual timestamp intervals: %#v", got)
+	}
+}
+
+func TestHourlyTelemetryRetainsEnoughSamplesForObservedCeiling(t *testing.T) {
+	telemetry := newTelemetryWithRetention(time.Hour, 24*time.Hour)
+	start := time.Unix(200, 0).UTC()
+	telemetry.sample(start, IngestSnapshot{})
+	for hour := 1; hour <= 20; hour++ {
+		telemetry.recordWrite(3600, time.Millisecond)
+		telemetry.sample(start.Add(time.Duration(hour)*time.Hour), IngestSnapshot{})
+	}
+
+	telemetry.mu.Lock()
+	samples := append([]PoolSample(nil), telemetry.samples...)
+	maxSamples := telemetry.maxSamples
+	telemetry.mu.Unlock()
+	if maxSamples != 24 || len(samples) != 20 {
+		t.Fatalf("hourly telemetry retained %d samples (capacity %d), want 20 within 24h", len(samples), maxSamples)
+	}
+	if got := estimateCeiling(samples); got.Source != "observed" || got.WriteBytesPerSecond != 1 {
+		t.Fatalf("hourly telemetry ceiling = %#v, want an observed one-byte/s write ceiling", got)
+	}
+}
+
+func TestPoolSampleObservationIntervalIsNotSerialized(t *testing.T) {
+	encoded, err := json.Marshal(PoolSample{At: time.Unix(1, 0), observedFor: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("observedFor")) || bytes.Contains(encoded, []byte("observed_for")) {
+		t.Fatalf("internal observation interval leaked to API JSON: %s", encoded)
 	}
 }
 

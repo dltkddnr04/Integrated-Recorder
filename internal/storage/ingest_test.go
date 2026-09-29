@@ -521,6 +521,33 @@ func TestIngestRetriesSameVolatileBytesAndReleasesOnce(t *testing.T) {
 	}
 }
 
+func TestDefaultPersistAttemptsMeansFiveTotalInvocations(t *testing.T) {
+	service := newSmallIngest(t, DefaultPersistAttempts)
+	payload, err := service.ReadPayload(context.Background(), "recording-a", bytes.NewReader([]byte("source")), 8, -1, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int32
+	completed := make(chan error, 1)
+	if err := service.Submit(context.Background(), payload, func([]byte) (PayloadResult, error) {
+		attempts.Add(1)
+		return PayloadResult{}, errors.New("permanent storage error")
+	}, func(_ PayloadResult, persistErr error) { completed <- persistErr }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("persistence callback did not complete")
+	}
+	if err == nil || attempts.Load() != int32(DefaultPersistAttempts) {
+		t.Fatalf("permanent failure calls=%d err=%v, want exactly %d total calls", attempts.Load(), err, DefaultPersistAttempts)
+	}
+	if got := service.Snapshot(); got.BufferUsedBytes != 0 || got.ReservedBytes != 0 {
+		t.Fatalf("permanent failure did not release volatile payload: %#v", got)
+	}
+}
+
 func TestIngestPermanentStorageFailureReleasesVolatileBytes(t *testing.T) {
 	service := newSmallIngest(t, 2)
 	payload, err := service.ReadPayload(context.Background(), "recording-a", bytes.NewReader([]byte("source")), 8, -1, 6)

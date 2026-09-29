@@ -1,6 +1,7 @@
 package systemsettings
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -120,6 +121,63 @@ func TestOpenBackfillsRetentionDefaultsForExistingSettings(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesLegacyRetryAttemptsToPersistAttempts(t *testing.T) {
+	root := t.TempDir()
+	management := filepath.Join(root, "management")
+	if err := os.Mkdir(management, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(management, settingsFilename)
+	legacy := `{"ui":{"theme":"dark"},"integrity":{"concurrency":2},"storage":{"failure_handling":{"retry_attempts":5,"retry_initial_backoff_ms":100,"retry_max_backoff_ms":800}}}`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Current().Storage.FailureHandling.PersistAttempts; got != 5 {
+		t.Fatalf("legacy value became %d total attempts, want 5", got)
+	}
+	if got := store.Current().Storage.IngestMemory; got != defaultStorageSettings().IngestMemory {
+		t.Fatalf("migration did not backfill other storage defaults: %#v", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	failure := stored["storage"].(map[string]any)["failure_handling"].(map[string]any)
+	if failure["persist_attempts"] != float64(5) {
+		t.Fatalf("canonical key not persisted: %#v", failure)
+	}
+	if _, exists := failure["retry_attempts"]; exists {
+		t.Fatalf("legacy key remained after migration: %#v", failure)
+	}
+	if mode := modeOf(t, path); mode.Perm() != 0600 {
+		t.Fatalf("migrated settings mode = %04o, want 0600", mode.Perm())
+	}
+}
+
+func TestOpenRejectsAmbiguousLegacyAndCanonicalPersistAttemptKeys(t *testing.T) {
+	root := t.TempDir()
+	management := filepath.Join(root, "management")
+	if err := os.Mkdir(management, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(management, settingsFilename)
+	data := `{"storage":{"failure_handling":{"retry_attempts":5,"persist_attempts":4,"retry_initial_backoff_ms":100,"retry_max_backoff_ms":800}}}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root); !errors.Is(err, ErrInvalidSettings) {
+		t.Fatalf("Open() error = %v, want ambiguous settings rejection", err)
+	}
+}
+
 func TestStorageSettingsDefaultsPersistAndReload(t *testing.T) {
 	root := t.TempDir()
 	store, err := Open(root)
@@ -127,7 +185,7 @@ func TestStorageSettingsDefaultsPersistAndReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	defaults := defaultStorageSettings()
-	if defaults.IngestMemory.GlobalBufferBytes != 1<<30 || defaults.IngestMemory.PerRecordingBufferBytes != 768<<20 || defaults.IngestMemory.MaxPayloadBytes != 512<<20 || defaults.QueueWriter.PendingQueueCapacity != 128 || defaults.QueueWriter.WriterConcurrency != 1 || defaults.FailureHandling.RetryAttempts != 5 || defaults.FailureHandling.RetryInitialBackoffMS != 100 || defaults.FailureHandling.RetryMaxBackoffMS != 800 || defaults.Observability.SamplingIntervalMS != 5000 || defaults.Observability.MetricsRetentionMS != 86400000 {
+	if defaults.IngestMemory.GlobalBufferBytes != 1<<30 || defaults.IngestMemory.PerRecordingBufferBytes != 768<<20 || defaults.IngestMemory.MaxPayloadBytes != 512<<20 || defaults.QueueWriter.PendingQueueCapacity != 128 || defaults.QueueWriter.WriterConcurrency != 1 || defaults.FailureHandling.PersistAttempts != 5 || defaults.FailureHandling.RetryInitialBackoffMS != 100 || defaults.FailureHandling.RetryMaxBackoffMS != 800 || defaults.Observability.SamplingIntervalMS != 5000 || defaults.Observability.MetricsRetentionMS != 86400000 {
 		t.Fatalf("storage defaults changed: %#v", defaults)
 	}
 	updated := defaults
@@ -173,8 +231,8 @@ func TestStorageSettingsRejectInvalidLimits(t *testing.T) {
 		{"zero queue", func(s *StorageSettings) { s.QueueWriter.PendingQueueCapacity = 0 }, "queue capacity"},
 		{"queue too large", func(s *StorageSettings) { s.QueueWriter.PendingQueueCapacity = 129 }, "queue capacity"},
 		{"writer concurrency", func(s *StorageSettings) { s.QueueWriter.WriterConcurrency = 2 }, "writer concurrency"},
-		{"retry attempts", func(s *StorageSettings) { s.FailureHandling.RetryAttempts = 11 }, "retry attempts"},
-		{"negative retry", func(s *StorageSettings) { s.FailureHandling.RetryAttempts = -1 }, "retry attempts"},
+		{"persist attempts", func(s *StorageSettings) { s.FailureHandling.PersistAttempts = 11 }, "persist attempts"},
+		{"negative persist attempts", func(s *StorageSettings) { s.FailureHandling.PersistAttempts = -1 }, "persist attempts"},
 		{"initial backoff", func(s *StorageSettings) { s.FailureHandling.RetryInitialBackoffMS = 1 }, "initial storage retry"},
 		{"overflowing duration", func(s *StorageSettings) { s.FailureHandling.RetryInitialBackoffMS = int64(^uint64(0) >> 1) }, "initial storage retry"},
 		{"max below initial", func(s *StorageSettings) { s.FailureHandling.RetryMaxBackoffMS = 99 }, "maximum storage retry"},
@@ -203,6 +261,7 @@ func TestOpenRejectsUnknownAndTrailingJSON(t *testing.T) {
 		data string
 	}{
 		{name: "unknown field", data: `{"ui":{"theme":"system"},"integrity":{"concurrency":2},"extra":"x"}`},
+		{name: "unknown nested field after legacy migration support", data: `{"storage":{"failure_handling":{"retry_attempts":5,"retry_initial_backoff_ms":100,"retry_max_backoff_ms":800,"other":"x"}}}`},
 		{name: "trailing object", data: `{"ui":{"theme":"system"},"integrity":{"concurrency":2}} {}`},
 		{name: "trailing garbage", data: `{"ui":{"theme":"system"},"integrity":{"concurrency":2}}x`},
 	} {

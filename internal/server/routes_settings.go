@@ -116,8 +116,8 @@ func changedStorageSettings(effective, stored systemsettings.StorageSettings) []
 	if effective.QueueWriter.WriterConcurrency != stored.QueueWriter.WriterConcurrency {
 		changed = append(changed, "storage.queue_writer.writer_concurrency")
 	}
-	if effective.FailureHandling.RetryAttempts != stored.FailureHandling.RetryAttempts {
-		changed = append(changed, "storage.failure_handling.retry_attempts")
+	if effective.FailureHandling.PersistAttempts != stored.FailureHandling.PersistAttempts {
+		changed = append(changed, "storage.failure_handling.persist_attempts")
 	}
 	if effective.FailureHandling.RetryInitialBackoffMS != stored.FailureHandling.RetryInitialBackoffMS {
 		changed = append(changed, "storage.failure_handling.retry_initial_backoff_ms")

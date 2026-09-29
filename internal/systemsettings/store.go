@@ -61,7 +61,7 @@ type QueueWriterSettings struct {
 }
 
 type FailureHandlingSettings struct {
-	RetryAttempts         int   `json:"retry_attempts"`
+	PersistAttempts       int   `json:"persist_attempts"`
 	RetryInitialBackoffMS int64 `json:"retry_initial_backoff_ms"`
 	RetryMaxBackoffMS     int64 `json:"retry_max_backoff_ms"`
 }
@@ -140,14 +140,20 @@ func Open(dataRoot string) (*Store, error) {
 	if info.Size() < 0 || info.Size() > maxSettingsBytes {
 		return nil, fmt.Errorf("%w: settings file exceeds size limit", ErrInvalidSettings)
 	}
-	loaded, err := readSettings(path)
+	loaded, migratedLegacyAttempts, err := readSettings(path)
 	if err != nil {
 		return nil, err
 	}
 	if err := validate(loaded); err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(path, 0600); err != nil {
+	if migratedLegacyAttempts {
+		// Rewrite the validated legacy value through the existing atomic private
+		// persistence path. Its numeric meaning remains total persist attempts.
+		if err := store.write(loaded); err != nil {
+			return nil, fmt.Errorf("migrate system settings: %w", err)
+		}
+	} else if err := os.Chmod(path, 0600); err != nil {
 		return nil, fmt.Errorf("secure system settings file: %w", err)
 	}
 	store.settings = loaded
@@ -178,7 +184,7 @@ func (settings StorageSettings) IngestOptions() storage.IngestOptions {
 		PerRecordingBytes: settings.IngestMemory.PerRecordingBufferBytes,
 		MaxPayloadBytes:   settings.IngestMemory.MaxPayloadBytes,
 		Writers:           settings.QueueWriter.WriterConcurrency,
-		PersistAttempts:   settings.FailureHandling.RetryAttempts,
+		PersistAttempts:   settings.FailureHandling.PersistAttempts,
 		RetryBase:         time.Duration(settings.FailureHandling.RetryInitialBackoffMS) * time.Millisecond,
 		RetryMaxBackoff:   time.Duration(settings.FailureHandling.RetryMaxBackoffMS) * time.Millisecond,
 		SampleInterval:    time.Duration(settings.Observability.SamplingIntervalMS) * time.Millisecond,
@@ -263,7 +269,7 @@ func defaultStorageSettings() StorageSettings {
 			WriterConcurrency:    options.Writers,
 		},
 		FailureHandling: FailureHandlingSettings{
-			RetryAttempts:         options.PersistAttempts,
+			PersistAttempts:       options.PersistAttempts,
 			RetryInitialBackoffMS: options.RetryBase.Milliseconds(),
 			RetryMaxBackoffMS:     options.RetryMaxBackoff.Milliseconds(),
 		},
@@ -283,38 +289,102 @@ func defaultSettings() Settings {
 	}
 }
 
-func readSettings(path string) (Settings, error) {
+func readSettings(path string) (Settings, bool, error) {
 	settings := defaultSettings()
 	f, err := os.Open(path)
 	if err != nil {
-		return settings, fmt.Errorf("open system settings: %w", err)
+		return settings, false, fmt.Errorf("open system settings: %w", err)
 	}
 	defer f.Close()
 	openedInfo, err := f.Stat()
 	if err != nil {
-		return settings, fmt.Errorf("inspect system settings: %w", err)
+		return settings, false, fmt.Errorf("inspect system settings: %w", err)
 	}
 	pathInfo, err := os.Lstat(path)
 	if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, pathInfo) {
-		return settings, ErrUnsafePath
+		return settings, false, ErrUnsafePath
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxSettingsBytes+1))
 	if err != nil {
-		return settings, fmt.Errorf("read system settings: %w", err)
+		return settings, false, fmt.Errorf("read system settings: %w", err)
 	}
 	if len(data) == 0 || len(data) > maxSettingsBytes {
-		return settings, fmt.Errorf("%w: invalid settings size", ErrInvalidSettings)
+		return settings, false, fmt.Errorf("%w: invalid settings size", ErrInvalidSettings)
+	}
+	data, migrated, err := migrateLegacyPersistAttempts(data)
+	if err != nil {
+		return settings, false, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&settings); err != nil {
-		return settings, fmt.Errorf("%w: malformed settings document", ErrInvalidSettings)
+		return settings, false, fmt.Errorf("%w: malformed settings document", ErrInvalidSettings)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return settings, fmt.Errorf("%w: trailing data", ErrInvalidSettings)
+		return settings, false, fmt.Errorf("%w: trailing data", ErrInvalidSettings)
 	}
-	return settings, nil
+	return settings, migrated, nil
+}
+
+// migrateLegacyPersistAttempts accepts the former retry_attempts key only in
+// persisted settings files. It preserves strict decoding for every other key,
+// rejects ambiguous documents containing both names, and emits only the
+// canonical persist_attempts key on the next atomic save.
+func migrateLegacyPersistAttempts(data []byte) ([]byte, bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, false, fmt.Errorf("%w: malformed settings document", ErrInvalidSettings)
+	}
+	if root == nil {
+		return data, false, nil
+	}
+	failureRaw, exists := root["storage"]
+	if !exists {
+		return data, false, nil
+	}
+	var storageObject map[string]json.RawMessage
+	if err := json.Unmarshal(failureRaw, &storageObject); err != nil {
+		// The strict typed decoder below returns the authoritative malformed
+		// document error for a non-object storage value.
+		return data, false, nil
+	}
+	failureRaw, exists = storageObject["failure_handling"]
+	if !exists {
+		return data, false, nil
+	}
+	var failureObject map[string]json.RawMessage
+	if err := json.Unmarshal(failureRaw, &failureObject); err != nil {
+		return data, false, nil
+	}
+	legacy, hasLegacy := failureObject["retry_attempts"]
+	_, hasCanonical := failureObject["persist_attempts"]
+	if !hasLegacy {
+		return data, false, nil
+	}
+	if hasCanonical {
+		return nil, false, fmt.Errorf("%w: both legacy retry_attempts and persist_attempts are present", ErrInvalidSettings)
+	}
+	failureObject["persist_attempts"] = legacy
+	delete(failureObject, "retry_attempts")
+	failureJSON, err := json.Marshal(failureObject)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: malformed settings document", ErrInvalidSettings)
+	}
+	storageObject["failure_handling"] = failureJSON
+	storageJSON, err := json.Marshal(storageObject)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: malformed settings document", ErrInvalidSettings)
+	}
+	root["storage"] = storageJSON
+	migrated, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: malformed settings document", ErrInvalidSettings)
+	}
+	if len(migrated) > maxSettingsBytes {
+		return nil, false, fmt.Errorf("%w: settings file exceeds size limit", ErrInvalidSettings)
+	}
+	return migrated, true, nil
 }
 
 func (s *Store) write(settings Settings) error {

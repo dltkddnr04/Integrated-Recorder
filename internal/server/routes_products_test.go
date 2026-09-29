@@ -487,14 +487,15 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 
 	storageSettings := settings.Current().Storage
 	storageSettings.Observability.SamplingIntervalMS = 10000
+	storageSettings.FailureHandling.PersistAttempts = 4
 	storageBody, err := json.Marshal(map[string]any{"storage": storageSettings})
 	if err != nil {
 		t.Fatal(err)
 	}
 	storageUpdate := httptest.NewRecorder()
 	handler.ServeHTTP(storageUpdate, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(storageBody)))
-	wantRestart := `"restart_required":["integrity.concurrency","storage.observability.sampling_interval_ms"]`
-	if storageUpdate.Code != http.StatusOK || !strings.Contains(storageUpdate.Body.String(), wantRestart) || !strings.Contains(storageUpdate.Body.String(), `"sampling_interval_ms":10000`) {
+	wantRestart := `"restart_required":["integrity.concurrency","storage.failure_handling.persist_attempts","storage.observability.sampling_interval_ms"]`
+	if storageUpdate.Code != http.StatusOK || !strings.Contains(storageUpdate.Body.String(), wantRestart) || !strings.Contains(storageUpdate.Body.String(), `"sampling_interval_ms":10000`) || !strings.Contains(storageUpdate.Body.String(), `"persist_attempts":4`) || strings.Contains(storageUpdate.Body.String(), `"retry_attempts"`) {
 		t.Fatalf("storage settings update=%d %s", storageUpdate.Code, storageUpdate.Body.String())
 	}
 
@@ -502,6 +503,7 @@ func TestSystemSettingsAPIReportsRestartRequiredAndValidatesStrictly(t *testing.
 	// restart marker while unrelated integrity restart state remains.
 	storageSettings = settings.Current().Storage
 	storageSettings.Observability.SamplingIntervalMS = 5000
+	storageSettings.FailureHandling.PersistAttempts = 5
 	storageBody, _ = json.Marshal(map[string]any{"storage": storageSettings})
 	revert := httptest.NewRecorder()
 	handler.ServeHTTP(revert, httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(storageBody)))

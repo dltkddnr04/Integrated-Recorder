@@ -48,7 +48,7 @@ function applyTheme(theme: ThemePreference) { applyResolvedTheme(resolveTheme(th
 
 type StorageForm = {
   globalBufferMiB: string; perRecordingBufferMiB: string; maxPayloadMiB: string
-  pendingQueueCapacity: string; retryAttempts: string; retryInitialBackoffMs: string; retryMaxBackoffMs: string
+  pendingQueueCapacity: string; persistAttempts: string; retryInitialBackoffMs: string; retryMaxBackoffMs: string
   samplingIntervalSeconds: string; metricsRetentionHours: string
 }
 const MIB = 1024 * 1024
@@ -58,7 +58,7 @@ function storageFormFromSettings(settings: StorageSettings): StorageForm {
     perRecordingBufferMiB: String(Math.round(settings.ingest_memory.per_recording_buffer_bytes / MIB)),
     maxPayloadMiB: String(Math.round(settings.ingest_memory.max_payload_bytes / MIB)),
     pendingQueueCapacity: String(settings.queue_writer.pending_queue_capacity),
-    retryAttempts: String(settings.failure_handling.retry_attempts),
+    persistAttempts: String(settings.failure_handling.persist_attempts),
     retryInitialBackoffMs: String(settings.failure_handling.retry_initial_backoff_ms),
     retryMaxBackoffMs: String(settings.failure_handling.retry_max_backoff_ms),
     samplingIntervalSeconds: String(settings.observability.sampling_interval_ms / 1000),
@@ -75,7 +75,7 @@ function storageSettingsFromForm(form: StorageForm): StorageSettings {
     },
     queue_writer: { pending_queue_capacity: number(form.pendingQueueCapacity), writer_concurrency: 1 },
     failure_handling: {
-      retry_attempts: number(form.retryAttempts),
+      persist_attempts: number(form.persistAttempts),
       retry_initial_backoff_ms: number(form.retryInitialBackoffMs),
       retry_max_backoff_ms: number(form.retryMaxBackoffMs),
     },
@@ -110,7 +110,7 @@ function StorageSettingsForm({ data, loading, error, retry, saving, saveError, s
     <form className="space-y-5" onSubmit={submit}>
       <div className="grid gap-4 lg:grid-cols-2"><fieldset className="space-y-3 rounded-lg border border-border p-4"><legend className="px-1 text-sm font-semibold">메모리 버퍼</legend><div className="grid gap-3 sm:grid-cols-2"><StorageNumberField id="storage-global-buffer" label="전체 버퍼 한도" value={form.globalBufferMiB} unit="MiB" min={64} max={2048} description="전체 동시 수집 작업이 나누어 사용하는 휘발성 메모리 한도입니다." onChange={update('globalBufferMiB')} /><StorageNumberField id="storage-recording-buffer" label="녹화별 버퍼 한도" value={form.perRecordingBufferMiB} unit="MiB" min={1} max={1536} onChange={update('perRecordingBufferMiB')} /><StorageNumberField id="storage-max-payload" label="단일 페이로드 최대 크기" value={form.maxPayloadMiB} unit="MiB" min={1} max={1024} onChange={update('maxPayloadMiB')} /></div><p className="text-[11px] leading-4 text-muted-foreground">버퍼에만 있는 데이터는 아직 보관 데이터로 확정되지 않습니다.</p></fieldset>
         <fieldset className="space-y-3 rounded-lg border border-border p-4"><legend className="px-1 text-sm font-semibold">대기열·저장 작업</legend><div className="grid gap-3 sm:grid-cols-2"><StorageNumberField id="storage-queue-capacity" label="저장 대기열 최대 크기" value={form.pendingQueueCapacity} unit="개" min={1} max={128} onChange={update('pendingQueueCapacity')} /><div className="space-y-1.5"><label htmlFor="storage-writer-concurrency" className="block text-xs font-medium">저장 작업 동시 실행 수</label><div className="flex items-center gap-2"><Input id="storage-writer-concurrency" type="number" value={1} disabled readOnly aria-describedby="storage-writer-guidance" /><span className="shrink-0 text-xs text-muted-foreground">개</span></div><p id="storage-writer-guidance" className="text-[11px] leading-4 text-muted-foreground">현재는 순서 보장을 위해 1개만 지원합니다. 높은 동시성이 항상 빠른 것은 아니며 HDD나 느린 저장소에서는 처리량을 낮출 수 있습니다.</p></div></div></fieldset>
-        <fieldset className="space-y-3 rounded-lg border border-border p-4"><legend className="px-1 text-sm font-semibold">실패 재시도</legend><div className="grid gap-3 sm:grid-cols-3"><StorageNumberField id="storage-retry-attempts" label="재시도 횟수" value={form.retryAttempts} unit="회" min={1} max={10} onChange={update('retryAttempts')} /><StorageNumberField id="storage-retry-initial" label="초기 대기" value={form.retryInitialBackoffMs} unit="ms" min={10} max={30000} onChange={update('retryInitialBackoffMs')} /><StorageNumberField id="storage-retry-max" label="최대 대기" value={form.retryMaxBackoffMs} unit="ms" min={10} max={300000} onChange={update('retryMaxBackoffMs')} /></div></fieldset>
+        <fieldset className="space-y-3 rounded-lg border border-border p-4"><legend className="px-1 text-sm font-semibold">실패 처리</legend><div className="grid gap-3 sm:grid-cols-3"><StorageNumberField id="storage-persist-attempts" label="총 저장 시도 횟수" value={form.persistAttempts} unit="회" min={1} max={10} description="최초 저장 시도를 포함한 최대 시도 횟수입니다." onChange={update('persistAttempts')} /><StorageNumberField id="storage-retry-initial" label="초기 대기" value={form.retryInitialBackoffMs} unit="ms" min={10} max={30000} onChange={update('retryInitialBackoffMs')} /><StorageNumberField id="storage-retry-max" label="최대 대기" value={form.retryMaxBackoffMs} unit="ms" min={10} max={300000} onChange={update('retryMaxBackoffMs')} /></div></fieldset>
         <fieldset className="space-y-3 rounded-lg border border-border p-4"><legend className="px-1 text-sm font-semibold">관측 기록</legend><div className="grid gap-3 sm:grid-cols-2"><StorageNumberField id="storage-sampling-interval" label="측정 간격" value={form.samplingIntervalSeconds} unit="초" min={1} max={3600} onChange={update('samplingIntervalSeconds')} /><StorageNumberField id="storage-metrics-retention" label="측정 기록 보존 기간" value={form.metricsRetentionHours} unit="시간" min={Math.max(0.001, Number(form.samplingIntervalSeconds || 1) / 3600)} max={24} step="any" onChange={update('metricsRetentionHours')} /></div></fieldset></div>
       {Boolean(saveError) && <p role="alert" className="text-sm text-destructive">{errorMessage(saveError)}</p>}
       {saveResult && <p role="status" className="text-xs text-muted-foreground">설정을 저장했습니다. 현재 적용값은 서버 재시작 전까지 유지됩니다.</p>}
