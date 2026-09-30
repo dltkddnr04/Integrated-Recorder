@@ -102,6 +102,8 @@ type Service struct {
 	jobs         map[string]Job
 	activeByRec  map[string]string
 	cancelByID   map[string]context.CancelFunc
+	running      int
+	changed      chan struct{}
 }
 
 // Open initializes an optional remux-only service. Missing FFmpeg is not a
@@ -168,6 +170,7 @@ func Open(root string, store *storage.Store, ffmpegPath string, concurrency int)
 		store: store, ffmpegPath: resolved, timeout: defaultTimeout,
 		queue: make(chan queuedJob, maxActiveJobs), ctx: ctx, cancel: cancel,
 		jobs: make(map[string]Job), activeByRec: make(map[string]string), cancelByID: make(map[string]context.CancelFunc),
+		changed: make(chan struct{}),
 	}
 	if err := s.load(); err != nil {
 		cancel()
@@ -236,6 +239,7 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	job := Job{ID: id, RecordingID: recording.ID, Kind: jobKindExport, State: StateQueued, CreatedAt: time.Now().UTC(), OutputName: "recording-" + recording.ID + ".mkv"}
 	s.jobs[id] = job
 	s.activeByRec[recording.ID] = id
+	s.notifyLocked()
 	if err := s.persistLocked(); err != nil {
 		delete(s.jobs, id)
 		delete(s.activeByRec, recording.ID)
@@ -319,6 +323,7 @@ func (s *Service) Cancel(id string) (Job, error) {
 	job.State, job.FinishedAt, job.ErrorCode = StateCanceled, &now, "canceled"
 	s.jobs[id] = job
 	delete(s.activeByRec, job.RecordingID)
+	s.notifyLocked()
 	err := s.persistLocked()
 	s.mu.Unlock()
 	_ = os.RemoveAll(filepath.Join(s.jobsDir, id))
@@ -386,6 +391,49 @@ func (s *Service) OpenDownload(id string) (*os.File, Job, error) {
 	return f, job, nil
 }
 
+// WaitForIdle waits for accepted exports to finish their job-state and
+// filesystem mutations. It neither closes the service nor prevents new jobs
+// from being accepted after the caller observes idle.
+func (s *Service) WaitForIdle(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if len(s.activeByRec) == 0 && s.running == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *Service) notifyLocked() {
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+func (s *Service) finishRunning() {
+	s.mu.Lock()
+	if s.running > 0 {
+		s.running--
+	}
+	s.notifyLocked()
+	s.mu.Unlock()
+}
+
 // Close cancels active process work and joins every worker up to ctx's limit.
 func (s *Service) Close(ctx context.Context) error {
 	if s == nil {
@@ -435,6 +483,9 @@ func (s *Service) run(task queuedJob) {
 	now := time.Now().UTC()
 	job.State, job.StartedAt = StateRunning, &now
 	s.jobs[job.ID] = job
+	s.running++
+	s.notifyLocked()
+	defer s.finishRunning()
 	jobCtx, cancel := context.WithTimeout(s.ctx, s.timeout)
 	s.cancelByID[job.ID] = cancel
 	if err := s.persistLocked(); err != nil {

@@ -36,6 +36,7 @@ var (
 	ErrConflict        = errors.New("watch state conflict")
 	ErrInvalid         = errors.New("invalid watch")
 	ErrQueueFull       = errors.New("watch check queue is full")
+	ErrHandoffPaused   = errors.New("watch scheduler is paused for control generation handoff")
 	ErrUnsupported     = errors.New("adapter does not support unattended watches")
 	ErrServiceClosed   = errors.New("watch service is closed")
 	ErrActiveRecording = errors.New("watch already has an active recording")

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -1459,6 +1460,47 @@ func TestReconcileDoesNotWaitForBlockedPreviewWorker(t *testing.T) {
 	waitFor(t, func() bool { return fixture.invocations() > 0 })
 	if err := service.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWaitForIdleDrainsQueuedAndActivePreviewTasksAndFlushesIndex(t *testing.T) {
+	fixture := newPreviewFixture(t, 3, false, "block")
+	fixture.recording.State = domain.StateRecording
+	service := fixture.open(t)
+	defer service.Close(context.Background())
+	if _, err := service.SetMode(fixture.recording.ID, ModeSegment); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Reconcile(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return fixture.invocations() >= previewWorkers })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	err := service.WaitForIdle(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForIdle error=%v, want deadline while preview work is blocked", err)
+	}
+	if err := os.WriteFile(filepath.Join(fixture.captureDir, "release"), []byte("ok"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := service.WaitForIdle(ctx); err != nil {
+		t.Fatalf("WaitForIdle after releasing workers: %v", err)
+	}
+	if got := service.Summary(fixture.recording).FrameCount; got != 3 {
+		t.Fatalf("preview frame count=%d, want all three accepted tasks", got)
+	}
+	service.mu.Lock()
+	dirty := service.dirtyIndexes[fixture.recording.ID]
+	service.mu.Unlock()
+	if dirty != 0 {
+		t.Fatalf("WaitForIdle left %d dirty index updates", dirty)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.root, "previews", fixture.recording.ID, "index.json")); err != nil {
+		t.Fatalf("WaitForIdle did not flush the live preview index: %v", err)
 	}
 }
 

@@ -132,6 +132,75 @@ func TestDuplicateQueuedOrRunningVerificationCoalesces(t *testing.T) {
 	waitJobState(t, service, first.ID, StateCompleted)
 }
 
+func TestWaitForIdleDrainsQueuedAndRunningVerificationsWithoutClosingService(t *testing.T) {
+	root := t.TempDir()
+	store, err := storage.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := Open(root, store, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	service.verify = func(ctx context.Context, _ *domain.Recording) storage.IntegrityResult {
+		entered <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return storage.IntegrityResult{Status: storage.IntegrityVerified, Issues: []storage.IntegrityIssue{}}
+	}
+	first, err := service.Start(context.Background(), &domain.Recording{ID: "12121212121212121212121212121212", Tracks: map[string]*domain.Track{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first verification did not start")
+	}
+	second, err := service.Start(context.Background(), &domain.Recording{ID: "34343434343434343434343434343434", Tracks: map[string]*domain.Track{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job, err := service.Get(second.ID); err != nil || job.State != StateQueued {
+		t.Fatalf("second job=%+v err=%v, want queued behind blocked worker", job, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	err = service.WaitForIdle(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForIdle error=%v, want deadline while verifications are blocked", err)
+	}
+	if job, err := service.Get(first.ID); err != nil || job.State != StateRunning {
+		t.Fatalf("WaitForIdle canceled or closed the running job: %+v err=%v", job, err)
+	}
+	close(release)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := service.WaitForIdle(ctx); err != nil {
+		t.Fatalf("WaitForIdle after releasing worker: %v", err)
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		job, err := service.Get(id)
+		if err != nil || job.State != StateCompleted {
+			t.Fatalf("job %s did not complete before idle: %+v err=%v", id, job, err)
+		}
+	}
+	if err := service.WaitForIdle(nil); err != nil {
+		t.Fatalf("WaitForIdle(nil) on idle service: %v", err)
+	}
+	if _, err := service.Start(context.Background(), &domain.Recording{ID: "56565656565656565656565656565656", Tracks: map[string]*domain.Track{}}); err != nil {
+		t.Fatalf("WaitForIdle closed the service: %v", err)
+	}
+	if err := service.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWorkerAndActiveJobBounds(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.New(root)

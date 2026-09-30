@@ -101,6 +101,8 @@ type Service struct {
 	closeOnce sync.Once
 	closeErr  error
 	lastErr   error
+	running   int
+	changed   chan struct{}
 }
 
 // Open loads persisted history, marks work left by a prior process as failed,
@@ -145,6 +147,7 @@ func Open(root string, store *storage.Store, concurrency int) (*Service, error) 
 		active:    make(map[string]string),
 		controls:  make(map[string]*jobControl),
 		queue:     make(chan string, maxActiveJobs),
+		changed:   make(chan struct{}),
 		ctx:       ctx,
 		cancel:    cancel,
 		done:      make(chan struct{}),
@@ -245,6 +248,7 @@ func (s *Service) Start(ctx context.Context, recording *domain.Recording) (Job, 
 	s.jobs[id] = job
 	s.order = append(s.order, id)
 	s.active[snapshot.ID] = id
+	s.notifyLocked()
 	control := &jobControl{snapshot: snapshot, ctx: jobCtx, cancel: cancel}
 	control.stopCall = context.AfterFunc(ctx, func() { s.cancelJob(id) })
 	s.controls[id] = control
@@ -345,6 +349,49 @@ func (s *Service) InProgress(recordingID string) bool {
 	return s.active[recordingID] != ""
 }
 
+// WaitForIdle waits until every accepted queued or running verification has
+// stopped mutating job state. It does not close the service or block later
+// Start calls after idle has been observed.
+func (s *Service) WaitForIdle(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if len(s.active) == 0 && s.running == 0 {
+			s.mu.Unlock()
+			return nil
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *Service) notifyLocked() {
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+func (s *Service) finishRunning() {
+	s.mu.Lock()
+	if s.running > 0 {
+		s.running--
+	}
+	s.notifyLocked()
+	s.mu.Unlock()
+}
+
 // Close cancels queued/running jobs, persists terminal states, and joins all
 // workers. If ctx expires first, Close returns ctx.Err while workers continue
 // only until their current non-context-aware storage verification returns.
@@ -405,6 +452,9 @@ func (s *Service) run(id string) {
 	job.State = StateRunning
 	job.StartedAt = timePointer(now)
 	s.jobs[id] = job
+	s.running++
+	s.notifyLocked()
+	defer s.finishRunning()
 	if previous, ok := s.results[job.RecordingID]; ok {
 		copy := cloneResult(previous)
 		control.previous = &copy
@@ -533,6 +583,7 @@ func (s *Service) finishLocked(id string) {
 		control.cancel()
 		delete(s.controls, id)
 	}
+	s.notifyLocked()
 }
 
 func (s *Service) load() error {

@@ -76,16 +76,16 @@ type storageMetricSample struct {
 }
 
 func (s *Server) storagePools(w http.ResponseWriter, r *http.Request) {
-	if s.manager == nil || s.manager.Store() == nil {
+	if s.storage == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage_unavailable"})
 		return
 	}
-	snapshot := s.manager.Store().PoolMetrics()
+	snapshot := s.storage.PoolMetrics()
 	writeJSON(w, http.StatusOK, storagePoolsResponse{Items: []storagePoolView{poolView(snapshot)}})
 }
 
 func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
-	if s.manager == nil || s.manager.Store() == nil {
+	if s.storage == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "storage_unavailable"})
 		return
 	}
@@ -99,7 +99,7 @@ func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_storage_metrics_window"})
 		return
 	}
-	snapshot := s.manager.Store().PoolMetricsWindow(window)
+	snapshot := s.storage.PoolMetricsWindow(window)
 	items := make([]storageMetricSample, 0, len(snapshot.Samples))
 	for _, sample := range snapshot.Samples {
 		items = append(items, storageMetricSample{
@@ -108,7 +108,7 @@ func (s *Server) storagePoolMetrics(w http.ResponseWriter, r *http.Request) {
 			BufferUsedBytes:     sample.BufferUsedBytes, PersistQueueBytes: sample.PersistQueueBytes,
 		})
 	}
-	configuredInterval := s.manager.Store().MetricsSamplingInterval()
+	configuredInterval := s.storage.MetricsSamplingInterval()
 	intervalSeconds := int((configuredInterval + time.Second - 1) / time.Second)
 	writeJSON(w, http.StatusOK, storageMetricsResponse{PoolID: poolID, SampleIntervalSeconds: intervalSeconds, SampleIntervalMS: configuredInterval.Milliseconds(), Items: items})
 }

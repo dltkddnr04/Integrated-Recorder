@@ -17,6 +17,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
@@ -584,10 +585,16 @@ func TestUnavailableExportIsAdvertisedAndNotImplemented(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewWithOptions(manager, nil, nil, Options{})
+	handler := NewWithOptions(manager, nil, nil, Options{BuildInfo: buildinfo.Info{
+		Version: "1.2.3", Commit: strings.Repeat("a", 40), BuildTime: "2026-09-29T00:00:00Z",
+		ReleaseChannel: "stable", RuntimeProtocolVersion: buildinfo.RuntimeProtocolVersion,
+	}})
 	info := httptest.NewRecorder()
 	handler.ServeHTTP(info, httptest.NewRequest(http.MethodGet, "/api/system/info", nil))
-	if info.Code != http.StatusOK || !strings.Contains(info.Body.String(), `"export_available":false`) {
+	if info.Code != http.StatusOK || !strings.Contains(info.Body.String(), `"export_available":false`) ||
+		!strings.Contains(info.Body.String(), `"build_time":"2026-09-29T00:00:00Z"`) ||
+		!strings.Contains(info.Body.String(), `"release_channel":"stable"`) ||
+		!strings.Contains(info.Body.String(), `"runtime_protocol_version":1`) {
 		t.Fatalf("system info=%d %s", info.Code, info.Body.String())
 	}
 	response := httptest.NewRecorder()

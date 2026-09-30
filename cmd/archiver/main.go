@@ -17,6 +17,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
 	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
 	"github.com/dltkddnr04/integrated-recorder/internal/management"
@@ -174,10 +175,8 @@ func run() error {
 	forceSecureCookies := os.Getenv("COOKIE_SECURE") == "1"
 	startedAt := time.Now().UTC()
 
-	version := buildVersion
-	commit := buildCommit
-
-	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage, ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, Version: version, Commit: commit})
+	build := buildinfo.Current()
+	apiServer := server.NewWithOptions(manager, adapters, configs, server.Options{Management: products, Integrity: integrityService, Derivatives: exportService, Previews: previewService, Watches: watchService, Auth: authService, Settings: settings, InitialIntegrityConcurrency: startupSettings.Integrity.Concurrency, InitialStorageSettings: &startupSettings.Storage, ForceSecureCookies: forceSecureCookies, StartedAt: startedAt, BuildInfo: build})
 	httpServer := &http.Server{Addr: addr, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -245,11 +244,6 @@ func run() error {
 	}
 	return nil
 }
-
-var (
-	buildVersion = "dev"
-	buildCommit  = "unknown"
-)
 
 func isLoopbackAddress(address string) bool {
 	host, _, err := net.SplitHostPort(address)

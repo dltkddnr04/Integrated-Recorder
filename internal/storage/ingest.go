@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -28,6 +29,7 @@ const (
 	DefaultRetryMaxBackoff               = 800 * time.Millisecond
 	DefaultPoolSampleInterval            = 5 * time.Second
 	DefaultPoolMetricsRetention          = 24 * time.Hour
+	runtimeResourceReleaseTimeout        = 3 * time.Second
 	MaxIngestGlobalBytes           int64 = 2 << 30
 	MaxIngestPerRecordingBytes     int64 = 1536 << 20
 	MaxIngestPayloadBytes          int64 = 1 << 30
@@ -39,6 +41,20 @@ var (
 	ErrIngestReservation  = errors.New("ingest payload exceeded its reserved byte budget")
 	ErrIngestSizeMismatch = ErrPayloadSizeMismatch
 )
+
+// RuntimeIngestCoordinator is the transport-neutral process-wide accounting
+// contract used when multiple recorder-engine generations share one Runtime
+// Host. A nil coordinator preserves the original single-process limits.
+// Implementations must make acquisitions idempotent by lease ID and bound the
+// duration of each transport operation.
+type RuntimeIngestCoordinator interface {
+	SetReservation(context.Context, string, string, int64) error
+	ReleaseReservation(context.Context, string, string) error
+	AcquireQueue(context.Context, string) error
+	ReleaseQueue(context.Context, string) error
+	AcquireWriter(context.Context, string) error
+	ReleaseWriter(context.Context, string) error
+}
 
 type IngestOptions struct {
 	QueueObjects      int
@@ -174,6 +190,7 @@ type IngestSnapshot struct {
 type IngestService struct {
 	store   *Store
 	options IngestOptions
+	global  RuntimeIngestCoordinator
 	jobs    chan *ingestJob
 	slots   chan struct{}
 
@@ -207,10 +224,14 @@ type storageErrorRecorder interface{ recordStorageError() }
 
 type ingestJob struct {
 	recordingID string
+	queueLease  string
+	writerLease string
 	payload     *IngestPayload
 	persist     func([]byte) (PayloadResult, error)
 	complete    func(PayloadResult, error)
 	queuedAt    time.Time
+	queueOnce   sync.Once
+	writerOnce  sync.Once
 }
 
 func (j *ingestJob) payloadBytes() int64 {
@@ -224,13 +245,15 @@ func (j *ingestJob) payloadBytes() int64 {
 // data; the archive becomes aware of bytes only after the persist callback
 // finishes all durable metadata ordering.
 type IngestPayload struct {
-	service     *IngestService
-	recordingID string
-	data        []byte
-	result      PayloadResult
-	reserved    int64
-	used        int64
-	once        sync.Once
+	service        *IngestService
+	recordingID    string
+	data           []byte
+	result         PayloadResult
+	reserved       int64
+	used           int64
+	reservationID  string
+	globalReserved int64
+	once           sync.Once
 }
 
 func (p *IngestPayload) Result() PayloadResult { return p.result }
@@ -246,6 +269,10 @@ func (p *IngestPayload) Release() {
 }
 
 func NewIngestService(store *Store, options IngestOptions) (*IngestService, error) {
+	return newIngestService(store, options, nil)
+}
+
+func newIngestService(store *Store, options IngestOptions, global RuntimeIngestCoordinator) (*IngestService, error) {
 	if store == nil {
 		return nil, errors.New("archive store is required")
 	}
@@ -286,13 +313,21 @@ func NewIngestService(store *Store, options IngestOptions) (*IngestService, erro
 	if backend, ok := store.StorageBackend.(*LocalFilesystemBackend); ok {
 		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
 	}
-	s := &IngestService{store: store, options: options, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]bool{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{})}
+	s := &IngestService{store: store, options: options, global: global, jobs: make(chan *ingestJob, options.QueueObjects), slots: make(chan struct{}, options.QueueObjects), changed: make(chan struct{}), reservedByRecording: map[string]int64{}, queueTimes: map[*ingestJob]time.Time{}, failedRecordings: map[string]bool{}, closeDone: make(chan struct{}), samplerStop: make(chan struct{}), samplerDone: make(chan struct{})}
 	for i := 0; i < options.Writers; i++ {
 		s.workers.Add(1)
 		go s.writer()
 	}
 	go s.sampleLoop()
 	return s, nil
+}
+
+func newIngestLeaseID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", errors.New("ingest lease identity unavailable")
+	}
+	return "i-" + hex.EncodeToString(value[:]), nil
 }
 
 // ReadPayload reserves an advertised size as an allocation hint and otherwise
@@ -319,10 +354,18 @@ func (s *IngestService) ReadPayload(ctx context.Context, recordingID string, src
 	// size is only a hint and is converted to the same geometric capacity used
 	// by the allocation path.
 	reserve = allocationCapacity(reserve, max)
-	if err := s.reserve(ctx, recordingID, reserve); err != nil {
+	payload := &IngestPayload{service: s, recordingID: recordingID}
+	if s.global != nil {
+		leaseID, err := newIngestLeaseID()
+		if err != nil {
+			return nil, err
+		}
+		payload.reservationID = leaseID
+	}
+	if err := s.reserve(ctx, payload, reserve); err != nil {
+		payload.Release()
 		return nil, err
 	}
-	payload := &IngestPayload{service: s, recordingID: recordingID, reserved: reserve}
 	hash := sha256.New()
 	buf := make([]byte, 64<<10)
 	for {
@@ -366,10 +409,9 @@ func (s *IngestService) ReadPayload(ctx context.Context, recordingID string, src
 					if needsLease {
 						defer s.releaseReallocationLease()
 					}
-					if err := s.reserve(ctx, recordingID, additional); err != nil {
+					if err := s.reserve(ctx, payload, additional); err != nil {
 						return err
 					}
-					payload.reserved += additional
 					if s.reallocationHook != nil {
 						s.reallocationHook(oldCapacity, allocation)
 					}
@@ -378,13 +420,13 @@ func (s *IngestService) ReadPayload(ctx context.Context, recordingID string, src
 					payload.data = grown
 					if oldCapacity > 0 {
 						payload.reserved -= oldCapacity
-						s.releaseReservation(recordingID, oldCapacity)
+						s.releasePayloadReservation(payload, oldCapacity)
 					}
 					// A small or inaccurate Content-Length hint can reserve more
 					// than the new array. Shrink after allocation succeeds.
 					if excess := payload.reserved - allocation; excess > 0 {
 						payload.reserved -= excess
-						s.releaseReservation(recordingID, excess)
+						s.releasePayloadReservation(payload, excess)
 					}
 					return nil
 				}()
@@ -416,8 +458,9 @@ func (s *IngestService) ReadPayload(ctx context.Context, recordingID string, src
 	}
 	allocated := int64(cap(payload.data))
 	if allocated < payload.reserved {
-		s.releaseReservation(recordingID, payload.reserved-allocated)
+		excess := payload.reserved - allocated
 		payload.reserved = allocated
+		s.releasePayloadReservation(payload, excess)
 	}
 	payload.result = PayloadResult{Size: int64(len(payload.data)), SHA256: hex.EncodeToString(hash.Sum(nil))}
 	return payload, nil
@@ -492,9 +535,12 @@ func (s *IngestService) releaseReallocationLease() {
 	s.mu.Unlock()
 }
 
-func (s *IngestService) reserve(ctx context.Context, recordingID string, bytes int64) error {
+func (s *IngestService) reserve(ctx context.Context, payload *IngestPayload, bytes int64) error {
 	if bytes == 0 {
 		return nil
+	}
+	if payload == nil {
+		return errors.New("ingest reservation payload is required")
 	}
 	for {
 		s.mu.Lock()
@@ -502,13 +548,13 @@ func (s *IngestService) reserve(ctx context.Context, recordingID string, bytes i
 			s.mu.Unlock()
 			return ErrIngestClosed
 		}
-		recordingUsed := s.reservedByRecording[recordingID]
+		recordingUsed := s.reservedByRecording[payload.recordingID]
 		if bytes <= s.options.GlobalBytes-s.reservedGlobal && bytes <= s.options.PerRecordingBytes-recordingUsed {
 			s.reservedGlobal += bytes
-			s.reservedByRecording[recordingID] = recordingUsed + bytes
+			s.reservedByRecording[payload.recordingID] = recordingUsed + bytes
 			s.signalLocked()
 			s.mu.Unlock()
-			return nil
+			break
 		}
 		changed := s.changed
 		s.mu.Unlock()
@@ -518,6 +564,23 @@ func (s *IngestService) reserve(ctx context.Context, recordingID string, bytes i
 		case <-changed:
 		}
 	}
+
+	if s.global != nil {
+		if payload.reservationID == "" {
+			s.releaseReservation(payload.recordingID, bytes)
+			return errors.New("ingest reservation identity is missing")
+		}
+		desired := payload.globalReserved + bytes
+		// Record the desired amount before the RPC. If the response is lost after
+		// the Host applied it, ReleasePayload still knows which lease to release.
+		payload.globalReserved = desired
+		if err := s.global.SetReservation(ctx, payload.recordingID, payload.reservationID, desired); err != nil {
+			s.releaseReservation(payload.recordingID, bytes)
+			return err
+		}
+	}
+	payload.reserved += bytes
+	return nil
 }
 
 func (s *IngestService) addUsed(bytes int64) {
@@ -540,6 +603,36 @@ func (s *IngestService) releaseReservation(recordingID string, bytes int64) {
 	s.mu.Unlock()
 }
 
+// releasePayloadReservation releases local bytes immediately and shrinks the
+// shared lease. A failed/uncertain remote shrink intentionally leaves the
+// larger Host reservation in place; that can reduce admission temporarily but
+// can never under-account a still-live backing array.
+func (s *IngestService) releasePayloadReservation(payload *IngestPayload, bytes int64) {
+	if payload == nil || bytes <= 0 {
+		return
+	}
+	s.releaseReservation(payload.recordingID, bytes)
+	if s.global == nil || payload.globalReserved <= 0 {
+		return
+	}
+	desired := payload.globalReserved - bytes
+	if desired <= 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+		err := s.global.ReleaseReservation(ctx, payload.recordingID, payload.reservationID)
+		cancel()
+		if err == nil {
+			payload.globalReserved = 0
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+	err := s.global.SetReservation(ctx, payload.recordingID, payload.reservationID, desired)
+	cancel()
+	if err == nil {
+		payload.globalReserved = desired
+	}
+}
+
 func (s *IngestService) releasePayload(payload *IngestPayload) {
 	s.mu.Lock()
 	s.usedBytes -= payload.used
@@ -551,6 +644,12 @@ func (s *IngestService) releasePayload(payload *IngestPayload) {
 	s.signalLocked()
 	s.mu.Unlock()
 	payload.data = nil
+	if s.global != nil && payload.globalReserved > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+		_ = s.global.ReleaseReservation(ctx, payload.recordingID, payload.reservationID)
+		cancel()
+		payload.globalReserved = 0
+	}
 }
 
 // Submit transfers payload ownership after placing it in the bounded object
@@ -586,6 +685,15 @@ func (s *IngestService) submit(_ context.Context, job *ingestJob) error {
 	// while a bounded queue is temporarily full. Submissions that began before
 	// Close are allowed to wait for a slot and enter the drain; Close rejects
 	// only submissions that begin after admission has stopped.
+	if s.global != nil {
+		var err error
+		if job.queueLease, err = newIngestLeaseID(); err != nil {
+			return err
+		}
+		if job.writerLease, err = newIngestLeaseID(); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -614,6 +722,13 @@ func (s *IngestService) submit(_ context.Context, job *ingestJob) error {
 	}
 
 slotAcquired:
+	if s.global != nil {
+		if err := s.global.AcquireQueue(context.Background(), job.queueLease); err != nil {
+			_ = s.releaseGlobalQueue(job)
+			<-s.slots
+			return errors.New("global storage queue is unavailable")
+		}
+	}
 	s.mu.Lock()
 	s.queuedObjects++
 	s.queuedBytes += job.payloadBytes()
@@ -643,10 +758,27 @@ func (s *IngestService) writer() {
 		s.mu.Unlock()
 		var result PayloadResult
 		var err error
+		writerAcquired := false
 		if failed {
 			err = errors.New("canonical storage commit failed")
+			_ = s.releaseGlobalQueue(job)
+		} else if s.global != nil {
+			if acquireErr := s.global.AcquireWriter(context.Background(), job.writerLease); acquireErr != nil {
+				err = errors.New("global storage writer is unavailable")
+				_ = s.releaseGlobalWriter(job)
+				_ = s.releaseGlobalQueue(job)
+			} else {
+				writerAcquired = true
+				_ = s.releaseGlobalQueue(job)
+			}
 		} else {
+			writerAcquired = true
+		}
+		if writerAcquired {
 			result, err = s.persistWithRetry(job)
+		}
+		if writerAcquired && s.global != nil {
+			_ = s.releaseGlobalWriter(job)
 		}
 		if err != nil {
 			s.mu.Lock()
@@ -666,6 +798,32 @@ func (s *IngestService) writer() {
 		s.signalLocked()
 		s.mu.Unlock()
 	}
+}
+
+func (s *IngestService) releaseGlobalQueue(job *ingestJob) error {
+	if s.global == nil || job == nil {
+		return nil
+	}
+	var err error
+	job.queueOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+		err = s.global.ReleaseQueue(ctx, job.queueLease)
+		cancel()
+	})
+	return err
+}
+
+func (s *IngestService) releaseGlobalWriter(job *ingestJob) error {
+	if s.global == nil || job == nil {
+		return nil
+	}
+	var err error
+	job.writerOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), runtimeResourceReleaseTimeout)
+		err = s.global.ReleaseWriter(ctx, job.writerLease)
+		cancel()
+	})
+	return err
 }
 
 func (s *IngestService) persistWithRetry(job *ingestJob) (PayloadResult, error) {
@@ -762,11 +920,7 @@ func (s *IngestService) runSampler(ticks <-chan time.Time, stop <-chan struct{})
 		select {
 		case now := <-ticks:
 			state := s.Snapshot()
-			if backend, ok := s.store.StorageBackend.(interface {
-				samplePool(IngestSnapshot, time.Time)
-			}); ok {
-				backend.samplePool(state, now)
-			}
+			s.store.samplePool(state, now)
 		case <-stop:
 			return
 		}

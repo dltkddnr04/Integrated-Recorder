@@ -57,6 +57,23 @@ func TestFakeFFmpegHelper(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	if mode == "wait-release" {
+		marker := os.Getenv("DERIVATIVE_FAKE_STARTED")
+		if marker != "" {
+			_ = os.WriteFile(marker, []byte("started"), 0600)
+		}
+		release := os.Getenv("DERIVATIVE_FAKE_RELEASE")
+		for release == "" {
+			time.Sleep(10 * time.Millisecond)
+			release = os.Getenv("DERIVATIVE_FAKE_RELEASE")
+		}
+		for {
+			if _, err := os.Stat(release); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	if mode == "fail" {
 		os.Exit(43)
 	}
@@ -278,6 +295,57 @@ func TestDuplicateExportCoalescesAndCancelCleansPartial(t *testing.T) {
 	}
 }
 
+func TestWaitForIdleDrainsQueuedAndRunningExportsWithoutClosingService(t *testing.T) {
+	root, store, firstRecording := fixtureRecording(t)
+	secondRecording := addFixtureRecording(t, store, firstRecording, "fedcba9876543210fedcba9876543210")
+	ffmpeg := fakeFFmpeg(t)
+	started := filepath.Join(t.TempDir(), "started")
+	release := filepath.Join(t.TempDir(), "release")
+	t.Setenv("DERIVATIVE_FAKE_FFMPEG", "wait-release")
+	t.Setenv("DERIVATIVE_FAKE_STARTED", started)
+	t.Setenv("DERIVATIVE_FAKE_RELEASE", release)
+	service := openService(t, root, store, ffmpeg, 1)
+	first, err := service.Start(context.Background(), firstRecording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFile(t, started)
+	second, err := service.Start(context.Background(), secondRecording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State != StateQueued {
+		t.Fatalf("second job state=%s, want queued behind blocked worker", second.State)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	err = service.WaitForIdle(ctx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitForIdle error=%v, want deadline while exports are blocked", err)
+	}
+	if job, getErr := service.Get(first.ID); getErr != nil || job.State != StateRunning {
+		t.Fatalf("timeout closed or canceled the running export: job=%+v err=%v", job, getErr)
+	}
+	if err := os.WriteFile(release, []byte("ok"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := service.WaitForIdle(ctx); err != nil {
+		t.Fatalf("WaitForIdle after releasing worker: %v", err)
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		job, err := service.Get(id)
+		if err != nil || job.State != StateCompleted {
+			t.Fatalf("job %s did not finish before idle: %+v err=%v", id, job, err)
+		}
+	}
+	if _, err := service.Start(context.Background(), firstRecording); err != nil {
+		t.Fatalf("WaitForIdle closed the service: %v", err)
+	}
+}
+
 func TestFailedFFmpegDoesNotRetainPartialArtifact(t *testing.T) {
 	root, store, recording := fixtureRecording(t)
 	ffmpeg := fakeFFmpeg(t)
@@ -385,6 +453,40 @@ func fixtureRecordingWithData(t *testing.T, data []byte) (string, *storage.Store
 		t.Fatal(err)
 	}
 	return root, store, recording
+}
+
+func addFixtureRecording(t *testing.T, store *storage.Store, template *domain.Recording, id string) *domain.Recording {
+	t.Helper()
+	copy, err := cloneRecording(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy.ID = id
+	if err := store.NewRecordingDir(id); err != nil {
+		t.Fatal(err)
+	}
+	segment := &copy.Tracks["main"].Segments[0]
+	source, err := store.OpenPayload(template.ID, segment.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := io.ReadAll(source)
+	closeErr := source.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("read fixture source: %v %v", err, closeErr)
+	}
+	result, err := store.SavePayload(id, segment.StoragePath, bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment.SHA256, segment.PayloadSize = result.SHA256, result.Size
+	if err := store.SaveSidecar(id, segment.StoragePath, *segment); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveRecording(copy); err != nil {
+		t.Fatal(err)
+	}
+	return copy
 }
 
 func fakeFFmpeg(t *testing.T) string {

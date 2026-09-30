@@ -3,8 +3,10 @@ package authn
 import (
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -183,7 +185,7 @@ func TestLoginAuthenticateLogoutAndCSRF(t *testing.T) {
 	}
 }
 
-func TestSessionExpiryAndRestartInvalidation(t *testing.T) {
+func TestSessionExpiryAndCrossProcessPersistence(t *testing.T) {
 	root := t.TempDir()
 	service, token := openForTest(t, root)
 	bootstrapForTest(t, service, token)
@@ -193,12 +195,23 @@ func TestSessionExpiryAndRestartInvalidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	reopened, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.now = func() time.Time { return clock }
+	if _, err := reopened.Authenticate(session.Token); err != nil {
+		t.Fatalf("session did not survive control-plane replacement: %v", err)
+	}
+	if !reopened.ValidCSRF(session.Token, session.CSRFToken) {
+		t.Fatal("CSRF validation did not survive control-plane replacement")
+	}
 	clock = clock.Add(defaultSessionLifetime + time.Second)
-	if _, err := service.Authenticate(session.Token); !errors.Is(err, ErrUnauthenticated) {
+	if _, err := reopened.Authenticate(session.Token); !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("expired session error = %v", err)
 	}
-	if got := len(service.sessions); got != 0 {
-		t.Fatalf("expired session was not cleaned up: %d entries", got)
+	if _, err := os.Stat(service.sessionPath(session.Token)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired session record remains: %v", err)
 	}
 
 	service.now = time.Now
@@ -206,18 +219,111 @@ func TestSessionExpiryAndRestartInvalidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(root)
+	reopenedAgain, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopened.NeedsBootstrap() {
+	if reopenedAgain.NeedsBootstrap() {
 		t.Fatal("restart lost configured administrator")
 	}
-	if _, err := reopened.Authenticate(restartSession.Token); !errors.Is(err, ErrUnauthenticated) {
-		t.Fatalf("restart retained session: %v", err)
+	if _, err := reopenedAgain.Authenticate(restartSession.Token); err != nil {
+		t.Fatalf("new session did not survive another control-plane replacement: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "security", bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("consumed token exists after restart: %v", err)
+	}
+}
+
+func TestLogoutInOneServiceRevokesOtherServiceSession(t *testing.T) {
+	root := t.TempDir()
+	first, bootstrapToken := openForTest(t, root)
+	bootstrapForTest(t, first, bootstrapToken)
+	second, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.bcryptCost = bcrypt.MinCost
+	session, err := first.Login(testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Authenticate(session.Token); err != nil {
+		t.Fatalf("second service could not authenticate session: %v", err)
+	}
+	second.Logout(session.Token)
+	if _, err := first.Authenticate(session.Token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("first service retained logged-out session: %v", err)
+	}
+	if first.ValidCSRF(session.Token, session.CSRFToken) {
+		t.Fatal("first service accepted CSRF after another service logged out")
+	}
+}
+
+func TestSessionRecordPermissionsAndDoesNotPersistSecrets(t *testing.T) {
+	root := t.TempDir()
+	service, bootstrapToken := openForTest(t, root)
+	bootstrapForTest(t, service, bootstrapToken)
+	session, err := service.Login(testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, securityDirectory, sessionDirectory)
+	if got := mustMode(t, dir); got != 0700 {
+		t.Fatalf("sessions directory mode = %#o, want 0700", got)
+	}
+	path := service.sessionPath(session.Token)
+	if filepath.Base(path) != fmt.Sprintf("%x", sha256.Sum256([]byte(session.Token))) {
+		t.Fatalf("session filename is not token SHA-256: %q", filepath.Base(path))
+	}
+	if got := mustMode(t, path); got != 0600 {
+		t.Fatalf("session file mode = %#o, want 0600", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), session.Token) || strings.Contains(string(data), session.CSRFToken) {
+		t.Fatal("session file contains raw session or CSRF token")
+	}
+	if strings.Contains(filepath.Base(path), session.Token) {
+		t.Fatal("session token disclosed in filename")
+	}
+}
+
+func TestMalformedAndSymlinkSessionRecordsAreRejected(t *testing.T) {
+	root := t.TempDir()
+	service, bootstrapToken := openForTest(t, root)
+	bootstrapForTest(t, service, bootstrapToken)
+	valid, err := service.Login(testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformedToken, err := randomToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(service.sessionPath(malformedToken), []byte(`{"csrf_hash":"nope","expires_at":"not-time"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Authenticate(malformedToken); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("malformed session accepted: %v", err)
+	}
+	if service.ValidCSRF(malformedToken, "anything") {
+		t.Fatal("malformed session passed CSRF validation")
+	}
+
+	linkedToken, err := randomToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(service.sessionPath(valid.Token), service.sessionPath(linkedToken)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := service.Authenticate(linkedToken); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("symlink session record accepted: %v", err)
+	}
+	if service.ValidCSRF(linkedToken, valid.CSRFToken) {
+		t.Fatal("symlink session passed CSRF validation")
 	}
 }
 
@@ -227,14 +333,10 @@ func TestConcurrentSessionCapacityAndExpiredCleanup(t *testing.T) {
 	bootstrapForTest(t, service, token)
 	now := time.Now()
 	service.now = func() time.Time { return now }
-	service.mu.Lock()
 	for i := 0; i < maxActiveSessions-1; i++ {
-		var tokenHash, csrfHash [sha256.Size]byte
-		tokenHash[0], tokenHash[1] = byte(i>>8), byte(i)
-		csrfHash[0] = byte(i + 1)
-		service.sessions[tokenHash] = sessionRecord{csrfHash: csrfHash, expiresAt: now.Add(time.Hour)}
+		path := filepath.Join(service.sessionsDir, fmt.Sprintf("%064x", i+1))
+		writeTestSessionRecord(t, path, now.Add(time.Hour))
 	}
-	service.mu.Unlock()
 
 	const callers = 16
 	var wg sync.WaitGroup
@@ -258,22 +360,50 @@ func TestConcurrentSessionCapacityAndExpiredCleanup(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if successes != 1 || capacityErrors != callers-1 || len(service.sessions) != maxActiveSessions {
-		t.Fatalf("success=%d capacity=%d sessions=%d", successes, capacityErrors, len(service.sessions))
+	entries, err := os.ReadDir(service.sessionsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if successes != 1 || capacityErrors != callers-1 || len(entries) != maxActiveSessions {
+		t.Fatalf("success=%d capacity=%d session records=%d", successes, capacityErrors, len(entries))
 	}
 
-	service.mu.Lock()
-	for key, record := range service.sessions {
-		record.expiresAt = now.Add(-time.Second)
-		service.sessions[key] = record
+	for _, entry := range entries {
+		writeTestSessionRecord(t, filepath.Join(service.sessionsDir, entry.Name()), now.Add(-time.Second))
 	}
-	service.mu.Unlock()
 	if _, err := service.Login(testPassword); err != nil {
 		t.Fatalf("login after expired-session cleanup: %v", err)
 	}
-	if len(service.sessions) != 1 {
-		t.Fatalf("lazy cleanup left %d sessions", len(service.sessions))
+	entries, err = os.ReadDir(service.sessionsDir)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(entries) != 1 {
+		t.Fatalf("lazy cleanup left %d session records", len(entries))
+	}
+}
+
+func writeTestSessionRecord(t *testing.T, path string, expiresAt time.Time) {
+	t.Helper()
+	csrfHash := make([]byte, sha256.Size)
+	csrfHash[0] = 1
+	record := persistedSessionRecord{CSRFHash: hex.EncodeToString(csrfHash), ExpiresAt: expiresAt.UTC()}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
 }
 
 func TestSessionCookieFlagsAndExtraction(t *testing.T) {

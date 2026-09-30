@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 
 const (
 	securityDirectory       = "security"
+	sessionDirectory        = "sessions"
 	adminFilename           = "admin.json"
 	bootstrapTokenFilename  = "bootstrap-token"
 	maxPasswordBytes        = 72 // bcrypt's input limit.
@@ -30,6 +32,7 @@ const (
 	defaultSessionLifetime  = 12 * time.Hour
 	defaultBcryptCost       = bcrypt.DefaultCost
 	maxBootstrapTokenLength = 256
+	maxSessionRecordBytes   = 1024
 )
 
 var (
@@ -57,22 +60,26 @@ type adminRecord struct {
 	PasswordHash string `json:"password_hash"`
 }
 
-type sessionKey [sha256.Size]byte
-
 type sessionRecord struct {
 	csrfHash  [sha256.Size]byte
 	expiresAt time.Time
 }
 
-// Service manages one local administrator and its process-local sessions.
-// Session state is intentionally not persisted, so a process restart revokes
-// every existing session.
+type persistedSessionRecord struct {
+	CSRFHash  string    `json:"csrf_hash"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// Service manages one local administrator and sessions persisted as private,
+// per-session records. Per-session records allow overlapping control-plane
+// generations to share session validity without read-modify-write races on a
+// shared session-map file.
 type Service struct {
 	mu sync.Mutex
 
 	securityDir string
+	sessionsDir string
 	adminHash   []byte
-	sessions    map[sessionKey]sessionRecord
 
 	now        func() time.Time
 	bcryptCost int
@@ -100,10 +107,17 @@ func Open(dataRoot string) (*Service, error) {
 	if err := os.Chmod(securityDir, 0700); err != nil {
 		return nil, fmt.Errorf("%w: secure security directory", ErrStorage)
 	}
+	sessionsDir := filepath.Join(securityDir, sessionDirectory)
+	if err := os.MkdirAll(sessionsDir, 0700); err != nil {
+		return nil, fmt.Errorf("%w: create session directory", ErrStorage)
+	}
+	if err := securePrivateDirectory(sessionsDir); err != nil {
+		return nil, fmt.Errorf("%w: secure session directory", ErrStorage)
+	}
 
 	s := &Service{
 		securityDir: securityDir,
-		sessions:    make(map[sessionKey]sessionRecord),
+		sessionsDir: sessionsDir,
 		now:         time.Now,
 		bcryptCost:  defaultBcryptCost,
 	}
@@ -191,7 +205,7 @@ func (s *Service) Bootstrap(token, password string) error {
 	return nil
 }
 
-// Login verifies the password and creates a process-local session.
+// Login verifies the password and creates a durable, process-shared session.
 func (s *Service) Login(password string) (Session, error) {
 	if !validPasswordLength(password) {
 		return Session{}, ErrInvalidCredentials
@@ -217,15 +231,31 @@ func (s *Service) Login(password string) (Session, error) {
 	}
 	now := s.now()
 	session := Session{Token: token, CSRFToken: csrf, ExpiresAt: now.Add(defaultSessionLifetime)}
-	tokenKey := hashSessionToken(token)
 	csrfHash := sha256.Sum256([]byte(csrf))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cleanupExpiredLocked(now)
-	if len(s.sessions) >= maxActiveSessions {
+	active, err := s.countAndCleanSessions(now)
+	if err != nil {
+		return Session{}, err
+	}
+	if active >= maxActiveSessions {
 		return Session{}, ErrSessionCapacity
 	}
-	s.sessions[tokenKey] = sessionRecord{csrfHash: csrfHash, expiresAt: session.ExpiresAt}
+	if err := s.writeSession(token, sessionRecord{csrfHash: csrfHash, expiresAt: session.ExpiresAt}); err != nil {
+		return Session{}, err
+	}
+	// A second control process may have admitted a login concurrently. Keep the
+	// historical capacity bound best-effort across processes without a shared
+	// mutable map: if this admission crossed the bound, revoke this new session.
+	active, err = s.countAndCleanSessions(now)
+	if err != nil {
+		s.removeSession(token)
+		return Session{}, err
+	}
+	if active > maxActiveSessions {
+		s.removeSession(token)
+		return Session{}, ErrSessionCapacity
+	}
 	return session, nil
 }
 
@@ -235,13 +265,12 @@ func (s *Service) Authenticate(token string) (Session, error) {
 	if token == "" {
 		return Session{}, ErrUnauthenticated
 	}
-	key := hashSessionToken(token)
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cleanupExpiredLocked(now)
-	record, ok := s.sessions[key]
-	if !ok {
+	record, err := s.readSession(token)
+	if err != nil {
+		return Session{}, ErrUnauthenticated
+	}
+	if !s.now().Before(record.expiresAt) {
+		s.removeSession(token)
 		return Session{}, ErrUnauthenticated
 	}
 	return Session{ExpiresAt: record.expiresAt}, nil
@@ -252,9 +281,7 @@ func (s *Service) Logout(token string) {
 	if token == "" {
 		return
 	}
-	s.mu.Lock()
-	delete(s.sessions, hashSessionToken(token))
-	s.mu.Unlock()
+	s.removeSession(token)
 }
 
 // ValidCSRF compares the supplied value with the CSRF token bound to a live
@@ -263,26 +290,173 @@ func (s *Service) ValidCSRF(sessionToken, supplied string) bool {
 	if sessionToken == "" {
 		return false
 	}
-	key := hashSessionToken(sessionToken)
 	suppliedHash := sha256.Sum256([]byte(supplied))
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if record, ok := s.sessions[key]; ok && !now.Before(record.expiresAt) {
-		delete(s.sessions, key)
+	record, err := s.readSession(sessionToken)
+	if err != nil {
 		return false
-	} else if ok {
-		return subtle.ConstantTimeCompare(record.csrfHash[:], suppliedHash[:]) == 1
 	}
-	return false
+	if !s.now().Before(record.expiresAt) {
+		s.removeSession(sessionToken)
+		return false
+	}
+	return subtle.ConstantTimeCompare(record.csrfHash[:], suppliedHash[:]) == 1
 }
 
-func (s *Service) cleanupExpiredLocked(now time.Time) {
-	for key, record := range s.sessions {
+func (s *Service) readSession(token string) (sessionRecord, error) {
+	if token == "" {
+		return sessionRecord{}, os.ErrNotExist
+	}
+	if err := validatePrivateDirectory(s.sessionsDir); err != nil {
+		return sessionRecord{}, err
+	}
+	return readSessionRecordAt(s.sessionPath(token))
+}
+
+func readSessionRecordAt(path string) (sessionRecord, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return sessionRecord{}, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxSessionRecordBytes {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return sessionRecord{}, err
+	}
+	defer f.Close()
+	openedInfo, err := f.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxSessionRecordBytes+1))
+	if err != nil {
+		return sessionRecord{}, err
+	}
+	if len(data) == 0 || len(data) > maxSessionRecordBytes {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	return decodeSessionRecord(data)
+}
+
+func (s *Service) writeSession(token string, record sessionRecord) error {
+	if err := securePrivateDirectory(s.sessionsDir); err != nil {
+		return fmt.Errorf("%w: secure session directory", ErrStorage)
+	}
+	persisted := persistedSessionRecord{CSRFHash: hex.EncodeToString(record.csrfHash[:]), ExpiresAt: record.expiresAt.UTC()}
+	data, err := json.Marshal(persisted)
+	if err != nil {
+		return fmt.Errorf("%w: encode session record", ErrStorage)
+	}
+	if len(data) > maxSessionRecordBytes {
+		return ErrCorruptStore
+	}
+	if err := atomicWrite(s.sessionPath(token), append(data, '\n'), 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) removeSession(token string) {
+	if token == "" || validatePrivateDirectory(s.sessionsDir) != nil {
+		return
+	}
+	if err := os.Remove(s.sessionPath(token)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	_ = syncDirectory(s.sessionsDir)
+}
+
+func (s *Service) sessionPath(token string) string {
+	hash := hashSessionToken(token)
+	return filepath.Join(s.sessionsDir, hex.EncodeToString(hash[:]))
+}
+
+func (s *Service) countAndCleanSessions(now time.Time) (int, error) {
+	if err := validatePrivateDirectory(s.sessionsDir); err != nil {
+		return 0, fmt.Errorf("%w: inspect session directory", ErrStorage)
+	}
+	entries, err := os.ReadDir(s.sessionsDir)
+	if err != nil {
+		return 0, fmt.Errorf("%w: read session directory", ErrStorage)
+	}
+	active := 0
+	removed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) != sha256.Size*2 {
+			continue
+		}
+		if _, err := hex.DecodeString(name); err != nil {
+			continue
+		}
+		path := filepath.Join(s.sessionsDir, name)
+		record, err := readSessionRecordAt(path)
+		if err != nil {
+			// Corrupt or linked records are never valid sessions. Login fails
+			// closed instead of silently counting attacker-controlled state.
+			return 0, fmt.Errorf("%w: inspect session record", ErrStorage)
+		}
 		if !now.Before(record.expiresAt) {
-			delete(s.sessions, key)
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return 0, fmt.Errorf("%w: remove expired session", ErrStorage)
+			}
+			removed = true
+			continue
+		}
+		active++
+	}
+	if removed {
+		if err := syncDirectory(s.sessionsDir); err != nil {
+			return 0, fmt.Errorf("%w: sync expired session cleanup", ErrStorage)
 		}
 	}
+	return active, nil
+}
+
+func decodeSessionRecord(data []byte) (sessionRecord, error) {
+	if len(data) == 0 || len(data) > maxSessionRecordBytes {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	var persisted persistedSessionRecord
+	if err := decoder.Decode(&persisted); err != nil {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	csrfBytes, err := hex.DecodeString(persisted.CSRFHash)
+	if err != nil || len(csrfBytes) != sha256.Size || persisted.ExpiresAt.IsZero() {
+		return sessionRecord{}, ErrCorruptStore
+	}
+	var csrfHash [sha256.Size]byte
+	copy(csrfHash[:], csrfBytes)
+	return sessionRecord{csrfHash: csrfHash, expiresAt: persisted.ExpiresAt}, nil
+}
+
+func securePrivateDirectory(path string) error {
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrCorruptStore
+	}
+	return os.Chmod(path, 0700)
+}
+
+func validatePrivateDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return ErrCorruptStore
+	}
+	return nil
 }
 
 func validPasswordLength(password string) bool {
@@ -297,7 +471,7 @@ func randomToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
 }
 
-func hashSessionToken(token string) sessionKey {
+func hashSessionToken(token string) [sha256.Size]byte {
 	return sha256.Sum256([]byte(token))
 }
 

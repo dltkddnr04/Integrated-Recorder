@@ -150,7 +150,7 @@ func (s *Server) recordingQueryItem(recording *domain.Recording) (recordquery.It
 			item.Integrity = string(result.Status)
 		}
 	}
-	archiveBytes, err := s.manager.Store().RecordingDirectoryBytes(recording.ID)
+	archiveBytes, err := s.storage.RecordingDirectoryBytes(recording.ID)
 	if err != nil {
 		return recordquery.Item{}, err
 	}
@@ -234,7 +234,7 @@ func (s *Server) systemStorage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "storage statistics are unavailable")
 		return
 	}
-	stats, err := s.manager.Store().StorageStats()
+	stats, err := s.storage.StorageStats()
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "storage statistics are unavailable")
 		return
@@ -254,8 +254,10 @@ func (s *Server) systemStorage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) systemInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version": s.version, "commit": s.commit, "go_version": runtime.Version(),
-		"goos": runtime.GOOS, "goarch": runtime.GOARCH, "started_at": s.startedAt,
+		"version": s.version, "commit": s.commit, "build_time": s.buildInfo.BuildTime,
+		"release_channel": s.buildInfo.ReleaseChannel, "runtime_protocol_version": s.buildInfo.RuntimeProtocolVersion,
+		"go_version": runtime.Version(),
+		"goos":       runtime.GOOS, "goarch": runtime.GOARCH, "started_at": s.startedAt,
 		"uptime_seconds":   int64(time.Since(s.startedAt).Seconds()),
 		"export_available": s.derivatives != nil && s.derivatives.Available(),
 	})
@@ -285,7 +287,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "dashboard data is unavailable")
 		return
 	}
-	stats, err := s.manager.Store().StorageStats()
+	stats, err := s.storage.StorageStats()
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "dashboard storage data is unavailable")
 		return
@@ -458,7 +460,7 @@ func (s *Server) archiveIndex(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
-	entries, err := s.manager.Store().ArchiveIndex(recording)
+	entries, err := s.storage.ArchiveIndex(recording)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "archive index is unavailable")
 		return

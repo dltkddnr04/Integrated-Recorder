@@ -157,10 +157,10 @@ func (t *telemetry) recordRead(bytes, operations uint64, elapsed time.Duration) 
 		return
 	}
 	t.mu.Lock()
-	t.readBytes += bytes
-	t.readOps += operations
+	t.readBytes = saturatingAdd(t.readBytes, bytes)
+	t.readOps = saturatingAdd(t.readOps, operations)
 	if elapsed > 0 {
-		t.readNanos += uint64(elapsed)
+		t.readNanos = saturatingAdd(t.readNanos, uint64(elapsed))
 	}
 	t.mu.Unlock()
 }
@@ -170,11 +170,11 @@ func (t *telemetry) recordWrite(bytes uint64, elapsed time.Duration) {
 		return
 	}
 	t.mu.Lock()
-	t.writeBytes += bytes
-	t.writeOps++
+	t.writeBytes = saturatingAdd(t.writeBytes, bytes)
+	t.writeOps = saturatingAdd(t.writeOps, 1)
 	t.ioDegraded = false
 	if elapsed > 0 {
-		t.writeNanos += uint64(elapsed)
+		t.writeNanos = saturatingAdd(t.writeNanos, uint64(elapsed))
 	}
 	t.mu.Unlock()
 }
@@ -184,9 +184,26 @@ func (t *telemetry) recordError() {
 		return
 	}
 	t.mu.Lock()
-	t.errors++
+	t.errors = saturatingAdd(t.errors, 1)
 	t.ioDegraded = true
 	t.mu.Unlock()
+}
+
+func (t *telemetry) ioTotals() (readBytes, writeBytes, errors uint64) {
+	if t == nil {
+		return 0, 0, 0
+	}
+	t.mu.Lock()
+	readBytes, writeBytes, errors = t.readBytes, t.writeBytes, t.errors
+	t.mu.Unlock()
+	return readBytes, writeBytes, errors
+}
+
+func saturatingAdd(left, right uint64) uint64 {
+	if math.MaxUint64-left < right {
+		return math.MaxUint64
+	}
+	return left + right
 }
 
 func (t *telemetry) degraded() bool {

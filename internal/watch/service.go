@@ -49,17 +49,19 @@ type Service struct {
 	options  Options
 	queue    chan *checkJob
 
-	mu         sync.Mutex
-	jobs       map[string]*checkJob
-	closed     bool
-	running    bool
-	runDone    chan struct{}
-	runStarted chan struct{}
-	runCancel  context.CancelFunc
-	closeOnce  sync.Once
-	workers    sync.WaitGroup
-	startGates map[string]*recordingStartGate
-	starting   map[string]string
+	mu          sync.Mutex
+	jobs        map[string]*checkJob
+	jobsChanged chan struct{}
+	closed      bool
+	running     bool
+	paused      bool
+	runDone     chan struct{}
+	runStarted  chan struct{}
+	runCancel   context.CancelFunc
+	closeOnce   sync.Once
+	workers     sync.WaitGroup
+	startGates  map[string]*recordingStartGate
+	starting    map[string]string
 }
 
 func New(root string, adapters AdapterRuntime, manager RecordingManager, options Options) (*Service, error) {
@@ -84,7 +86,7 @@ func New(root string, adapters AdapterRuntime, manager RecordingManager, options
 	if options.CheckTimeout <= 0 {
 		options.CheckTimeout = checkTimeout
 	}
-	return &Service{store: store, adapters: adapters, manager: manager, options: options, queue: make(chan *checkJob, queueCapacity), jobs: map[string]*checkJob{}, startGates: map[string]*recordingStartGate{}, starting: map[string]string{}, runDone: make(chan struct{}), runStarted: make(chan struct{})}, nil
+	return &Service{store: store, adapters: adapters, manager: manager, options: options, queue: make(chan *checkJob, queueCapacity), jobs: map[string]*checkJob{}, jobsChanged: make(chan struct{}), startGates: map[string]*recordingStartGate{}, starting: map[string]string{}, runDone: make(chan struct{}), runStarted: make(chan struct{})}, nil
 }
 
 func (s *Service) Create(request Update) (View, error) {
@@ -396,6 +398,54 @@ func (s *Service) ManualCheck(ctx context.Context, id string) error {
 	}
 }
 
+// Pause stops new scheduled/manual checks and cancels the checks already in
+// flight, then waits until every check has left the worker pool. It is used by
+// Control generation handoff; unlike Close it is reversible if activation is
+// rolled back.
+func (s *Service) Pause(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrServiceClosed
+	}
+	s.paused = true
+	for _, job := range s.jobs {
+		if job.cancel != nil {
+			job.cancel()
+		}
+	}
+	for len(s.jobs) > 0 {
+		changed := s.jobsChanged
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return ErrServiceClosed
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// Resume reopens check admission after an aborted Control handoff.
+func (s *Service) Resume() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrServiceClosed
+	}
+	s.paused = false
+	return nil
+}
+
 func (s *Service) enqueue(id string) (*checkJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -404,6 +454,9 @@ func (s *Service) enqueue(id string) (*checkJob, error) {
 	}
 	if !s.running {
 		return nil, errors.New("watch scheduler is not running")
+	}
+	if s.paused {
+		return nil, ErrHandoffPaused
 	}
 	if current := s.jobs[id]; current != nil {
 		return current, nil
@@ -523,8 +576,11 @@ func (s *Service) worker(ctx context.Context) {
 			if s.jobs[job.id] == job {
 				job.cancel = cancel
 			}
+			paused := s.paused
 			s.mu.Unlock()
-			if err := jobCtx.Err(); err != nil {
+			if paused {
+				job.err = ErrHandoffPaused
+			} else if err := jobCtx.Err(); err != nil {
 				job.err = err
 			} else {
 				job.err = s.runCheck(jobCtx, job.id)
@@ -540,6 +596,8 @@ func (s *Service) finishJob(job *checkJob) {
 	if s.jobs[job.id] == job {
 		delete(s.jobs, job.id)
 		close(job.done)
+		close(s.jobsChanged)
+		s.jobsChanged = make(chan struct{})
 	}
 	s.mu.Unlock()
 }
@@ -552,6 +610,8 @@ func (s *Service) failQueued(err error) {
 		close(job.done)
 		delete(s.jobs, id)
 	}
+	close(s.jobsChanged)
+	s.jobsChanged = make(chan struct{})
 }
 
 func (s *Service) runCheck(parent context.Context, id string) error {

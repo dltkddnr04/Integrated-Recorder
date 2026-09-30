@@ -47,7 +47,9 @@ func (s *Server) RunRetention(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.runScheduledRetentionPass(ctx)
+	if !s.runScheduledRetentionPassWithAdmission(ctx) {
+		return
+	}
 	ticker := time.NewTicker(retentionInterval)
 	defer ticker.Stop()
 	for {
@@ -55,9 +57,25 @@ func (s *Server) RunRetention(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.runScheduledRetentionPass(ctx)
+			if !s.runScheduledRetentionPassWithAdmission(ctx) {
+				return
+			}
 		}
 	}
+}
+
+func (s *Server) runScheduledRetentionPassWithAdmission(ctx context.Context) bool {
+	if s.backgroundMutationGate == nil {
+		s.runScheduledRetentionPass(ctx)
+		return ctx.Err() == nil
+	}
+	release, err := s.backgroundMutationGate.WaitAdmission(ctx)
+	if err != nil {
+		return false
+	}
+	defer release()
+	s.runScheduledRetentionPass(ctx)
+	return ctx.Err() == nil
 }
 
 func (s *Server) runScheduledRetentionPass(ctx context.Context) {

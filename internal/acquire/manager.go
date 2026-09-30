@@ -66,17 +66,21 @@ type entry struct {
 }
 
 type Manager struct {
-	store      *storage.Store
-	ingest     *storage.IngestService
-	client     *http.Client
-	resolver   Resolver
-	validate   SourceValidator
-	mu         sync.RWMutex
-	entries    map[string]*entry
-	closed     bool
-	starts     sync.WaitGroup
-	startsWait sync.Once
-	startsDone chan struct{}
+	store    *storage.Store
+	ingest   *storage.IngestService
+	client   *http.Client
+	resolver Resolver
+	validate SourceValidator
+	mu       sync.RWMutex
+	entries  map[string]*entry
+	// freshGeneration leaves existing archive documents read-only and does
+	// not take ownership of them. It is used for a candidate Engine generation
+	// that must not recover/interrupt work owned by an older Engine.
+	freshGeneration bool
+	closed          bool
+	starts          sync.WaitGroup
+	startsWait      sync.Once
+	startsDone      chan struct{}
 
 	// fetchBoundaryHook is a deterministic test seam for scheduler-owned
 	// generation checks. It is configured before recording goroutines start.
@@ -100,6 +104,25 @@ type Manager struct {
 	metadataClock func() time.Time
 }
 
+// OwnedRecordingState is a bounded, non-payload runtime snapshot. It avoids
+// cloning full canonical segment histories for process inventory checks.
+type OwnedRecordingState struct {
+	ID        string
+	State     domain.RecordingState
+	StartedAt time.Time
+}
+
+// StartupMode makes archive ownership behavior explicit when constructing a
+// recorder manager. RecoverExisting preserves the established single-process
+// startup recovery semantics. FreshGeneration reads no existing archives into
+// the worker registry and performs no startup recovery writes.
+type StartupMode uint8
+
+const (
+	RecoverExisting StartupMode = iota
+	FreshGeneration
+)
+
 var errManagerClosed = errors.New("recording manager is closed")
 
 // ErrActiveRecording is returned when a management operation attempts to
@@ -111,8 +134,18 @@ var ErrActiveRecording = errors.New("active recording cannot be deleted")
 var ErrListLimit = errors.New("recording list exceeds management limit")
 
 func NewManager(store *storage.Store, client *http.Client, resolver Resolver, validate SourceValidator) (*Manager, error) {
+	return NewManagerWithMode(store, client, resolver, validate, RecoverExisting)
+}
+
+// NewManagerWithMode constructs a manager using an explicit archive recovery
+// policy. Fresh generations may observe prior archives through read-only
+// Get/List projections but own only recordings they start themselves.
+func NewManagerWithMode(store *storage.Store, client *http.Client, resolver Resolver, validate SourceValidator, mode StartupMode) (*Manager, error) {
 	if store == nil {
 		return nil, fmt.Errorf("storage is required")
+	}
+	if mode != RecoverExisting && mode != FreshGeneration {
+		return nil, fmt.Errorf("invalid recording manager startup mode")
 	}
 	if client == nil {
 		client = network.NewPublicHTTPClient(25 * time.Second)
@@ -120,9 +153,13 @@ func NewManager(store *storage.Store, client *http.Client, resolver Resolver, va
 	if validate == nil {
 		validate = network.ValidatePublicURL
 	}
-	loaded, err := store.LoadAll()
-	if err != nil {
-		return nil, err
+	var loaded []*domain.Recording
+	var err error
+	if mode == RecoverExisting {
+		loaded, err = store.LoadAll()
+		if err != nil {
+			return nil, err
+		}
 	}
 	ingest, err := store.IngestService()
 	if err != nil {
@@ -131,7 +168,7 @@ func NewManager(store *storage.Store, client *http.Client, resolver Resolver, va
 	if resolver == nil {
 		resolver = unavailableResolver{}
 	}
-	m := &Manager{store: store, ingest: ingest, client: client, resolver: resolver, validate: validate, entries: map[string]*entry{}, startsDone: make(chan struct{})}
+	m := &Manager{store: store, ingest: ingest, client: client, resolver: resolver, validate: validate, entries: map[string]*entry{}, freshGeneration: mode == FreshGeneration, startsDone: make(chan struct{})}
 	for _, recording := range loaded {
 		m.entries[recording.ID] = &entry{recording: recording, done: closedChannel()}
 	}
@@ -277,6 +314,15 @@ func (m *Manager) startResolved(ctx context.Context, id, adapterID string, media
 }
 
 func (m *Manager) Stop(id string) (*domain.Recording, error) {
+	return m.StopContext(context.Background(), id)
+}
+
+// StopContext requests cancellation immediately and then waits for the worker
+// only until ctx ends. A caller timeout does not undo the stop request.
+func (m *Manager) StopContext(ctx context.Context, id string) (*domain.Recording, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	e, ok := m.entry(id)
 	if !ok {
 		return nil, storage.ErrNotFound
@@ -288,7 +334,11 @@ func (m *Manager) Stop(id string) (*domain.Recording, error) {
 	if cancel != nil {
 		cancel()
 	}
-	<-done
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	recording, err := m.Get(id)
 	e.mu.Lock()
 	terminalErr := e.terminalErr
@@ -304,12 +354,40 @@ func (m *Manager) Stop(id string) (*domain.Recording, error) {
 // is held only for state checks/publication. Active acquisitions must be
 // stopped explicitly first.
 func (m *Manager) Delete(id string) error {
+	return m.delete(id, false)
+}
+
+// DeleteTerminalArchive lets a current Engine remove a terminal canonical
+// archive after the Runtime Host has confirmed that no Engine generation has
+// an active worker for it. This keeps Control Plane out of the archive write
+// path when the original owner generation has already exited.
+func (m *Manager) DeleteTerminalArchive(id string) error {
+	return m.delete(id, true)
+}
+
+func (m *Manager) delete(id string, allowUnownedTerminal bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.entries[id]
 	if !ok {
+		if m.freshGeneration && !allowUnownedTerminal {
+			// A fresh Engine can read archives from prior generations, but it must
+			// never delete data it does not own.
+			return storage.ErrNotFound
+		}
+		if allowUnownedTerminal {
+			recording, err := m.store.LoadRecordingReadOnly(id)
+			if err != nil {
+				return err
+			}
+			switch recording.State {
+			case domain.StateStopped, domain.StateCompleted, domain.StateInterrupted:
+			default:
+				return ErrActiveRecording
+			}
+		}
 		// Store deletion is idempotent and also handles a tombstone left by an
-		// interrupted previous delete.
+		// interrupted previous delete. The caller must be an Engine.
 		return m.store.DeleteRecordingData(id)
 	}
 	e.persistMu.Lock()
@@ -408,6 +486,9 @@ func (m *Manager) Close(ctx context.Context) error {
 func (m *Manager) Get(id string) (*domain.Recording, error) {
 	e, ok := m.entry(id)
 	if !ok {
+		if m.freshGeneration {
+			return m.store.LoadRecordingReadOnly(id)
+		}
 		return nil, storage.ErrNotFound
 	}
 	e.mu.Lock()
@@ -433,6 +514,21 @@ func (m *Manager) List() []*domain.Recording {
 			result = append(result, recording)
 		}
 		e.mu.Unlock()
+	}
+	if m.freshGeneration {
+		if archived, err := m.store.LoadAllReadOnly(); err == nil {
+			byID := make(map[string]*domain.Recording, len(archived)+len(result))
+			for _, recording := range archived {
+				byID[recording.ID] = recording
+			}
+			for _, recording := range result {
+				byID[recording.ID] = recording
+			}
+			result = result[:0]
+			for _, recording := range byID {
+				result = append(result, recording)
+			}
+		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
 	return result
@@ -493,6 +589,29 @@ func (m *Manager) ListForManagement(ctx context.Context, max int) ([]*domain.Rec
 		}
 		result = append(result, recording)
 	}
+	if m.freshGeneration {
+		archived, err := m.store.LoadAllReadOnlyLimit(max)
+		if err != nil {
+			if errors.Is(err, storage.ErrReadOnlyListLimit) {
+				return nil, ErrListLimit
+			}
+			return nil, err
+		}
+		byID := make(map[string]*domain.Recording, len(archived)+len(result))
+		for _, recording := range archived {
+			byID[recording.ID] = recording
+		}
+		for _, recording := range result {
+			byID[recording.ID] = recording
+		}
+		if max >= 0 && len(byID) > max {
+			return nil, ErrListLimit
+		}
+		result = make([]*domain.Recording, 0, len(byID))
+		for _, recording := range byID {
+			result = append(result, recording)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -501,6 +620,38 @@ func (m *Manager) ListForManagement(ctx context.Context, max int) ([]*domain.Rec
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	return result, nil
+}
+
+// OwnedStates returns only lightweight lifecycle state for this manager's
+// worker registry. A candidate manager never includes read-only archive
+// snapshots from prior generations.
+func (m *Manager) OwnedStates(max int) ([]OwnedRecordingState, error) {
+	if max < 0 {
+		return nil, ErrListLimit
+	}
+	m.mu.RLock()
+	if max > 0 && len(m.entries) > max {
+		m.mu.RUnlock()
+		return nil, ErrListLimit
+	}
+	entries := make([]*entry, 0, len(m.entries))
+	for _, e := range m.entries {
+		entries = append(entries, e)
+	}
+	m.mu.RUnlock()
+	result := make([]OwnedRecordingState, 0, len(entries))
+	for _, e := range entries {
+		e.mu.Lock()
+		if e.recording != nil {
+			result = append(result, OwnedRecordingState{ID: e.recording.ID, State: e.recording.State, StartedAt: e.recording.StartedAt})
+		}
+		e.mu.Unlock()
+	}
+	if max > 0 && len(result) > max {
+		return nil, ErrListLimit
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].StartedAt.After(result[j].StartedAt) })
 	return result, nil
 }
 

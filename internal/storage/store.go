@@ -31,6 +31,10 @@ var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 // ordinary local I/O errors remain distinguishable and are not retried.
 var ErrPayloadSizeMismatch = errors.New("payload size mismatch")
 
+// ErrReadOnlyListLimit marks a read-only archive snapshot that exceeds its
+// caller's count bound.
+var ErrReadOnlyListLimit = errors.New("read-only recording list exceeds limit")
+
 // StorageBackend is the set of canonical archive operations currently needed
 // by the application. Store is the stable archive facade; New currently wires
 // exactly one implementation, LocalFilesystemBackend.
@@ -45,6 +49,9 @@ type StorageBackend interface {
 	CreateRecording(*domain.Recording) error
 	SaveRecording(*domain.Recording) error
 	LoadAll() ([]*domain.Recording, error)
+	LoadAllReadOnly() ([]*domain.Recording, error)
+	LoadAllReadOnlyLimit(int) ([]*domain.Recording, error)
+	LoadRecordingReadOnly(string) (*domain.Recording, error)
 	SavePayload(string, string, io.Reader, int64) (PayloadResult, error)
 	SavePayloadExact(string, string, io.Reader, int64, int64) (PayloadResult, error)
 	SaveSidecar(string, string, any) error
@@ -65,10 +72,13 @@ type StorageBackend interface {
 // rather than the local filesystem implementation.
 type Store struct {
 	StorageBackend
-	root          string // internal/test compatibility only; never part of API models
-	ingestMu      sync.RWMutex
-	ingest        *IngestService
-	ingestOptions IngestOptions
+	root             string // internal/test compatibility only; never part of API models
+	ingestMu         sync.RWMutex
+	ingest           *IngestService
+	ingestOptions    IngestOptions
+	runtimeIngest    RuntimeIngestCoordinator
+	telemetryMu      sync.RWMutex
+	runtimeTelemetry RuntimeStorageTelemetry
 }
 
 // LocalFilesystemBackend owns physical filesystem paths and crash-safe local
@@ -137,12 +147,48 @@ func (s *Store) IngestService() (*IngestService, error) {
 	if s.ingest != nil {
 		return s.ingest, nil
 	}
-	service, err := NewIngestService(s, s.ingestOptions)
+	service, err := newIngestService(s, s.ingestOptions, s.runtimeIngest)
 	if err != nil {
 		return nil, err
 	}
 	s.ingest = service
 	return service, nil
+}
+
+// ConfigureRuntimeIngestCoordinator connects this Store to the Runtime Host's
+// process-wide admission authority before its lazy ingest service is created.
+// A nil coordinator is not accepted here; callers that need the traditional
+// single-process behavior simply leave it unconfigured.
+func (s *Store) ConfigureRuntimeIngestCoordinator(coordinator RuntimeIngestCoordinator) error {
+	if coordinator == nil {
+		return errors.New("runtime ingest coordinator configuration is invalid")
+	}
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if s.ingest != nil {
+		return errors.New("ingest service is already constructed; restart required")
+	}
+	if s.runtimeIngest != nil {
+		return errors.New("runtime ingest coordinator is already configured")
+	}
+	s.runtimeIngest = coordinator
+	return nil
+}
+
+// ConfigureRuntimeStorageTelemetry attaches the Host-wide I/O projection
+// before managed process metrics are read. Direct development Stores leave it
+// unset and retain process-local telemetry behavior.
+func (s *Store) ConfigureRuntimeStorageTelemetry(telemetry RuntimeStorageTelemetry) error {
+	if telemetry == nil {
+		return errors.New("runtime storage telemetry configuration is invalid")
+	}
+	s.telemetryMu.Lock()
+	defer s.telemetryMu.Unlock()
+	if s.runtimeTelemetry != nil {
+		return errors.New("runtime storage telemetry is already configured")
+	}
+	s.runtimeTelemetry = telemetry
+	return nil
 }
 
 // ConfigureIngestOptions sets fixed-lifetime ingest limits before the lazy
@@ -188,10 +234,66 @@ func (s *Store) PoolMetrics() PoolSnapshot {
 	s.ingestMu.RLock()
 	service := s.ingest
 	s.ingestMu.RUnlock()
+	var ingest IngestSnapshot
+	var pool PoolSnapshot
 	if service != nil {
-		return service.PoolMetrics()
+		ingest = service.Snapshot()
+		pool = service.PoolMetrics()
+	} else {
+		options := s.IngestOptions()
+		ingest = IngestSnapshot{
+			BufferCapacityBytes: options.GlobalBytes, PerRecordingCapacityBytes: options.PerRecordingBytes,
+			WriterConcurrency: options.Writers,
+		}
+		pool = s.StorageBackend.PoolMetrics()
 	}
-	return s.StorageBackend.PoolMetrics()
+	s.publishRuntimeStorageIOTotals(ingest)
+	s.telemetryMu.RLock()
+	runtimeTelemetry := s.runtimeTelemetry
+	s.telemetryMu.RUnlock()
+	if runtimeTelemetry != nil {
+		if snapshot, err := runtimeTelemetry.StorageTelemetrySnapshot(); err == nil {
+			pool.Throughput = snapshot.Throughput
+			pool.EstimatedCeiling = snapshot.EstimatedCeiling
+			pool.ErrorsTotal = snapshot.ErrorsTotal
+			pool.Samples = append([]PoolSample(nil), snapshot.Samples...)
+			pool.Buffer = PoolBuffer{
+				UsedBytes: snapshot.Ingest.BufferUsedBytes, CapacityBytes: snapshot.Ingest.BufferCapacityBytes,
+				ReservedBytes:             snapshot.Ingest.ReservedBytes,
+				PerRecordingCapacityBytes: snapshot.Ingest.PerRecordingCapacityBytes,
+			}
+			pool.Queue = PoolQueue{
+				Objects: snapshot.Ingest.QueueObjects, Bytes: snapshot.Ingest.QueueBytes,
+				OldestAgeSeconds: snapshot.Ingest.OldestPersistAgeSeconds,
+			}
+			pool.Writers = PoolWriters{Active: snapshot.Ingest.ActiveWriters, Limit: snapshot.Ingest.WriterConcurrency}
+		}
+	}
+	return pool
+}
+
+// samplePool advances the local backend sample and publishes its cumulative
+// counters once per configured sampling tick. No IPC operation occurs in an
+// individual Read or Write call.
+func (s *Store) samplePool(ingest IngestSnapshot, now time.Time) {
+	if backend, ok := s.StorageBackend.(interface {
+		samplePool(IngestSnapshot, time.Time)
+	}); ok {
+		backend.samplePool(ingest, now)
+	}
+	s.publishRuntimeStorageIOTotals(ingest)
+}
+
+func (s *Store) publishRuntimeStorageIOTotals(ingest IngestSnapshot) {
+	s.telemetryMu.RLock()
+	runtimeTelemetry := s.runtimeTelemetry
+	s.telemetryMu.RUnlock()
+	backend, ok := s.StorageBackend.(*LocalFilesystemBackend)
+	if runtimeTelemetry == nil || !ok || backend.telemetry == nil {
+		return
+	}
+	readBytes, writeBytes, errorsTotal := backend.telemetry.ioTotals()
+	_ = runtimeTelemetry.ReportStorageIOTotals(readBytes, writeBytes, errorsTotal, ingest)
 }
 
 // PoolMetricsWindow returns bounded in-memory samples from at most the
@@ -494,6 +596,141 @@ func (s *LocalFilesystemBackend) LoadAll() ([]*domain.Recording, error) {
 		recordings = append(recordings, &recording)
 	}
 	return recordings, nil
+}
+
+// LoadAllReadOnly returns a snapshot of recording.json documents without
+// running startup recovery, tightening permissions, reconciling sidecars, or
+// publishing writes. It is used by fresh Engine generations that must observe
+// archives owned by another Engine without taking ownership of them.
+func (s *LocalFilesystemBackend) LoadAllReadOnly() ([]*domain.Recording, error) {
+	return s.loadAllReadOnly(0, false)
+}
+
+// LoadAllReadOnlyLimit is the bounded variant used by management snapshots.
+func (s *LocalFilesystemBackend) LoadAllReadOnlyLimit(max int) ([]*domain.Recording, error) {
+	if max < 0 {
+		return nil, ErrReadOnlyListLimit
+	}
+	return s.loadAllReadOnly(max, true)
+}
+
+func (s *LocalFilesystemBackend) loadAllReadOnly(max int, bounded bool) ([]*domain.Recording, error) {
+	base := filepath.Join(s.root, "recordings")
+	baseInfo, err := os.Lstat(base)
+	if err != nil {
+		return nil, err
+	}
+	if !baseInfo.IsDir() || baseInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("recording root is not a safe directory")
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, err
+	}
+	var recordings []*domain.Recording
+	for _, entry := range entries {
+		if !entry.IsDir() || !recordingIDPattern.MatchString(entry.Name()) {
+			continue
+		}
+		recording, loadErr := s.LoadRecordingReadOnly(entry.Name())
+		if errors.Is(loadErr, os.ErrNotExist) {
+			continue
+		}
+		if loadErr != nil {
+			// A management snapshot is best-effort over individually malformed
+			// archive documents, matching LoadAll's preservation behavior without
+			// creating recovery side effects.
+			continue
+		}
+		recordings = append(recordings, recording)
+		if bounded && len(recordings) > max {
+			return nil, ErrReadOnlyListLimit
+		}
+	}
+	sort.Slice(recordings, func(i, j int) bool { return recordings[i].CreatedAt.After(recordings[j].CreatedAt) })
+	return recordings, nil
+}
+
+// LoadRecordingReadOnly reads a single canonical root document without
+// changing archive state. It strictly validates the opaque recording ID and
+// rejects symlinked directories or metadata files.
+func (s *LocalFilesystemBackend) LoadRecordingReadOnly(id string) (*domain.Recording, error) {
+	if !recordingIDPattern.MatchString(id) {
+		return nil, errors.New("invalid recording id")
+	}
+	base := filepath.Join(s.root, "recordings")
+	baseInfo, err := os.Lstat(base)
+	if err != nil {
+		return nil, err
+	}
+	if !baseInfo.IsDir() || baseInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("recording root is not a safe directory")
+	}
+	dir := filepath.Join(base, id)
+	dirInfo, err := os.Lstat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("recording directory is not a safe directory")
+	}
+	path := filepath.Join(dir, "recording.json")
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("recording metadata is not a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		return nil, errors.New("recording metadata changed during read")
+	}
+	// Canonical roots may grow with segment metadata. Keep this read bounded;
+	// the limit is substantially above ordinary manifests while preventing an
+	// accidental unbounded allocation in a read-only candidate process.
+	const maxRecordingDocumentBytes = 64 << 20
+	if openedInfo.Size() < 0 || openedInfo.Size() > maxRecordingDocumentBytes {
+		return nil, errors.New("recording metadata exceeds read limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxRecordingDocumentBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRecordingDocumentBytes {
+		return nil, errors.New("recording metadata exceeds read limit")
+	}
+	var recording domain.Recording
+	if err := json.Unmarshal(data, &recording); err != nil {
+		return nil, errors.New("recording metadata is invalid")
+	}
+	if recording.ID != id {
+		return nil, errors.New("recording metadata identity mismatch")
+	}
+	if err := domain.ValidateMetadataTimeline(recording.MetadataTimeline); err != nil {
+		return nil, errors.New("recording metadata timeline is invalid")
+	}
+	if recording.Tracks == nil {
+		recording.Tracks = map[string]*domain.Track{}
+	}
+	for _, track := range recording.Tracks {
+		if track == nil {
+			return nil, errors.New("recording contains an invalid track")
+		}
+		sortTrack(track)
+	}
+	return &recording, nil
 }
 
 func (s *LocalFilesystemBackend) reconcileRecording(recording *domain.Recording) (bool, error) {

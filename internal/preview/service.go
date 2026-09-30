@@ -196,6 +196,49 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+// WaitForIdle waits until all preview tasks already accepted by the service
+// have finished and their dirty indexes are durably published. It does not
+// stop reconciliation or prevent later work from being enqueued; callers must
+// stop and join Run/Reconcile producers before using it as a handoff barrier.
+func (s *Service) WaitForIdle(ctx context.Context) error {
+	if s == nil {
+		return ErrUnavailable
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if len(s.queued) == 0 && len(s.active) == 0 {
+			ids := make([]string, 0, len(s.dirtyIndexes))
+			for id, dirty := range s.dirtyIndexes {
+				if dirty > 0 {
+					ids = append(ids, id)
+				}
+			}
+			sort.Strings(ids)
+			for _, id := range ids {
+				if err := s.flushIndexLocked(id); err != nil {
+					s.mu.Unlock()
+					return errors.New("preview index could not be saved while waiting for idle")
+				}
+			}
+			s.mu.Unlock()
+			return nil
+		}
+		changed := s.changed
+		s.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 func (s *Service) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
@@ -734,6 +777,7 @@ func (s *Service) runTask(item task) {
 	}
 	if existing, ok := findFrame(idx.Items, item.key.ordinal); ok {
 		if existing.SegmentSHA256 != "" && frameFileMatches(s.previewRoot, item.key.recordingID, item.key.ordinal, existing) {
+			s.notifyLocked()
 			s.mu.Unlock()
 			return
 		}

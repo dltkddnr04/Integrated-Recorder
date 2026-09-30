@@ -187,6 +187,62 @@ func TestWatchCheckMediaFastPathAndRepeatedSessionDoesNotDuplicate(t *testing.T)
 	}
 }
 
+func TestPauseAndResumeFenceChecksDuringControlHandoff(t *testing.T) {
+	entered := make(chan struct{})
+	adapter := &fakeAdapterRuntime{checkContext: func(ctx context.Context, count int) (adapterproto.WatchCheckResult, error) {
+		if count == 1 {
+			close(entered)
+			<-ctx.Done()
+			return adapterproto.WatchCheckResult{}, ctx.Err()
+		}
+		return adapterproto.WatchCheckResult{State: "offline"}, nil
+	}}
+	service, view := newTestService(t, adapter, newFakeRecordingManager(), Options{})
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- service.Run(runCtx) }()
+	<-service.runStarted
+	job, err := service.enqueue(view.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("watch check did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Pause(ctx); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	select {
+	case <-job.done:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight check did not finish before pause returned")
+	}
+	if _, err := service.enqueue(view.ID); !errors.Is(err, ErrHandoffPaused) {
+		t.Fatalf("enqueue while paused = %v", err)
+	}
+	if err := service.Resume(); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if err := service.ManualCheck(context.Background(), view.ID); err != nil {
+		t.Fatalf("check after resume: %v", err)
+	}
+	checks, _ := adapter.counts()
+	if checks != 2 {
+		t.Fatalf("adapter check count = %d; want 2", checks)
+	}
+	cancelRun()
+	if err := service.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("scheduler exit = %v", err)
+	}
+}
+
 func TestWatchResolveFallbackExactlyOnce(t *testing.T) {
 	adapter := &fakeAdapterRuntime{check: func(int) (adapterproto.WatchCheckResult, error) {
 		return adapterproto.WatchCheckResult{State: "live", SessionRef: "session-A"}, nil

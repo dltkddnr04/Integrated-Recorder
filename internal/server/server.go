@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -18,11 +19,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/applog"
 	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/derivative"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/integrity"
@@ -35,7 +36,8 @@ import (
 )
 
 type Server struct {
-	manager                     *acquire.Manager
+	manager                     recordingManager
+	storage                     *storage.Store
 	adapters                    *adapterhost.Host
 	configs                     *pluginconfig.Service
 	products                    *management.Store
@@ -51,18 +53,36 @@ type Server struct {
 	forceSecureCookie           bool
 	version                     string
 	commit                      string
+	buildInfo                   buildinfo.Info
 	mux                         *http.ServeMux
 	mu                          sync.Mutex
 	workflowTitles              map[string]workflowTitle
 	startedAt                   time.Time
 	productLocks                [64]sync.RWMutex
 	retentionGate               chan struct{}
-	handler                     http.Handler
+	backgroundMutationGate      interface {
+		WaitAdmission(context.Context) (func(), error)
+	}
+	handler http.Handler
+}
+
+// recordingManager is the Control Plane's lifecycle boundary. Production may
+// satisfy it with a Runtime Host IPC client while tests and embedders can
+// continue to use acquire.Manager directly.
+type recordingManager interface {
+	StartResolved(context.Context, string, adapterproto.MediaSource, *adapterproto.ResourceRef, string, *adapterproto.AdapterProvenance) (*domain.Recording, error)
+	StartResolvedWithID(context.Context, string, string, adapterproto.MediaSource, *adapterproto.ResourceRef, string, *adapterproto.AdapterProvenance) (*domain.Recording, error)
+	Get(string) (*domain.Recording, error)
+	List() []*domain.Recording
+	ListForManagement(context.Context, int) ([]*domain.Recording, error)
+	Stop(string) (*domain.Recording, error)
+	Delete(string) error
 }
 
 // Options contains optional product-management services. New remains available
 // for embedders and tests that only need the original control API.
 type Options struct {
+	Storage                     *storage.Store
 	Management                  *management.Store
 	Integrity                   *integrity.Service
 	Derivatives                 *derivative.Service
@@ -77,6 +97,13 @@ type Options struct {
 	StartedAt                   time.Time
 	Version                     string
 	Commit                      string
+	BuildInfo                   buildinfo.Info
+	MutationGate                interface {
+		Wrap(http.Handler) http.Handler
+	}
+	BackgroundMutationGate interface {
+		WaitAdmission(context.Context) (func(), error)
+	}
 }
 
 type workflowTitle struct {
@@ -93,23 +120,29 @@ const (
 //go:embed static/*
 var staticFiles embed.FS
 
-func New(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginconfig.Service) http.Handler {
+func New(manager recordingManager, adapters *adapterhost.Host, configs *pluginconfig.Service) http.Handler {
 	return NewWithOptions(manager, adapters, configs, Options{})
 }
 
-func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, configs *pluginconfig.Service, options Options) *Server {
+func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, configs *pluginconfig.Service, options Options) *Server {
 	startedAt := options.StartedAt
 	if startedAt.IsZero() {
 		startedAt = time.Now().UTC()
 	}
+	build := options.BuildInfo
+	if build.Version == "" {
+		build = buildinfo.Current()
+	}
 	version := options.Version
 	if version == "" {
-		version = "dev"
+		version = build.Version
 	}
 	commit := options.Commit
 	if commit == "" {
-		commit = "unknown"
+		commit = build.Commit
 	}
+	build.Version = version
+	build.Commit = commit
 	logs := options.Logs
 	if logs == nil {
 		logs = applog.NewStore()
@@ -120,7 +153,13 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	} else if options.Settings != nil {
 		effectiveStorage = options.Settings.Current().Storage
 	}
-	s := &Server{manager: manager, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1)}
+	archiveStore := options.Storage
+	if archiveStore == nil {
+		if local, ok := manager.(interface{ Store() *storage.Store }); ok {
+			archiveStore = local.Store()
+		}
+	}
+	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
@@ -153,6 +192,9 @@ func NewWithOptions(manager *acquire.Manager, adapters *adapterhost.Host, config
 	var handler http.Handler = s.mux
 	if s.auth != nil {
 		handler = s.authMiddleware(handler)
+	}
+	if options.MutationGate != nil {
+		handler = options.MutationGate.Wrap(handler)
 	}
 	handler = s.flushWorkflowLifecycleMiddleware(handler)
 	handler = requestLogMiddleware(s.logs, handler)
@@ -1036,7 +1078,7 @@ func liveDiscontinuityBefore(recording *domain.Recording, trackID string, segmen
 }
 
 func (s *Server) livePayloadsAvailable(recording *domain.Recording, track *domain.Track, segments []domain.Segment) bool {
-	store := s.manager.Store()
+	store := s.storage
 	for _, segment := range segments {
 		info, err := store.StatPayload(recording.ID, segment.StoragePath)
 		if err != nil || !info.Regular || info.Size != segment.PayloadSize {
@@ -1070,7 +1112,7 @@ func (s *Server) liveRecording(w http.ResponseWriter, id string) (*domain.Record
 }
 
 func (s *Server) playableTrackPayloadsAvailable(recording *domain.Recording, track *domain.Track) bool {
-	store := s.manager.Store()
+	store := s.storage
 	if store.HasCanonicalPayloadIssue(recording.ID) {
 		return false
 	}
@@ -1123,7 +1165,7 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := s.manager.Store().OpenPayloadReader(recording.ID, found.StoragePath)
+	f, err := s.storage.OpenPayloadReader(recording.ID, found.StoragePath)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "stored payload is unavailable")
 		return
