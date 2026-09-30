@@ -8,25 +8,51 @@ This document describes the current implementation. Reserved protocol shapes and
 
 The canonical archive is the source media received from the broadcaster plus metadata needed to reconstruct its timeline. Acquisition does not decode, encode, transcode, or remux media. Core has no platform domain model: resource types, field keys, adapter state, and interaction data remain opaque strings or JSON values. Platform-specific discovery stays in an external adapter process.
 
-## Runtime and package boundaries
+## Runtime generations and package boundaries
 
 ```text
-Browser ── HTTP API / generated VOD ── Core
-                                          ├─ adapterhost ── framed JSON/stdin/stdout ── adapter binary
-                                          ├─ shared HLS parser and acquisition
-                                          ├─ network safety policy
-                                          └─ self-describing recording directories
+Browser ── stable HTTP listener ── Runtime Host
+                                      ├─ Control generation(s)
+                                      │    ├─ API/UI, auth, Watches, settings, management projections
+                                      │    ├─ preview, integrity, export, retention coordination
+                                      │    └─ generation-pinned Engine IPC clients
+                                      ├─ Recorder Engine generation(s)
+                                      │    ├─ acquire.Manager, HLS scheduler, metadata monitor
+                                      │    ├─ canonical recording writes and terminal ownership
+                                      │    └─ adapterhost ── framed JSON/stdin/stdout ── adapter binaries
+                                      └─ shared ingest/resource and storage telemetry coordinator
 ```
 
+The production container starts `runtime-host` as PID 1. It owns the stable public listener, release verification/installation, generation supervision, routing, leases, draining, rollback, and the process-shared resource coordinator. It does not parse HLS or recording manifests and does not interpret platform metadata. `control-plane` is replaceable: it owns management APIs and Watch scheduling, but not canonical media acquisition. Each `recorder-engine` process owns its own `acquire.Manager` and any work it admitted. Replacing or killing a Control process does not signal its Engine; a Recording remains pinned to the Engine generation that started it until that Engine reports it terminal.
+
+```text
+candidate verified and ready
+  → fence old Control admission and drain accepted mutations
+  → atomically switch active Control epoch and stable route
+  → enable candidate background work
+  → keep old Engine generations while their durable recording leases remain
+  → drain, detach, stop, and collect an old Engine only after inventory is empty
+```
+
+Application release activation is designed to keep already-running Engine processes alive. Replacing the Runtime Host, container image, operating system, or bundled FFmpeg is a separate maintenance operation and is not covered by application-generation zero-downtime behavior. A Host/container restart uses normal Engine shutdown and startup recovery; an unclean Engine death can still recover an active archive as interrupted.
+
+Host-owned `/data/runtime/state/generations.json` records generation lifecycle and recording-to-Engine leases. The Host reconciles leases against bounded inventories from every ready Engine before retiring a generation. The previous known-good release remains protected as a rollback target. Release directories are immutable and separate from canonical `recordings/` data. Remote artifacts are accepted only after a detached Ed25519 signature and manifest-declared size/SHA-256 checks; GitHub is a discovery/download source, not a trust root. Compatibility is checked against explicit runtime, IPC, archive, and management-schema declarations rather than inferred from SemVer.
+
+The Host resource coordinator keeps the existing ingest limits global while Engine generations overlap: RAM reservation, per-recording limits, pending object/byte admission, and the single canonical writer permit are shared over authenticated local IPC. Storage I/O counters and ingest gauges are aggregated into one Host-owned `local-primary` metrics history. Integrity, preview, export, and Watch worker pools remain Control-generation services; the old Control fences and drains accepted jobs before shutdown, and the candidate takes over after activation. This milestone does not add a multi-backend placement catalog.
+
+Control and Engine communicate with bounded, authenticated local IPC using versioned JSON frames, request IDs, deadlines, generation/instance identity, and a fixed maximum frame size. The public listener is never bound by an application child. The Host routes new requests to the active Control and waits for routed in-flight requests during handoff. A brief mutation fence can return a retryable unavailable response while the candidate application opens shared management state; the listener itself remains bound.
+
+Each Control process and Engine process currently discovers configured adapter binaries in its own adapterhost. An Engine retains its adapter process/runtime for the lifetime of its recordings, so Control replacement does not remove metadata/refresh capability from that Engine. This is not yet a separately supervised Host-level Adapter Runtime or Plugin Store: adapter binaries are still configured through the existing explicit directories and adapter generation/update is future work.
+
 - `internal/adapterproto` defines language-neutral Protocol v1 envelopes, descriptor/schema validation, resources, workflows, media sources, refresh policy, adapter-owned state, and optional Watch check messages.
-- `internal/adapterhost` discovers only explicitly configured adapter directories, supervises long-lived processes, validates descriptors/resources, resolves settings, and manages workflow sessions.
+- `internal/adapterhost` discovers only explicitly configured adapter directories, supervises long-lived processes, validates descriptors/resources, resolves settings, and manages workflow sessions inside the owning application process.
 - `internal/watch` stores durable management state, runs bounded polling, deduplicates sessions, and starts/reconciles automatic Recordings.
 - `internal/pluginconfig` stores user configuration/secrets separately from adapter-owned opaque state/state secrets. Interfaces are backend-neutral; the current implementation uses files.
 - `internal/interaction` bounds and expires generic interaction progress messages.
 - `cmd/adapters/owncast` and `internal/adapters/owncast` build the first standalone adapter. Core does not import the Owncast package.
-- `internal/hls` parses the supported HLS subset. `internal/acquire` owns polling, refresh, retries, segment acquisition, sequence epochs, and recording lifecycle.
+- `internal/hls` parses the supported HLS subset. `internal/acquire` (owned by `recorder-engine`) owns polling, refresh, retries, segment acquisition, sequence epochs, metadata observation, and recording lifecycle.
 - `internal/network` validates public destinations and pins each connection to a freshly validated address.
-- `internal/domain` holds archive-owned types independent of adapter wire types. `internal/storage` writes durable payloads and self-describing metadata. `internal/server` exposes the API and static management page.
+- `internal/domain` holds archive-owned types independent of adapter wire types. `internal/storage` writes durable payloads and self-describing metadata. `internal/server` exposes the API and static management page inside a Control generation.
 
 ## Adapter process and protocol
 
@@ -120,7 +146,9 @@ The dashboard, paginated recording query, tags, delete, archive index, events, i
 
 ## Authentication, settings, and derived media
 
-Single-administrator authentication is enabled by default. First-run setup uses the mode-`0600` token at `DATA_DIR/security/bootstrap-token` and a password of at least 12 bytes; only a bcrypt hash is stored. Session tokens come from a cryptographic RNG and are kept in process memory under SHA-256 keys, so a Core restart revokes every session. Browser cookies are HttpOnly and SameSite=Strict, and mutations require a CSRF header. Set `COOKIE_SECURE=1` behind a TLS reverse proxy. `AUTH_DISABLED=1` is accepted only for loopback binds. There is no user/role system, password reset, or external identity provider.
+Single-administrator authentication is enabled by default. First-run setup uses the mode-`0600` token at `DATA_DIR/security/bootstrap-token` and a password of at least 12 bytes; only a bcrypt hash is stored. Session tokens come from a cryptographic RNG. Only the token hash, CSRF hash, and expiry are stored as mode-`0600` per-session records under `DATA_DIR/security/sessions`; this lets overlapping Control generations share revocation and preserves a browser session across an application release activation. Browser cookies are HttpOnly and SameSite=Strict, and mutations require a CSRF header. Set `COOKIE_SECURE=1` behind a TLS reverse proxy. `AUTH_DISABLED=1` is accepted only for loopback binds. There is no user/role system, password reset, or external identity provider.
+
+The Runtime Host intercepts `GET /api/runtime/update` and authenticated, CSRF-protected `POST` operations at `/check`, `/stage`, `/activate`, and `/rollback`. Update status is a bounded public projection and omits paths, PIDs, tokens, and raw release notes; it may include a bounded, plain-text release-notes summary rendered as text. Development builds fail closed for remote updates. A release activation replaces the default application generation while active Recordings stay pinned to their current Engine. The Runtime Host/container itself is not self-updated by this API.
 
 `internal/systemsettings` manages the UI theme (immediate), integrity concurrency (persisted but applied after server restart), storage/ingest operating limits (persisted and applied after restart), and an optional retention policy. The Storage settings API reports both saved values and the effective startup snapshot, plus fields that require restart. Writer concurrency currently accepts only one writer to preserve canonical commit ordering. Retention defaults to disabled with a 30-day age threshold. When enabled, only completed recordings older than the configured threshold are eligible; any tagged recording is protected, as are recordings with active integrity or derivative jobs. The server performs one bounded pass at startup and then every 24 hours, deleting at most 100 recordings per pass. `GET /api/retention/candidates` previews candidates and `POST /api/retention/run` explicitly runs a pass. Bind address, storage root, and adapter directories are read-only. Settings use strict validation and atomic private-file replacement.
 
@@ -130,9 +158,9 @@ Recording directories are mode `0700`; metadata, payload, and sidecar files use 
 
 ## Server lifecycle and Docker
 
-On SIGINT/SIGTERM, Core stops accepting HTTP work, stops and joins the Watch scheduler, cancels all recording workers before waiting for any worker, durably records their terminal states, then shuts down adapter processes. Shutdown is bounded. Compose allows 45 seconds for graceful termination, longer than the configured HTTP, Watch, and recording-worker shutdown deadlines. A real crash still causes active recordings to reload as interrupted; enabled Watches are reconciled and staggered after restart.
+On SIGINT/SIGTERM, the Runtime Host stops the stable listener and supervises bounded shutdown of its child processes. On a normal Host/container stop, the Control fences new management work and stops its Watch scheduler; each Recorder Engine then drains its accepted ingest queue and closes its own recording workers and adapter processes. Application release activation does not stop Engines. A Host/container replacement is maintenance: active recordings can be recovered as interrupted if their Engine cannot finish its bounded shutdown or if it crashes. Enabled Watches are reconciled and staggered after cold startup.
 
-The container runs as UID 10001. Compose uses a named `/data` volume and publishes the control port on host loopback. The runtime image includes the `ffmpeg` package from Alpine v3.21's community repository and the Owncast adapter in `/adapters`. Alpine package metadata lists the ffmpeg license expression as `GPL-2.0-or-later AND LGPL-2.1-or-later`; FFmpeg upstream documents how GPL-enabled optional components affect FFmpeg licensing. This is a package metadata notice, not legal advice or a statement changing Integrated Recorder's own license. Check the exact package/build included in an image before redistribution. References: [Alpine v3.21 ffmpeg package metadata](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html). Mount additional executable adapters read-only at `./adapter-binaries` (container path `/external-adapters`). Set their executable bit before starting Compose. Core must restart to discover additions; there is no hot reload. Even when authentication is explicitly disabled, only loopback binds are allowed.
+The container runs as UID 10001. Compose uses a named `/data` volume and publishes the Runtime Host listener on host loopback. The image contains the Runtime Host plus an immutable initial Control/Engine release under `/opt/integrated-recorder/initial`; it also includes the `ffmpeg` package from Alpine v3.21's community repository and the Owncast adapter in `/adapters`. Existing `/data/recordings`, `/data/management`, and `/data/security` remain in place; generation registry, runtime credentials, and installed releases are added under `/data/runtime`. Alpine package metadata lists the ffmpeg license expression as `GPL-2.0-or-later AND LGPL-2.1-or-later`; FFmpeg upstream documents how GPL-enabled optional components affect FFmpeg licensing. This is a package metadata notice, not legal advice or a statement changing Integrated Recorder's own license. Check the exact package/build included in an image before redistribution. References: [Alpine v3.21 ffmpeg package metadata](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html). Mount additional executable adapters read-only at `./adapter-binaries` (container path `/external-adapters`). Each Control/Engine discovers its configured directories at startup; this update milestone does not hot-install or update adapter plugins. Even when authentication is explicitly disabled, only loopback binds are allowed.
 
 ## Playback and intentionally unimplemented work
 
@@ -144,7 +172,7 @@ Not implemented: chat timeline, asynchronous adapter notification runtime, real 
 
 The management UI is a React 19 + TypeScript SPA under `web/`. It uses Vite, Tailwind, shadcn-style Radix UI components, TanStack Query/Router/Table, Lucide, and hls.js. API requests and CSRF handling live in a shared client; TanStack Query owns server state. The browser uses same-origin `/api` endpoints, and the player bundles hls.js locally.
 
-For local development, run the Go API and Vite in separate terminals:
+For the legacy monolithic local development command, run the Go API and Vite in separate terminals. This path is useful for iterating on API/UI behavior but does not provide Runtime Host generation updates or cross-process global resource coordination:
 
 ```sh
 go run ./cmd/archiver

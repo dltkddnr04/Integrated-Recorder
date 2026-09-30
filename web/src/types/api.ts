@@ -119,6 +119,24 @@ export type StorageMetricSample = { at: string; read_bytes_per_second: number; w
 export type StoragePoolsResponse = { items: StoragePool[] }
 export type StorageMetricsResponse = { pool_id: string; sample_interval_ms: number; sample_interval_seconds: number; items: StorageMetricSample[] }
 export type SystemInfo = { version: string; commit: string; go_version: string; goos: string; goarch: string; started_at: string; uptime_seconds: number; export_available: boolean }
+export type RuntimeBuildIdentity = { version: string; commit: string; build_time: string; release_channel: string; runtime_protocol_version: number }
+export type RuntimeGenerationSummary = { id: string; version: string; commit: string; installed_at: string; state: string; active_recordings: number }
+export type RuntimeReleaseSummary = { version: string; commit: string; build_time: string; release_channel: string; notes_summary?: string }
+export type RuntimeUpdateStatus = {
+  host: RuntimeBuildIdentity
+  application: RuntimeBuildIdentity
+  active_control?: RuntimeGenerationSummary
+  default_engine?: RuntimeGenerationSummary
+  active_generations: RuntimeGenerationSummary[]
+  draining_generations: RuntimeGenerationSummary[]
+  staged_release?: RuntimeReleaseSummary
+  previous_release?: RuntimeReleaseSummary
+  available_release?: RuntimeReleaseSummary
+  verification_state: 'unknown' | 'not_checked' | 'checking' | 'verified' | 'failed'
+  last_failure_code?: string
+  updates_available: boolean
+  update_unavailable_reason?: string
+}
 export type StorageSettings = {
   ingest_memory: { global_buffer_bytes: number; per_recording_buffer_bytes: number; max_payload_bytes: number }
   queue_writer: { pending_queue_capacity: number; writer_concurrency: number }

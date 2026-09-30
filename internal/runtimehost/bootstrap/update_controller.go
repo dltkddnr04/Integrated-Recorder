@@ -1,0 +1,1358 @@
+package bootstrap
+
+import (
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"net/url"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
+	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
+	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/leases"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
+)
+
+const (
+	updateOperationTimeout = 2 * time.Minute
+	updateMaxTrustKeys     = 16
+)
+
+type updateSupervisor interface {
+	Snapshot() supervisor.Snapshot
+	StartEngine(context.Context, supervisor.ProcessSpec) error
+	StartControl(context.Context, supervisor.ProcessSpec, *url.URL) error
+	ActivateControlWith(context.Context, string, func() error, func() error) error
+	StopControl(context.Context, string) error
+	RetireEngine(context.Context, string, supervisor.EngineDrain) error
+}
+
+type readinessRegistrar interface {
+	supervisor.Readiness
+	register(string, supervisor.Role, string, string)
+	engineIdentity(string) (recorderengine.ReadyResult, error)
+	controlIdentity(string) (controlplane.LifecycleSnapshot, error)
+}
+
+type lifecycleRegistrar interface {
+	supervisor.ControlLifecycle
+	register(string, string, string, string) error
+}
+
+type engineDrainRegistrar interface {
+	supervisor.EngineDrain
+	register(string, string, string, string) error
+}
+
+// EngineDetacher removes a confirmed-idle Engine from the running active
+// Control's runtime catalog before the Host retires that Engine process.
+type EngineDetacher interface {
+	DetachEngine(context.Context, string, string) error
+}
+
+// engineAttachment is private Host runtime state. Paths and tokens in this
+// value are never projected through the update API.
+type engineAttachment struct {
+	generationID string
+	releaseDir   string
+	socketPath   string
+	tokenPath    string
+	instanceID   string
+	manifest     *release.Manifest
+}
+
+type updateControllerOptions struct {
+	Config            Config
+	HostBuild         buildinfo.Info
+	ApplicationBuild  buildinfo.Info
+	Registry          *generation.Registry
+	Supervisor        updateSupervisor
+	Readiness         readinessRegistrar
+	Lifecycle         lifecycleRegistrar
+	Drain             engineDrainRegistrar
+	EngineDetacher    EngineDetacher
+	Coordinator       *resources.Coordinator
+	Installer         *install.Installer
+	TrustedKeys       map[string]ed25519.PublicKey
+	Compatibility     release.HostCompatibility
+	SourceFactory     func() (install.Source, error)
+	ControlTarget     func() (string, *url.URL, error)
+	CatalogWriter     func(string, controlplane.EngineCatalog) error
+	Engines           []engineAttachment
+	ActiveControlID   string
+	ResourceSocket    string
+	ResourceTokenPath string
+	UnavailableReason string
+	OperationTimeout  time.Duration
+}
+
+type updateController struct {
+	config            Config
+	hostBuild         buildinfo.Info
+	applicationBuild  buildinfo.Info
+	registry          *generation.Registry
+	supervisor        updateSupervisor
+	readiness         readinessRegistrar
+	lifecycle         lifecycleRegistrar
+	drain             engineDrainRegistrar
+	engineDetacher    EngineDetacher
+	coordinator       *resources.Coordinator
+	installer         *install.Installer
+	trustedKeys       map[string]ed25519.PublicKey
+	compatibility     release.HostCompatibility
+	sourceFactory     func() (install.Source, error)
+	controlTarget     func() (string, *url.URL, error)
+	catalogWriter     func(string, controlplane.EngineCatalog) error
+	resourceSocket    string
+	resourceTokenPath string
+	operationTimeout  time.Duration
+	unavailableReason string
+
+	gate chan struct{}
+	mu   sync.RWMutex
+
+	engines         map[string]engineAttachment
+	manifests       map[string]release.Manifest
+	releaseNotes    map[string]string
+	buildIdentities map[string]buildinfo.Info
+	bundleBuild     buildinfo.Info
+	inventorySource leases.InventorySource
+	available       *release.Manifest
+	availableSource install.Source
+	availableNotes  string
+	verification    string
+	lastFailureCode string
+}
+
+var _ httpapi.Controller = (*updateController)(nil)
+
+func newUpdateController(options updateControllerOptions) (*updateController, error) {
+	if err := options.Config.Validate(); err != nil || options.Registry == nil || options.Supervisor == nil || options.Readiness == nil || options.Lifecycle == nil || options.Drain == nil || options.Coordinator == nil {
+		return nil, errors.New("runtime update controller dependencies are incomplete")
+	}
+	if options.ActiveControlID != "" {
+		if !generationPattern.MatchString(options.ActiveControlID) || options.Supervisor.Snapshot().ActiveControlGeneration != options.ActiveControlID {
+			return nil, errors.New("runtime update active Control identity is inconsistent")
+		}
+		if activeID := options.Registry.Snapshot().ActiveGenerationID; activeID != "" && activeID != options.ActiveControlID {
+			return nil, errors.New("runtime update active generation identity is inconsistent")
+		}
+	}
+	if options.UnavailableReason == "" {
+		switch {
+		case options.HostBuild.Version == "dev" || options.ApplicationBuild.Version == "dev":
+			options.UnavailableReason = "development_build"
+		case len(options.TrustedKeys) == 0 || options.Installer == nil:
+			options.UnavailableReason = "trust_key_unavailable"
+		case options.SourceFactory == nil:
+			options.UnavailableReason = "source_unavailable"
+		}
+	}
+	if len(options.TrustedKeys) > updateMaxTrustKeys {
+		return nil, errors.New("runtime update trust key count exceeds limit")
+	}
+	if options.OperationTimeout == 0 {
+		options.OperationTimeout = updateOperationTimeout
+	}
+	if options.OperationTimeout < time.Second || options.OperationTimeout > 5*time.Minute {
+		return nil, errors.New("runtime update operation timeout is invalid")
+	}
+	if options.ControlTarget == nil {
+		options.ControlTarget = privateControlTarget
+	}
+	if options.CatalogWriter == nil {
+		options.CatalogWriter = writeEngineCatalog
+	}
+	if options.ResourceSocket != "" && validateSocketPath(options.ResourceSocket) != nil {
+		return nil, errors.New("runtime update resource socket is invalid")
+	}
+	if options.ResourceTokenPath != "" && (!filepath.IsAbs(options.ResourceTokenPath) || filepath.Clean(options.ResourceTokenPath) != options.ResourceTokenPath) {
+		return nil, errors.New("runtime update resource credential path is invalid")
+	}
+	keys := make(map[string]ed25519.PublicKey, len(options.TrustedKeys))
+	for keyID, publicKey := range options.TrustedKeys {
+		if len(keyID) == 0 || len(keyID) > 64 || len(publicKey) != ed25519.PublicKeySize {
+			return nil, errors.New("runtime update trust key is invalid")
+		}
+		keys[keyID] = append(ed25519.PublicKey(nil), publicKey...)
+	}
+	c := &updateController{
+		config: options.Config, hostBuild: options.HostBuild, applicationBuild: options.ApplicationBuild,
+		registry: options.Registry, supervisor: options.Supervisor, readiness: options.Readiness,
+		lifecycle: options.Lifecycle, drain: options.Drain, engineDetacher: options.EngineDetacher, coordinator: options.Coordinator,
+		installer: options.Installer, trustedKeys: keys, compatibility: options.Compatibility,
+		sourceFactory: options.SourceFactory, resourceSocket: options.ResourceSocket,
+		catalogWriter:     options.CatalogWriter,
+		resourceTokenPath: options.ResourceTokenPath, operationTimeout: options.OperationTimeout,
+		controlTarget:     options.ControlTarget,
+		unavailableReason: options.UnavailableReason, gate: make(chan struct{}, 1),
+		engines: make(map[string]engineAttachment), manifests: make(map[string]release.Manifest), buildIdentities: make(map[string]buildinfo.Info),
+		bundleBuild:  options.ApplicationBuild,
+		verification: "not_checked",
+	}
+	for _, attachment := range options.Engines {
+		if !generationPattern.MatchString(attachment.generationID) || !filepath.IsAbs(attachment.releaseDir) || !filepath.IsAbs(attachment.socketPath) || !filepath.IsAbs(attachment.tokenPath) || attachment.instanceID == "" {
+			return nil, errors.New("initial engine attachment is invalid")
+		}
+		if _, exists := c.engines[attachment.generationID]; exists {
+			return nil, errors.New("initial engine attachment is duplicated")
+		}
+		c.engines[attachment.generationID] = attachment
+		if attachment.manifest != nil {
+			c.manifests[attachment.generationID] = *attachment.manifest
+			c.buildIdentities[attachment.generationID] = buildInfoFromManifest(*attachment.manifest)
+		}
+	}
+	if activeID := options.Registry.Snapshot().ActiveGenerationID; activeID != "" && options.ApplicationBuild.Version != "" {
+		if _, known := c.buildIdentities[activeID]; !known {
+			c.buildIdentities[activeID] = options.ApplicationBuild
+		}
+	}
+	if c.unavailableReason == "" && (c.installer == nil || c.sourceFactory == nil || len(c.trustedKeys) == 0) {
+		if len(c.trustedKeys) == 0 || c.installer == nil {
+			c.unavailableReason = "trust_key_unavailable"
+		} else {
+			c.unavailableReason = "source_unavailable"
+		}
+	}
+	if c.unavailableReason == "" && (c.resourceSocket == "" || c.resourceTokenPath == "") {
+		return nil, errors.New("runtime update requires the Host resource coordinator IPC")
+	}
+	return c, nil
+}
+
+func (c *updateController) Status(ctx context.Context) (httpapi.Status, error) {
+	if ctx == nil {
+		return httpapi.Status{}, httpapi.NewControllerError("internal_error")
+	}
+	if err := ctx.Err(); err != nil {
+		return httpapi.Status{}, httpapi.NewControllerError("internal_error")
+	}
+	return c.status(), nil
+}
+
+func (c *updateController) Check(ctx context.Context) (httpapi.Status, error) {
+	if err := c.acquireOperation(ctx); err != nil {
+		return httpapi.Status{}, err
+	}
+	defer c.releaseOperation()
+	if err := c.availableForUpdates(); err != nil {
+		return httpapi.Status{}, err
+	}
+	manifest, src, err := c.fetchCandidate(ctx)
+	if err != nil {
+		return httpapi.Status{}, err
+	}
+	if c.activeMatches(manifest) {
+		c.mu.Lock()
+		c.available, c.availableSource, c.availableNotes = nil, nil, ""
+		c.verification, c.lastFailureCode = "verified", "no_update_available"
+		c.mu.Unlock()
+		return c.status(), httpapi.NewControllerError("no_update_available")
+	}
+	c.mu.Lock()
+	copyManifest := manifest
+	c.available, c.availableSource = &copyManifest, src
+	c.availableNotes = releaseNotesSummary(src)
+	c.verification, c.lastFailureCode = "verified", ""
+	c.mu.Unlock()
+	return c.status(), nil
+}
+
+func (c *updateController) Stage(ctx context.Context) (httpapi.Status, error) {
+	if err := c.acquireOperation(ctx); err != nil {
+		return httpapi.Status{}, err
+	}
+	defer c.releaseOperation()
+	if err := c.availableForUpdates(); err != nil {
+		return httpapi.Status{}, err
+	}
+	snapshot := c.registry.Snapshot()
+	if snapshot.StagedGenerationID != "" {
+		return httpapi.Status{}, httpapi.NewControllerError("operation_conflict")
+	}
+	manifest, src := c.cachedAvailable()
+	if manifest == nil || src == nil {
+		fetched, fetchedSource, err := c.fetchCandidate(ctx)
+		if err != nil {
+			return httpapi.Status{}, err
+		}
+		if c.activeMatches(fetched) {
+			return httpapi.Status{}, httpapi.NewControllerError("no_update_available")
+		}
+		manifest, src = &fetched, fetchedSource
+	}
+	stageCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+	staged, err := c.installer.Stage(stageCtx, src)
+	if errors.Is(err, install.ErrReleaseExists) {
+		id := install.ReleaseDirectoryID(manifest.ReleaseVersion, manifest.Commit)
+		installed, inspectErr := install.InspectInstalledRelease(filepath.Join(c.config.DataDir, "runtime"), id, c.trustedKeys, c.compatibility)
+		if inspectErr != nil {
+			return httpapi.Status{}, c.fail("verification_failed")
+		}
+		staged = install.StagedRelease{ID: installed.ID, Version: installed.Manifest.ReleaseVersion, Commit: installed.Manifest.Commit, Channel: installed.Manifest.Channel, Verified: true, ArtifactCount: len(installed.Manifest.Artifacts)}
+		err = nil
+	}
+	if err != nil {
+		return httpapi.Status{}, c.mapInstallError(err, "stage_failed")
+	}
+	if !staged.Verified || staged.ID != install.ReleaseDirectoryID(manifest.ReleaseVersion, manifest.Commit) {
+		return httpapi.Status{}, c.fail("verification_failed")
+	}
+	installed, err := install.InspectInstalledRelease(filepath.Join(c.config.DataDir, "runtime"), staged.ID, c.trustedKeys, c.compatibility)
+	if err != nil {
+		return httpapi.Status{}, c.mapInstallError(err, "verification_failed")
+	}
+	if manifest == nil || !reflect.DeepEqual(*manifest, installed.Manifest) {
+		return httpapi.Status{}, c.fail("verification_failed")
+	}
+	genID, err := newGenerationID()
+	if err != nil {
+		return httpapi.Status{}, c.fail("internal_error")
+	}
+	newGeneration := generation.Generation{
+		ID: genID, Version: installed.Manifest.ReleaseVersion, Commit: strings.ToLower(installed.Manifest.Commit),
+		InstalledAt: time.Now().UTC(), State: generation.StateStaging,
+		ControlProtocol: installed.Manifest.ControlProtocolVersion, EngineProtocol: installed.Manifest.EngineProtocolVersion,
+		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: installed.Manifest.ArchiveReadMinimum, Maximum: installed.Manifest.ArchiveReadMaximum},
+		ArchiveWriteEpoch:        installed.Manifest.ArchiveWriteEpoch,
+	}
+	if err := c.registry.Stage(newGeneration); err != nil {
+		return httpapi.Status{}, c.mapRegistryError(err, "stage_failed")
+	}
+	if err := c.registry.MarkVerified(genID); err != nil {
+		_ = c.registry.Fail(genID)
+		return httpapi.Status{}, c.mapRegistryError(err, "stage_failed")
+	}
+	c.mu.Lock()
+	c.manifests[genID] = installed.Manifest
+	if c.releaseNotes == nil {
+		c.releaseNotes = make(map[string]string)
+	}
+	if notes := releaseNotesSummary(src); notes != "" {
+		c.releaseNotes[genID] = notes
+	}
+	c.available, c.availableSource, c.availableNotes = nil, nil, ""
+	c.verification, c.lastFailureCode = "verified", ""
+	c.mu.Unlock()
+	return c.status(), nil
+}
+
+func (c *updateController) Activate(ctx context.Context) (httpapi.Status, error) {
+	if err := c.acquireOperation(ctx); err != nil {
+		return httpapi.Status{}, err
+	}
+	defer c.releaseOperation()
+	if err := c.availableForUpdates(); err != nil {
+		return httpapi.Status{}, err
+	}
+	snapshot := c.registry.Snapshot()
+	id := snapshot.StagedGenerationID
+	candidate, exists := snapshot.Generations[id]
+	if id == "" || !exists || candidate.State != generation.StateVerified {
+		return httpapi.Status{}, httpapi.NewControllerError("candidate_not_ready")
+	}
+	installed, err := c.inspectGeneration(candidate)
+	if err != nil {
+		return httpapi.Status{}, c.mapInstallError(err, "verification_failed")
+	}
+	if !c.archiveCompatibleWithRuntime(installed.Manifest) {
+		return httpapi.Status{}, c.fail("release_incompatible")
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+	attachment, err := c.startEngine(ctx, candidate.ID, installed.Directory, installed.Manifest, installed.ArtifactPaths)
+	if err != nil {
+		c.failCandidate(ctx, candidate.ID)
+		return httpapi.Status{}, c.mapLaunchError(err, "candidate_not_ready")
+	}
+	if err := c.registerEngine(candidate.ID, attachment); err != nil {
+		c.failCandidate(ctx, candidate.ID)
+		return httpapi.Status{}, c.fail("candidate_not_ready")
+	}
+	if err := c.publishControl(ctx, candidate.ID, installed.Directory, installed.Manifest, installed.ArtifactPaths, candidate.ID); err != nil {
+		c.failCandidate(ctx, candidate.ID)
+		return httpapi.Status{}, c.mapLaunchError(err, "candidate_not_ready")
+	}
+	if err := c.registry.MarkReady(candidate.ID); err != nil {
+		c.failCandidate(ctx, candidate.ID)
+		return httpapi.Status{}, c.mapRegistryError(err, "activation_failed")
+	}
+	previousID := snapshot.ActiveGenerationID
+	activateErr := c.supervisor.ActivateControlWith(ctx, candidate.ID,
+		func() error { return c.registry.Activate(candidate.ID) },
+		func() error { return c.registry.AbortActivation(candidate.ID, previousID) },
+	)
+	current := c.registry.Snapshot()
+	if current.ActiveGenerationID == candidate.ID && c.supervisor.Snapshot().ActiveControlGeneration == candidate.ID {
+		if err := c.registry.FinalizeActivation(candidate.ID); err != nil {
+			c.mu.Lock()
+			c.lastFailureCode = "internal_error"
+			c.mu.Unlock()
+		}
+		c.mu.Lock()
+		c.applicationBuild = buildInfoFromManifest(installed.Manifest)
+		c.manifests[candidate.ID] = installed.Manifest
+		c.buildIdentities[candidate.ID] = c.applicationBuild
+		c.verification, c.lastFailureCode = "verified", ""
+		c.mu.Unlock()
+		// A bounded old-Control drain may remain pending after the route and new
+		// epoch are active. The candidate is still the committed default.
+		return c.status(), nil
+	}
+	if activateErr != nil {
+		c.failCandidate(ctx, candidate.ID)
+		return httpapi.Status{}, httpapi.NewControllerError("activation_failed")
+	}
+	c.failCandidate(ctx, candidate.ID)
+	return httpapi.Status{}, httpapi.NewControllerError("activation_failed")
+}
+
+func (c *updateController) Rollback(ctx context.Context) (httpapi.Status, error) {
+	if err := c.acquireOperation(ctx); err != nil {
+		return httpapi.Status{}, err
+	}
+	defer c.releaseOperation()
+	if err := c.availableForUpdates(); err != nil {
+		return httpapi.Status{}, err
+	}
+	snapshot := c.registry.Snapshot()
+	previousID := snapshot.PreviousGenerationID
+	previous, exists := snapshot.Generations[previousID]
+	if previousID == "" || !exists || previous.State != generation.StateDraining {
+		return httpapi.Status{}, httpapi.NewControllerError("rollback_unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+	installed, _, err := c.loadGeneration(previous)
+	if err != nil {
+		return httpapi.Status{}, c.mapInstallError(err, "rollback_unavailable")
+	}
+	if installed != nil && !c.archiveCompatibleWithRuntime(installed.Manifest) {
+		return httpapi.Status{}, c.fail("release_incompatible")
+	}
+	attachment, attached := c.engineAttachment(previousID)
+	engineState := c.supervisorEngineState(previousID)
+	if !attached || engineState != supervisor.ProcessReady {
+		if engineState == supervisor.ProcessStarting || engineState == supervisor.ProcessStopping {
+			return httpapi.Status{}, c.fail("rollback_failed")
+		}
+		if !attached || engineState == supervisor.ProcessExited || engineState == supervisor.ProcessFailed {
+			var paths map[string]string
+			var directory string
+			if installed != nil {
+				directory, paths = installed.Directory, installed.ArtifactPaths
+			} else {
+				directory, paths = c.bundleExecutables()
+			}
+			manifest := release.Manifest{}
+			if installed != nil {
+				manifest = installed.Manifest
+			}
+			attachment, err = c.startEngine(ctx, previousID, directory, manifest, paths)
+			if err != nil {
+				return httpapi.Status{}, c.mapLaunchError(err, "rollback_failed")
+			}
+			if err := c.registerEngine(previousID, attachment); err != nil {
+				return httpapi.Status{}, c.fail("rollback_failed")
+			}
+		} else {
+			return httpapi.Status{}, c.fail("rollback_failed")
+		}
+	}
+	var directory string
+	var paths map[string]string
+	var manifest release.Manifest
+	if installed != nil {
+		directory, paths, manifest = installed.Directory, installed.ArtifactPaths, installed.Manifest
+	} else {
+		directory, paths = c.bundleExecutables()
+	}
+	if err := c.publishControl(ctx, previousID, directory, manifest, paths, previousID); err != nil {
+		_ = c.supervisor.StopControl(context.Background(), previousID)
+		return httpapi.Status{}, c.mapLaunchError(err, "rollback_failed")
+	}
+	rollbackErr := c.supervisor.ActivateControlWith(ctx, previousID,
+		func() error { return c.registry.Rollback() },
+		func() error { return c.registry.Rollback() },
+	)
+	current := c.registry.Snapshot()
+	if current.ActiveGenerationID == previousID && c.supervisor.Snapshot().ActiveControlGeneration == previousID {
+		if installed != nil {
+			c.mu.Lock()
+			c.applicationBuild = buildInfoFromManifest(manifest)
+			c.manifests[previousID] = manifest
+			c.buildIdentities[previousID] = c.applicationBuild
+			c.mu.Unlock()
+		} else {
+			c.mu.Lock()
+			if build, ok := c.buildIdentities[previousID]; ok {
+				c.applicationBuild = build
+			} else if matchesBuild(previous, c.hostBuild) {
+				c.applicationBuild = c.hostBuild
+			}
+			c.mu.Unlock()
+		}
+		c.mu.Lock()
+		c.verification, c.lastFailureCode = "verified", ""
+		c.mu.Unlock()
+		_ = rollbackErr
+		return c.status(), nil
+	}
+	_ = rollbackErr
+	_ = c.supervisor.StopControl(context.Background(), previousID)
+	return httpapi.Status{}, httpapi.NewControllerError("rollback_failed")
+}
+
+// ReconcileLeases performs one complete confirmed inventory pass over every
+// running active or draining Engine. A failed Engine inventory leaves the
+// previous durable lease projection unchanged.
+func (c *updateController) ReconcileLeases(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("lease reconciliation context is required")
+	}
+	if err := c.lockOperation(ctx, false); err != nil {
+		return err
+	}
+	defer c.releaseOperation()
+	attachments := c.EngineAttachments()
+	sup := c.supervisor.Snapshot()
+	ready := make(map[string]bool, len(sup.Generations))
+	for _, process := range sup.Generations {
+		ready[process.ID] = process.Engine.State == supervisor.ProcessReady
+	}
+	eligible := make(map[string]engineAttachment)
+	for _, attachment := range attachments {
+		if ready[attachment.generationID] {
+			eligible[attachment.generationID] = attachment
+		}
+	}
+	source := c.inventorySource
+	if source == nil {
+		source = leases.InventorySourceFunc(func(ctx context.Context, engine generation.Generation) (generation.EngineInventory, error) {
+			attachment, ok := eligible[engine.ID]
+			if !ok {
+				return generation.EngineInventory{}, errors.New("engine inventory endpoint is unavailable")
+			}
+			secret, err := controlplane.LoadPrivateIPCSecret(attachment.tokenPath)
+			if err != nil {
+				return generation.EngineInventory{}, err
+			}
+			client, err := runtimeipc.NewClientForInstance(attachment.socketPath, attachment.generationID, attachment.instanceID, secret, 3*time.Second)
+			if err != nil {
+				return generation.EngineInventory{}, err
+			}
+			manager, err := recorderengine.NewManagerClient(client)
+			if err != nil {
+				return generation.EngineInventory{}, err
+			}
+			inventory, err := manager.Inventory(ctx)
+			if err != nil || !inventory.Ready || inventory.GenerationID != engine.ID || inventory.InstanceID != attachment.instanceID {
+				return generation.EngineInventory{}, errors.New("engine inventory identity could not be confirmed")
+			}
+			result := generation.EngineInventory{Confirmed: true, EngineGeneration: engine.ID, WorkerInstance: inventory.InstanceID, ObservedAt: time.Now().UTC(), Recordings: make([]generation.InventoryRecording, 0, len(inventory.Active))}
+			for _, active := range inventory.Active {
+				result.Recordings = append(result.Recordings, generation.InventoryRecording{RecordingID: active.RecordingID, StartedAt: active.StartedAt})
+			}
+			return result, nil
+		})
+	}
+	reconciler, err := leases.New(c.registry, source)
+	if err != nil {
+		return err
+	}
+	if err := reconciler.RunOnce(ctx); err != nil {
+		return err
+	}
+	return c.retireSafeGenerations(ctx)
+}
+
+func (c *updateController) retireSafeGenerations(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("generation retirement context is required")
+	}
+	snapshot := c.registry.Snapshot()
+	idList := make([]string, 0, len(snapshot.Generations))
+	for id := range snapshot.Generations {
+		idList = append(idList, id)
+	}
+	sort.Strings(idList)
+	for _, id := range idList {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		current := c.registry.Snapshot()
+		g, exists := current.Generations[id]
+		rollbackTarget := id == current.PreviousGenerationID
+		if !exists || (generationProtected(current, id) && !rollbackTarget) || generationHasLease(current, id) {
+			continue
+		}
+		if rollbackTarget {
+			// Keep the previous signed release and registry entry for rollback,
+			// but do not keep an idle Engine process alive indefinitely. The
+			// Engine is detached and stopped only after the fresh inventory pass
+			// above has confirmed that it owns no Recording leases.
+			if g.State != generation.StateDraining || g.EngineDormant {
+				continue
+			}
+			if c.proveAndStopEngine(ctx, id, true) && c.processesStopped(id) {
+				_ = c.registry.MarkEngineDormant(id)
+			}
+			continue
+		}
+		if g.State == generation.StateRetired {
+			c.finishRetiredGeneration(ctx, g)
+			continue
+		}
+		if g.State != generation.StateDraining && g.State != generation.StateFailed {
+			continue
+		}
+		if !c.proveAndRetireEngine(ctx, id) {
+			continue
+		}
+		if !c.processesStopped(id) {
+			continue
+		}
+		if err := c.registry.Retire(id); err != nil {
+			continue
+		}
+		retired := c.registry.Snapshot().Generations[id]
+		c.finishRetiredGeneration(ctx, retired)
+	}
+	return nil
+}
+
+func generationProtected(snapshot generation.Snapshot, id string) bool {
+	return id == snapshot.ActiveGenerationID || id == snapshot.PreviousGenerationID || id == snapshot.ActivationPreviousGenerationID || id == snapshot.StagedGenerationID
+}
+
+func generationHasLease(snapshot generation.Snapshot, id string) bool {
+	for _, lease := range snapshot.Leases {
+		if lease.EngineGeneration == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *updateController) proveAndRetireEngine(ctx context.Context, id string) bool {
+	return c.proveAndStopEngine(ctx, id, false)
+}
+
+func (c *updateController) proveAndStopEngine(ctx context.Context, id string, retainPrevious bool) bool {
+	snapshot := c.supervisor.Snapshot()
+	process, found := supervisorGeneration(snapshot, id)
+	if found && (process.Engine.State == supervisor.ProcessStarting || process.Engine.State == supervisor.ProcessStopping) {
+		return false
+	}
+	engineRunning := found && process.Engine.State == supervisor.ProcessReady
+	if engineRunning {
+		if err := c.drain.BeginDrain(ctx, id); err != nil {
+			return false
+		}
+		active, err := c.drain.ActiveRecordings(ctx, id)
+		if err != nil || active != 0 {
+			return false
+		}
+	}
+	latest := c.registry.Snapshot()
+	protected := id == latest.ActiveGenerationID || id == latest.ActivationPreviousGenerationID || id == latest.StagedGenerationID
+	if id == latest.PreviousGenerationID && !retainPrevious {
+		protected = true
+	}
+	if retainPrevious && id != latest.PreviousGenerationID {
+		protected = true
+	}
+	if protected || generationHasLease(latest, id) {
+		return false
+	}
+	controlID, mayContain := activeControlCatalog(snapshot)
+	if mayContain {
+		if controlID == "" || c.engineDetacher == nil || c.engineDetacher.DetachEngine(ctx, controlID, id) != nil {
+			return false
+		}
+	}
+	if engineRunning {
+		if err := c.supervisor.RetireEngine(ctx, id, c.drain); err != nil {
+			return false
+		}
+	}
+	return c.processesStopped(id)
+}
+
+func supervisorGeneration(snapshot supervisor.Snapshot, id string) (supervisor.GenerationSnapshot, bool) {
+	for _, process := range snapshot.Generations {
+		if process.ID == id {
+			return process, true
+		}
+	}
+	return supervisor.GenerationSnapshot{}, false
+}
+
+func activeControlCatalog(snapshot supervisor.Snapshot) (string, bool) {
+	if snapshot.ActiveControlGeneration == "" {
+		return "", false
+	}
+	process, exists := supervisorGeneration(snapshot, snapshot.ActiveControlGeneration)
+	if !exists || !process.ControlActive || process.Control.State != supervisor.ProcessReady {
+		// The active-control pointer is inconsistent with the process view, so
+		// do not assume its Engine catalog is empty.
+		return "", true
+	}
+	return snapshot.ActiveControlGeneration, true
+}
+
+func (c *updateController) processesStopped(id string) bool {
+	process, exists := supervisorGeneration(c.supervisor.Snapshot(), id)
+	if !exists {
+		return true
+	}
+	return stoppedProcessState(process.Engine.State) && stoppedProcessState(process.Control.State) && !process.ControlActive
+}
+
+func stoppedProcessState(state supervisor.ProcessState) bool {
+	return state == "" || state == supervisor.ProcessExited || state == supervisor.ProcessFailed
+}
+
+func (c *updateController) finishRetiredGeneration(ctx context.Context, g generation.Generation) {
+	if ctx.Err() != nil {
+		return
+	}
+	snapshot := c.registry.Snapshot()
+	current, exists := snapshot.Generations[g.ID]
+	if !exists || current.State != generation.StateRetired || generationProtected(snapshot, g.ID) || generationHasLease(snapshot, g.ID) || !c.processesStopped(g.ID) {
+		return
+	}
+	if !c.isBundledGeneration(current) {
+		dirID := install.ReleaseDirectoryID(current.Version, current.Commit)
+		err := install.RemoveInstalledRelease(filepath.Join(c.config.DataDir, "runtime"), dirID, c.trustedKeys)
+		if err != nil && !errors.Is(err, install.ErrReleaseNotFound) {
+			return
+		}
+	}
+	snapshot = c.registry.Snapshot()
+	if current, exists = snapshot.Generations[g.ID]; !exists || current.State != generation.StateRetired || generationProtected(snapshot, g.ID) || generationHasLease(snapshot, g.ID) || !c.processesStopped(g.ID) {
+		return
+	}
+	if err := c.registry.RemoveRetired(g.ID); err != nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.engines, g.ID)
+	delete(c.manifests, g.ID)
+	delete(c.releaseNotes, g.ID)
+	delete(c.buildIdentities, g.ID)
+	c.mu.Unlock()
+}
+
+func (c *updateController) isBundledGeneration(g generation.Generation) bool {
+	if attachment, ok := c.engineAttachment(g.ID); ok && attachment.releaseDir == c.config.BundleDir {
+		return true
+	}
+	return matchesBuild(g, c.bundleBuild) || matchesBuild(g, c.hostBuild)
+}
+
+// EngineAttachments returns a stable copy of Host-local IPC attachments. The
+// values include private socket and credential paths and are for bootstrap
+// orchestration only, never public API projection.
+func (c *updateController) EngineAttachments() []engineAttachment {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]engineAttachment, 0, len(c.engines))
+	for _, attachment := range c.engines {
+		copyAttachment := attachment
+		if attachment.manifest != nil {
+			manifest := *attachment.manifest
+			copyAttachment.manifest = &manifest
+		}
+		result = append(result, copyAttachment)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].generationID < result[j].generationID })
+	return result
+}
+
+func (c *updateController) fetchCandidate(ctx context.Context) (release.Manifest, install.Source, error) {
+	if err := ctx.Err(); err != nil {
+		return release.Manifest{}, nil, httpapi.NewControllerError("update_check_failed")
+	}
+	src, err := c.sourceFactory()
+	if err != nil || src == nil {
+		return release.Manifest{}, nil, c.fail("update_check_failed")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+	manifestBytes, signature, err := src.Manifest(checkCtx)
+	if err != nil {
+		return release.Manifest{}, nil, c.fail("update_check_failed")
+	}
+	manifest, err := release.DecodeAndVerifyManifest(manifestBytes, signature, c.trustedKeys)
+	if err != nil {
+		return release.Manifest{}, nil, c.mapManifestError(err)
+	}
+	if err := release.CheckCompatibility(manifest, c.compatibility); err != nil {
+		return release.Manifest{}, nil, c.mapManifestError(err)
+	}
+	if !c.archiveCompatibleWithRuntime(manifest) {
+		return release.Manifest{}, nil, c.fail("release_incompatible")
+	}
+	c.mu.Lock()
+	c.verification = "verified"
+	c.mu.Unlock()
+	return manifest, src, nil
+}
+
+func (c *updateController) availableForUpdates() error {
+	c.mu.RLock()
+	reason := c.unavailableReason
+	c.mu.RUnlock()
+	if reason != "" {
+		return httpapi.NewControllerError("update_unavailable")
+	}
+	return nil
+}
+
+func (c *updateController) acquireOperation(ctx context.Context) error {
+	if err := c.lockOperation(ctx, true); err != nil {
+		return httpapi.NewControllerError("operation_conflict")
+	}
+	return nil
+}
+
+func (c *updateController) lockOperation(ctx context.Context, wait bool) error {
+	if ctx == nil {
+		return errors.New("runtime update operation context is required")
+	}
+	if wait {
+		select {
+		case c.gate <- struct{}{}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	select {
+	case c.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return errors.New("runtime update operation is already running")
+	}
+}
+
+func (c *updateController) releaseOperation() { <-c.gate }
+
+func (c *updateController) cachedAvailable() (*release.Manifest, install.Source) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.available == nil {
+		return nil, nil
+	}
+	manifest := *c.available
+	return &manifest, c.availableSource
+}
+
+func (c *updateController) activeMatches(manifest release.Manifest) bool {
+	snapshot := c.registry.Snapshot()
+	active := snapshot.Generations[snapshot.ActiveGenerationID]
+	return active.ID != "" && active.Version == manifest.ReleaseVersion && strings.EqualFold(active.Commit, manifest.Commit)
+}
+
+func (c *updateController) inspectGeneration(generationInfo generation.Generation) (*install.VerifiedRelease, error) {
+	id := install.ReleaseDirectoryID(generationInfo.Version, generationInfo.Commit)
+	installed, err := install.InspectInstalledRelease(filepath.Join(c.config.DataDir, "runtime"), id, c.trustedKeys, c.compatibility)
+	if err != nil {
+		return nil, err
+	}
+	if installed.Manifest.ReleaseVersion != generationInfo.Version || !strings.EqualFold(installed.Manifest.Commit, generationInfo.Commit) {
+		return nil, release.ErrInvalidManifest
+	}
+	return &installed, nil
+}
+
+func (c *updateController) loadGeneration(generationInfo generation.Generation) (*install.VerifiedRelease, bool, error) {
+	if attachment, ok := c.engineAttachment(generationInfo.ID); ok && attachment.releaseDir == c.config.BundleDir {
+		return nil, true, nil
+	}
+	if matchesBuild(generationInfo, c.applicationBuild) || matchesBuild(generationInfo, c.hostBuild) {
+		return nil, true, nil
+	}
+	installed, err := c.inspectGeneration(generationInfo)
+	if err != nil {
+		return nil, false, err
+	}
+	return installed, false, nil
+}
+
+func (c *updateController) startEngine(ctx context.Context, id, directory string, manifest release.Manifest, paths map[string]string) (engineAttachment, error) {
+	if c.resourceSocket == "" || c.resourceTokenPath == "" {
+		return engineAttachment{}, errors.New("Host resource coordinator IPC is unavailable")
+	}
+	if err := validateSocketPath(c.resourceSocket); err != nil {
+		return engineAttachment{}, errors.New("Host resource coordinator socket is invalid")
+	}
+	if _, err := controlplane.LoadPrivateIPCSecret(c.resourceTokenPath); err != nil {
+		return engineAttachment{}, errors.New("Host resource coordinator credential is unavailable")
+	}
+	executable := paths[release.RoleRecorderEngine]
+	if executable == "" && directory == c.config.BundleDir {
+		executable = filepath.Join(directory, "recorder-engine")
+	}
+	if executable == "" || filepath.Dir(executable) != directory {
+		return engineAttachment{}, errors.New("verified Recorder Engine executable is unavailable")
+	}
+	if err := ensurePrivateDirectory(filepath.Join(c.config.DataDir, "runtime", "ipc")); err != nil {
+		return engineAttachment{}, err
+	}
+	secret, err := randomSecret()
+	if err != nil {
+		return engineAttachment{}, err
+	}
+	suffix := id[:12]
+	socket := filepath.Join(c.config.DataDir, "runtime", "ipc", "e-"+suffix+".sock")
+	tokenPath := filepath.Join(c.config.DataDir, "runtime", "ipc", "e-"+suffix+".token")
+	if err := validateSocketPath(socket); err != nil {
+		return engineAttachment{}, err
+	}
+	if err := writeAtomicPrivate(tokenPath, secret); err != nil {
+		return engineAttachment{}, errors.New("generation IPC credential could not be secured")
+	}
+	ownerNonce, err := newGenerationID()
+	if err != nil {
+		return engineAttachment{}, errors.New("generation resource owner identity could not be created")
+	}
+	owner := "e" + id + "-" + ownerNonce
+	env := commonChildEnv(c.config)
+	env = append(env, "RUNTIME_RESOURCE_SOCKET_PATH="+c.resourceSocket, "RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath, "RUNTIME_RESOURCE_OWNER="+owner)
+	env = append(env, "ENGINE_SOCKET_PATH="+socket, "ENGINE_GENERATION_ID="+id, "ENGINE_RECOVERY_MODE=fresh", "ENGINE_IPC_TOKEN_FILE="+tokenPath)
+	spec := supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleEngine, Executable: executable, Dir: directory, Env: env}
+	c.readiness.register(id, supervisor.RoleEngine, socket, tokenPath)
+	if err := c.supervisor.StartEngine(ctx, spec); err != nil {
+		return engineAttachment{}, err
+	}
+	ready, err := c.readiness.engineIdentity(id)
+	if err != nil || !ready.Ready || ready.GenerationID != id || ready.InstanceID == "" || ready.ProtocolVersion != runtimeipc.ProtocolVersion {
+		return engineAttachment{}, errors.New("Recorder Engine readiness identity is invalid")
+	}
+	attachment := engineAttachment{generationID: id, releaseDir: directory, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
+	if manifest.ReleaseVersion != "" {
+		copyManifest := manifest
+		attachment.manifest = &copyManifest
+	}
+	return attachment, nil
+}
+
+func (c *updateController) registerEngine(id string, attachment engineAttachment) error {
+	if err := c.drain.register(id, attachment.socketPath, attachment.tokenPath, attachment.instanceID); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.engines[id] = attachment
+	if attachment.manifest != nil {
+		c.manifests[id] = *attachment.manifest
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *updateController) publishControl(ctx context.Context, id, directory string, manifest release.Manifest, paths map[string]string, activeEngineID string) error {
+	executable := paths[release.RoleControlPlane]
+	if executable == "" && directory == c.config.BundleDir {
+		executable = filepath.Join(directory, "control-plane")
+	}
+	if executable == "" || filepath.Dir(executable) != directory {
+		return errors.New("verified Control Plane executable is unavailable")
+	}
+	entries, err := c.catalogEntries(activeEngineID)
+	if err != nil {
+		return err
+	}
+	ipcDir := filepath.Join(c.config.DataDir, "runtime", "ipc")
+	if err := ensurePrivateDirectory(ipcDir); err != nil {
+		return err
+	}
+	secret, err := randomSecret()
+	if err != nil {
+		return err
+	}
+	suffix := id[:12]
+	socket := filepath.Join(ipcDir, "c-"+suffix+".sock")
+	tokenPath := filepath.Join(ipcDir, "c-"+suffix+".token")
+	catalogPath := filepath.Join(ipcDir, "catalog-"+id+".json")
+	if err := validateSocketPath(socket); err != nil {
+		return err
+	}
+	if err := writeAtomicPrivate(tokenPath, secret); err != nil {
+		return errors.New("generation IPC credential could not be secured")
+	}
+	if err := c.catalogWriter(catalogPath, controlplane.EngineCatalog{Version: 1, ActiveGenerationID: activeEngineID, Engines: entries}); err != nil {
+		return errors.New("private Recorder Engine catalog could not be published")
+	}
+	controlAddr, target, err := c.controlTarget()
+	if err != nil {
+		return err
+	}
+	ownerNonce, err := newGenerationID()
+	if err != nil {
+		return errors.New("generation resource owner identity could not be created")
+	}
+	resourceOwner := "c" + id + "-" + ownerNonce
+	env := append([]string(nil), commonChildEnv(c.config)...)
+	env = append(env,
+		"CONTROL_ADDR="+controlAddr,
+		"CONTROL_GENERATION_ID="+id,
+		"CONTROL_IPC_SOCKET_PATH="+socket,
+		"CONTROL_IPC_TOKEN_FILE="+tokenPath,
+		"ENGINE_CATALOG_FILE="+catalogPath,
+		"ACTIVE_ENGINE_GENERATION="+activeEngineID,
+		"COOKIE_SECURE="+boolEnv(c.config.ForceSecureCookies),
+		"RUNTIME_RESOURCE_SOCKET_PATH="+c.resourceSocket,
+		"RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath,
+		"RUNTIME_RESOURCE_OWNER="+resourceOwner,
+	)
+	if c.config.AuthDisabled {
+		env = append(env, "AUTH_DISABLED=1")
+	}
+	spec := supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleControl, Executable: executable, Dir: directory, Env: env}
+	c.readiness.register(id, supervisor.RoleControl, socket, tokenPath)
+	if err := c.supervisor.StartControl(ctx, spec, target); err != nil {
+		return err
+	}
+	ready, err := c.readiness.controlIdentity(id)
+	if err != nil || !ready.Ready || ready.Active || ready.State != controlplane.LifecyclePassive || ready.GenerationID != id || ready.InstanceID == "" {
+		return errors.New("Control Plane readiness identity is invalid")
+	}
+	if err := c.lifecycle.register(id, socket, tokenPath, ready.InstanceID); err != nil {
+		return errors.New("Control Plane lifecycle endpoint is unavailable")
+	}
+	if manifest.ReleaseVersion != "" {
+		c.mu.Lock()
+		c.manifests[id] = manifest
+		c.mu.Unlock()
+	}
+	return nil
+}
+
+func (c *updateController) catalogEntries(activeEngineID string) ([]controlplane.EngineCatalogEntry, error) {
+	if !generationPattern.MatchString(activeEngineID) {
+		return nil, errors.New("active Recorder Engine identity is invalid")
+	}
+	snapshot := c.supervisor.Snapshot()
+	ready := make(map[string]bool, len(snapshot.Generations))
+	for _, process := range snapshot.Generations {
+		ready[process.ID] = process.Engine.State == supervisor.ProcessReady
+	}
+	attachments := c.EngineAttachments()
+	entries := make([]controlplane.EngineCatalogEntry, 0, len(attachments))
+	foundActive := false
+	for _, attachment := range attachments {
+		if !ready[attachment.generationID] {
+			continue
+		}
+		if attachment.generationID == activeEngineID {
+			foundActive = true
+		}
+		entries = append(entries, controlplane.EngineCatalogEntry{
+			GenerationID: attachment.generationID, SocketPath: attachment.socketPath,
+			TokenFile: attachment.tokenPath, InstanceID: attachment.instanceID,
+		})
+	}
+	if !foundActive {
+		return nil, errors.New("active Recorder Engine is not attached")
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].GenerationID < entries[j].GenerationID })
+	if len(entries) == 0 || len(entries) > 32 {
+		return nil, errors.New("Recorder Engine catalog is outside its limit")
+	}
+	return entries, nil
+}
+
+func (c *updateController) failCandidate(ctx context.Context, id string) {
+	snapshot := c.registry.Snapshot()
+	if snapshot.ActiveGenerationID == id || c.supervisor.Snapshot().ActiveControlGeneration == id {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = c.supervisor.StopControl(cleanupCtx, id)
+	if _, exists := c.engineAttachment(id); exists {
+		_ = c.supervisor.RetireEngine(cleanupCtx, id, c.drain)
+		if c.supervisorEngineState(id) != supervisor.ProcessReady {
+			c.mu.Lock()
+			delete(c.engines, id)
+			delete(c.manifests, id)
+			delete(c.releaseNotes, id)
+			c.mu.Unlock()
+		}
+	}
+	snapshot = c.registry.Snapshot()
+	if snapshot.StagedGenerationID == id {
+		_ = c.registry.Fail(id)
+	}
+}
+
+func (c *updateController) status() httpapi.Status {
+	registryState := c.registry.Snapshot()
+	supState := c.supervisor.Snapshot()
+	c.mu.RLock()
+	hostBuild := c.hostBuild
+	appBuild := c.applicationBuild
+	verification := c.verification
+	lastFailure := c.lastFailureCode
+	unavailable := c.unavailableReason
+	available := c.available
+	availableNotes := c.availableNotes
+	manifestByID := make(map[string]release.Manifest, len(c.manifests))
+	for id, manifest := range c.manifests {
+		manifestByID[id] = manifest
+	}
+	releaseNotesByID := make(map[string]string, len(c.releaseNotes))
+	for id, summary := range c.releaseNotes {
+		releaseNotesByID[id] = summary
+	}
+	buildByID := make(map[string]buildinfo.Info, len(c.buildIdentities))
+	for id, build := range c.buildIdentities {
+		buildByID[id] = build
+	}
+	c.mu.RUnlock()
+	if active, ok := registryState.Generations[registryState.ActiveGenerationID]; ok {
+		if manifest, found := manifestByID[active.ID]; found {
+			appBuild = buildInfoFromManifest(manifest)
+		} else if build, found := buildByID[active.ID]; found {
+			appBuild = build
+		} else if active.Version != appBuild.Version || !strings.EqualFold(active.Commit, appBuild.Commit) {
+			if installed, err := c.inspectGeneration(active); err == nil {
+				appBuild = buildInfoFromManifest(installed.Manifest)
+			}
+		}
+	}
+	status := httpapi.Status{
+		Host: toAPIIdentity(hostBuild), Application: toAPIIdentity(appBuild),
+		ActiveGenerations: []httpapi.GenerationSummary{}, DrainingGenerations: []httpapi.GenerationSummary{},
+		VerificationState: verification, LastFailureCode: lastFailure,
+		UpdateUnavailableReason: unavailable,
+	}
+	leaseCount := make(map[string]int, len(registryState.Leases))
+	for _, lease := range registryState.Leases {
+		leaseCount[lease.EngineGeneration]++
+	}
+	generations := make([]generation.Generation, 0, len(registryState.Generations))
+	for _, item := range registryState.Generations {
+		generations = append(generations, item)
+	}
+	sort.Slice(generations, func(i, j int) bool {
+		if generations[i].InstalledAt.Equal(generations[j].InstalledAt) {
+			return generations[i].ID < generations[j].ID
+		}
+		return generations[i].InstalledAt.After(generations[j].InstalledAt)
+	})
+	for _, item := range generations {
+		row := httpapi.GenerationSummary{ID: item.ID, Version: item.Version, Commit: item.Commit, InstalledAt: item.InstalledAt, State: string(item.State), ActiveRecordings: leaseCount[item.ID]}
+		switch item.State {
+		case generation.StateActive:
+			status.ActiveGenerations = append(status.ActiveGenerations, row)
+		case generation.StateDraining:
+			status.DrainingGenerations = append(status.DrainingGenerations, row)
+		}
+	}
+	if len(status.ActiveGenerations) > 64 {
+		status.ActiveGenerations = status.ActiveGenerations[:64]
+	}
+	if len(status.DrainingGenerations) > 64 {
+		status.DrainingGenerations = status.DrainingGenerations[:64]
+	}
+	if active, ok := registryState.Generations[supState.ActiveControlGeneration]; ok {
+		row := summaryFor(active, leaseCount[active.ID])
+		status.ActiveControl = &row
+	}
+	if active, ok := registryState.Generations[registryState.ActiveGenerationID]; ok {
+		row := summaryFor(active, leaseCount[active.ID])
+		status.DefaultEngine = &row
+	}
+	if staged, ok := registryState.Generations[registryState.StagedGenerationID]; ok {
+		status.StagedRelease = c.releaseSummary(staged, manifestByID, releaseNotesByID)
+	}
+	if previous, ok := registryState.Generations[registryState.PreviousGenerationID]; ok {
+		status.PreviousRelease = c.releaseSummary(previous, manifestByID, releaseNotesByID)
+	}
+	if available != nil {
+		status.AvailableRelease = releaseSummaryFromManifest(*available, availableNotes)
+		status.UpdatesAvailable = true
+	}
+	return status
+}
+
+func (c *updateController) releaseSummary(g generation.Generation, manifests map[string]release.Manifest, notes map[string]string) *httpapi.ReleaseSummary {
+	if manifest, ok := manifests[g.ID]; ok {
+		return releaseSummaryFromManifest(manifest, notes[g.ID])
+	}
+	c.mu.RLock()
+	build, buildFound := c.buildIdentities[g.ID]
+	applicationBuild := c.applicationBuild
+	hostBuild := c.hostBuild
+	c.mu.RUnlock()
+	if buildFound {
+		if summary := releaseSummaryFromBuild(build); summary != nil {
+			return summary
+		}
+	}
+	if g.Version == applicationBuild.Version && strings.EqualFold(g.Commit, applicationBuild.Commit) && applicationBuild.ReleaseChannel != "development" {
+		return releaseSummaryFromBuild(applicationBuild)
+	}
+	if g.Version == hostBuild.Version && strings.EqualFold(g.Commit, hostBuild.Commit) && hostBuild.ReleaseChannel != "development" {
+		return releaseSummaryFromBuild(hostBuild)
+	}
+	if installed, err := c.inspectGeneration(g); err == nil {
+		return releaseSummaryFromManifest(installed.Manifest)
+	}
+	return nil
+}
+
+func matchesBuild(g generation.Generation, build buildinfo.Info) bool {
+	return build.Version != "" && g.Version == build.Version && strings.EqualFold(g.Commit, build.Commit)
+}
+
+// archiveCompatibleWithRuntime applies the explicit coexistence contract to
+// every active or draining generation. A candidate must read each existing
+// writer epoch, and retained generations must be able to read objects the
+// candidate may write so rollback does not strand archives created after the
+// switch.
+func (c *updateController) archiveCompatibleWithRuntime(candidate release.Manifest) bool {
+	snapshot := c.registry.Snapshot()
+	for _, current := range snapshot.Generations {
+		if current.State != generation.StateActive && current.State != generation.StateDraining {
+			continue
+		}
+		if candidate.ArchiveReadMinimum > current.ArchiveWriteEpoch || candidate.ArchiveReadMaximum < current.ArchiveWriteEpoch {
+			return false
+		}
+		if current.ArchiveReadCompatibility.Minimum > candidate.ArchiveWriteEpoch || current.ArchiveReadCompatibility.Maximum < candidate.ArchiveWriteEpoch {
+			return false
+		}
+	}
+	return true
+}
+
+func summaryFor(item generation.Generation, recordings int) httpapi.GenerationSummary {
+	return httpapi.GenerationSummary{ID: item.ID, Version: item.Version, Commit: item.Commit, InstalledAt: item.InstalledAt, State: string(item.State), ActiveRecordings: recordings}
+}
+
+func releaseSummaryFromManifest(manifest release.Manifest, notes ...string) *httpapi.ReleaseSummary {
+	summary := &httpapi.ReleaseSummary{Version: manifest.ReleaseVersion, Commit: strings.ToLower(manifest.Commit), BuildTime: canonicalRFC3339(manifest.BuildTime), ReleaseChannel: manifest.Channel}
+	if len(notes) > 0 {
+		summary.NotesSummary = notes[0]
+	}
+	return summary
+}
+
+func releaseNotesSummary(source install.Source) string {
+	provider, ok := source.(install.ReleaseNotesSummarySource)
+	if !ok {
+		return ""
+	}
+	return provider.ReleaseNotesSummary()
+}
+
+func releaseSummaryFromBuild(build buildinfo.Info) *httpapi.ReleaseSummary {
+	if build.ReleaseChannel == "development" || build.Version == "dev" || build.Commit == "unknown" {
+		return nil
+	}
+	return &httpapi.ReleaseSummary{Version: build.Version, Commit: build.Commit, BuildTime: build.BuildTime, ReleaseChannel: build.ReleaseChannel}
+}
+
+func canonicalRFC3339(value string) string {
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return ""
+	}
+	return parsed.Format(time.RFC3339)
+}
+
+func toAPIIdentity(build buildinfo.Info) httpapi.BuildIdentity {
+	if build.Version == "" {
+		build = buildinfo.Current()
+	}
+	return httpapi.BuildIdentity{Version: build.Version, Commit: build.Commit, BuildTime: build.BuildTime, ReleaseChannel: build.ReleaseChannel, RuntimeProtocolVersion: build.RuntimeProtocolVersion}
+}
+
+func buildInfoFromManifest(manifest release.Manifest) buildinfo.Info {
+	return buildinfo.Info{Version: manifest.ReleaseVersion, Commit: strings.ToLower(manifest.Commit), BuildTime: canonicalRFC3339(manifest.BuildTime), ReleaseChannel: manifest.Channel, RuntimeProtocolVersion: buildinfo.RuntimeProtocolVersion}
+}
+
+func (c *updateController) mapManifestError(err error) error {
+	if errors.Is(err, release.ErrIncompatible) {
+		return c.fail("release_incompatible")
+	}
+	return c.fail("verification_failed")
+}
+
+func (c *updateController) mapInstallError(err error, fallback string) error {
+	if errors.Is(err, release.ErrIncompatible) {
+		return c.fail("release_incompatible")
+	}
+	if errors.Is(err, release.ErrInvalidSignature) || errors.Is(err, release.ErrUnknownSigningKey) || errors.Is(err, release.ErrInvalidManifest) || errors.Is(err, release.ErrArtifactFile) || errors.Is(err, release.ErrInvalidArtifact) {
+		return c.fail("verification_failed")
+	}
+	return c.fail(fallback)
+}
+
+func (c *updateController) mapRegistryError(err error, fallback string) error {
+	if errors.Is(err, generation.ErrInvalidTransition) || errors.Is(err, generation.ErrGenerationExists) {
+		return c.fail("operation_conflict")
+	}
+	return c.fail(fallback)
+}
+
+func (c *updateController) mapLaunchError(err error, fallback string) error {
+	if errors.Is(err, supervisor.ErrCandidateNotReady) {
+		return c.fail("candidate_not_ready")
+	}
+	return c.fail(fallback)
+}
+
+func (c *updateController) fail(code string) error {
+	c.mu.Lock()
+	c.lastFailureCode = code
+	if code == "verification_failed" || code == "release_incompatible" {
+		c.verification = "failed"
+	}
+	c.mu.Unlock()
+	return httpapi.NewControllerError(code)
+}
+
+func (c *updateController) engineAttachment(id string) (engineAttachment, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	attachment, ok := c.engines[id]
+	return attachment, ok
+}
+
+func (c *updateController) supervisorEngineState(id string) supervisor.ProcessState {
+	for _, item := range c.supervisor.Snapshot().Generations {
+		if item.ID == id {
+			return item.Engine.State
+		}
+	}
+	return supervisor.ProcessExited
+}
+
+func (c *updateController) bundleExecutables() (string, map[string]string) {
+	directory := c.config.BundleDir
+	return directory, map[string]string{
+		release.RoleRecorderEngine: filepath.Join(directory, "recorder-engine"),
+		release.RoleControlPlane:   filepath.Join(directory, "control-plane"),
+	}
+}

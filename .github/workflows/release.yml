@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Verify frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm run test
+          npm run build
+      - name: Verify Go
+        run: go test -race -count=1 ./...
+      - name: Build and sign Linux release assets
+        env:
+          IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64 }}
+          IR_RELEASE_SIGNING_KEY_ID: ${{ vars.IR_RELEASE_SIGNING_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64}" ]]; then
+            echo "IR_RELEASE_SIGNING_PRIVATE_KEY_BASE64 secret is required to publish a release" >&2
+            exit 1
+          fi
+          if [[ -z "${IR_RELEASE_SIGNING_KEY_ID}" ]]; then
+            echo "IR_RELEASE_SIGNING_KEY_ID repository variable is required to publish a release" >&2
+            exit 1
+          fi
+
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          if [[ "${VERSION}" == *-* ]]; then CHANNEL=prerelease; else CHANNEL=stable; fi
+          BUILD_TIME="$(git show -s --format=%cI "${GITHUB_SHA}")"
+          mkdir -p dist
+          go build -trimpath -o dist/release-pack ./cmd/release-pack
+
+          for ARCH in amd64 arm64; do
+            export GOOS=linux GOARCH="${ARCH}" CGO_ENABLED=0
+            TARGET="linux-${ARCH}"
+            mkdir -p "dist/bin-${TARGET}"
+            LDFLAGS="-s -w -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.version=${VERSION} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.commit=${GITHUB_SHA} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.buildTime=${BUILD_TIME} -X github.com/dltkddnr04/integrated-recorder/internal/buildinfo.releaseChannel=${CHANNEL}"
+            go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/runtime-host" ./cmd/runtime-host
+            go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/control-plane" ./cmd/control-plane
+            go build -buildvcs=false -trimpath -ldflags "${LDFLAGS}" -o "dist/bin-${TARGET}/recorder-engine" ./cmd/recorder-engine
+            go build -buildvcs=false -trimpath -o "dist/bin-${TARGET}/adapter-runtime" ./cmd/adapters/owncast
+
+            dist/release-pack \
+              -version "${VERSION}" \
+              -commit "${GITHUB_SHA}" \
+              -build-time "${BUILD_TIME}" \
+              -channel "${CHANNEL}" \
+              -platform linux \
+              -architecture "${ARCH}" \
+              -key-id "${IR_RELEASE_SIGNING_KEY_ID}" \
+              -output "dist/package-${TARGET}" \
+              -runtime-host "dist/bin-${TARGET}/runtime-host" \
+              -control-plane "dist/bin-${TARGET}/control-plane" \
+              -recorder-engine "dist/bin-${TARGET}/recorder-engine" \
+              -adapter-runtime "dist/bin-${TARGET}/adapter-runtime"
+
+            cp "dist/package-${TARGET}/release.json" "dist/release-${TARGET}.json"
+            cp "dist/package-${TARGET}/release.json.sig" "dist/release-${TARGET}.json.sig"
+            for ROLE in runtime-host control-plane recorder-engine adapter-runtime; do
+              cp "dist/package-${TARGET}/${ROLE}-${TARGET}" "dist/${ROLE}-${TARGET}"
+            done
+            rm -rf "dist/bin-${TARGET}" "dist/package-${TARGET}"
+          done
+          (
+            cd dist
+            sha256sum \
+              release-linux-amd64.json release-linux-amd64.json.sig \
+              runtime-host-linux-amd64 control-plane-linux-amd64 recorder-engine-linux-amd64 adapter-runtime-linux-amd64 \
+              release-linux-arm64.json release-linux-arm64.json.sig \
+              runtime-host-linux-arm64 control-plane-linux-arm64 recorder-engine-linux-arm64 adapter-runtime-linux-arm64 \
+              > SHA256SUMS
+          )
+          rm -f dist/release-pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-linux-release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 2
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-linux-release-assets
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${TAG#v}" == *-* ]]; then
+            gh release create "${TAG}" dist/* --title "${TAG}" --generate-notes --prerelease
+          else
+            gh release create "${TAG}" dist/* --title "${TAG}" --generate-notes
+          fi

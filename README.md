@@ -31,6 +31,8 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 
 React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, 리소스 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, Preview Frame Index, 자동 녹화 Watch를 backend API에 연결합니다. Watch는 지속적인 녹화 의도이고 방송 한 회차마다 별도의 Recording을 만듭니다. `watch` capability가 없는 어댑터에는 자동 녹화 등록을 표시하지 않습니다. 첫 관리자 설정은 `<DATA_DIR>/security/bootstrap-token`을 이용합니다. FFmpeg가 설치된 경우 장면 미리보기 프레임 생성과 별도의 remux export를 제공하며 canonical 녹화 데이터는 변경하지 않습니다.
 
+운영 컨테이너는 안정된 listener를 소유하는 Runtime Host, 교체 가능한 Control Plane, segment 수집과 canonical archive를 소유하는 Recorder Engine으로 나뉩니다. 애플리케이션 release를 활성화해도 이미 녹화 중인 Engine은 살아서 작업을 마치고, 이후 시작한 녹화는 새 기본 세대를 사용합니다. Host/container 자체 교체는 별도의 유지보수 작업입니다. 세대 runtime, signed application release, rollback 동작은 [architecture 문서](docs/ARCHITECTURE.ko.md)와 [release 절차](docs/RELEASING.md)를 참고하세요.
+
 장면 미리보기는 녹화별 opt-in 파생 기능이며 기본값은 꺼져 있습니다. 각 확정된 primary track 세그먼트에는 최대 한 개의 재사용 가능한 프레임을 비동기로 생성합니다. 먼저 대상 세그먼트만 시도하고(필요한 fMP4 init object 포함), 실패할 때만 제한된 이전 세그먼트 context로 재시도합니다. FFmpeg가 느리거나 실패해도 녹화는 계속되며, 포스터·스토리보드·향후 탐색 UI는 저장된 프레임을 재사용합니다.
 
 현재 지원:
@@ -73,6 +75,8 @@ go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
 DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 ```
 
+위 `cmd/archiver`는 API/UI 개발용 monolithic 실행 경로이며 production Runtime Host의 세대 교체/전역 resource coordination을 제공하지 않습니다. 운영과 generation update는 Docker image의 `runtime-host` 실행 경로를 사용합니다.
+
 실행 후 `http://localhost:8080/`을 엽니다.
 
 Docker 설정도 포함되어 있습니다. 기본 runtime image에는 Alpine Linux의 `ffmpeg` package가 포함되어 장면 미리보기와 MKV 리먹스 파생 기능을 사용할 수 있습니다. Host 설치에서는 FFmpeg가 선택 사항이며, FFmpeg가 없어도 원본 녹화와 VOD 재생은 동작합니다. Alpine v3.21 package metadata는 `ffmpeg`의 license expression을 `GPL-2.0-or-later AND LGPL-2.1-or-later`로 표시합니다. FFmpeg upstream은 선택적 GPL 적용 구성 요소가 포함될 때 배포 조건이 달라질 수 있다고 설명합니다. 배포자는 실제 image의 package metadata와 [Alpine package record](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html)를 확인하세요.
@@ -81,7 +85,7 @@ Docker 설정도 포함되어 있습니다. 기본 runtime image에는 Alpine Li
 docker compose up --build
 ```
 
-컨테이너는 named `/data` volume을 사용하며 control API port는 host loopback에 공개합니다. Image에는 `/adapters`의 Owncast binary가 포함됩니다. 추가 executable adapter를 `./adapter-binaries`에 넣으면 `/external-adapters`에 read-only mount되며 Core를 재시작한 뒤 발견됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
+컨테이너는 named `/data` volume을 사용하며 Runtime Host listener를 host loopback에 공개합니다. Image에는 Runtime Host, initial Control/Engine release, `/adapters`의 Owncast binary가 포함됩니다. 추가 executable adapter를 `./adapter-binaries`에 넣으면 `/external-adapters`에 read-only mount되며 각 application generation 시작 시 발견됩니다. Adapter Store/adapter auto-update는 아직 지원하지 않습니다. 원격 애플리케이션 update에는 별도로 provision한 Ed25519 public trust key가 필요하며, trust key가 없는 배포는 fail-closed됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
 
 ## API
 

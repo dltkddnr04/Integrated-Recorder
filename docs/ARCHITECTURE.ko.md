@@ -8,25 +8,51 @@
 
 canonical archive는 방송사에서 받은 원본 media와 timeline을 재구성할 metadata입니다. acquisition 중 media를 decode, encode, transcode, remux하지 않습니다. Core에는 플랫폼 domain model이 없습니다. resource type, field key, adapter state, interaction data는 opaque string 또는 JSON으로 취급하고 플랫폼별 탐색은 external adapter process에 둡니다.
 
-## 실행 구조와 package 책임
+## 실행 세대와 package 책임
 
 ```text
-Browser ── HTTP API / 생성 VOD ── Core
-                                    ├─ adapterhost ── framed JSON/stdin/stdout ── adapter binary
-                                    ├─ 공통 HLS parser/acquisition
-                                    ├─ network safety policy
-                                    └─ self-describing recording directory
+Browser ── 안정된 HTTP listener ── Runtime Host
+                                     ├─ Control 세대들
+                                     │    ├─ API/UI, 인증, Watch, 설정, 관리 projection
+                                     │    ├─ preview, integrity, export, retention 조정
+                                     │    └─ 세대가 고정된 Engine IPC client
+                                     ├─ Recorder Engine 세대들
+                                     │    ├─ acquire.Manager, HLS scheduler, metadata monitor
+                                     │    ├─ canonical 녹화 기록과 terminal 상태 소유
+                                     │    └─ adapterhost ── framed JSON/stdin/stdout ── adapter binary
+                                     └─ 공유 ingest/resource 및 저장소 telemetry coordinator
 ```
 
+운영 컨테이너는 `runtime-host`를 PID 1로 실행합니다. Runtime Host는 외부 listener, release 검증/설치, 세대 process 감독, routing, lease, drain, rollback, process 간 공유 resource coordinator를 소유합니다. HLS나 recording manifest를 해석하거나 플랫폼 metadata를 이해하지 않습니다. `control-plane`은 교체 가능한 관리 API와 Watch scheduler를 소유하지만 canonical media acquisition은 소유하지 않습니다. 각 `recorder-engine`은 자기 `acquire.Manager`와 자신이 admission한 작업을 소유합니다. Control process를 교체하거나 강제 종료해도 그 Control 세대의 Engine에는 signal을 보내지 않으며, 녹화가 terminal이 될 때까지 시작 당시 Engine 세대에 고정됩니다.
+
+```text
+후보 검증 및 준비 완료
+  → 기존 Control admission 차단 및 승인된 mutation 처리
+  → active Control epoch과 안정된 route 전환
+  → 새 세대 background 작업 시작
+  → 기존 Engine 녹화가 남아 있으면 유지
+  → inventory가 비었을 때 Engine detach, 종료, 수거
+```
+
+애플리케이션 release 활성화는 이미 실행 중인 Engine을 유지하도록 설계되어 있습니다. Runtime Host, 컨테이너 이미지, 운영체제, bundled FFmpeg 교체는 별도의 유지보수 작업이며 애플리케이션 세대 업데이트의 무중단 범위에 포함되지 않습니다. Host/container 재시작은 일반 Engine 종료/시작 복구 경로를 사용합니다. Engine이 비정상 종료되면 active 녹화가 `interrupted`로 복구될 수 있습니다.
+
+Host의 `/data/runtime/state/generations.json`은 세대 상태와 recording-to-Engine lease를 보존합니다. Host는 ready Engine들의 bounded inventory와 lease를 대조한 뒤에만 세대를 retire합니다. 직전 정상 release는 rollback 대상이라 수거하지 않습니다. release directory는 immutable이며 canonical `recordings/`와 분리됩니다. 원격 artifact는 detached Ed25519 signature와 manifest의 size/SHA-256 검증을 통과해야 합니다. GitHub는 배포물 제공처이지 신뢰 기준점이 아닙니다. 호환성은 SemVer 추측이 아니라 runtime, IPC, archive, management schema 계약으로 확인합니다.
+
+Engine 세대가 겹치는 동안 기존 ingest 한도는 Host coordinator가 전역으로 적용합니다. RAM reservation, recording별 한도, pending object/byte admission, 단일 canonical writer permit을 인증된 local IPC로 공유합니다. 저장소 I/O counter와 ingest gauge도 Host의 하나의 `local-primary` metrics history로 합칩니다. Integrity, preview, export, Watch worker pool은 Control 세대 소유이며 기존 Control이 admission을 막고 이미 승인된 작업을 정리한 다음 후보가 넘겨받습니다. 다중 storage placement catalog는 추가하지 않았습니다.
+
+Control과 Engine은 protocol 버전, request ID, deadline, generation/instance identity 및 최대 frame 크기가 있는 bounded authenticated local JSON IPC를 사용합니다. application child는 public listener를 직접 열지 않습니다. Host가 새 요청을 active Control로 routing하고 handoff 중 이전 route 요청의 종료를 기다립니다. 후보가 공유 management state를 준비하는 동안 mutation이 잠시 차단되어 재시도 가능한 unavailable 응답이 올 수 있지만 외부 listener는 계속 열려 있습니다.
+
+현재 각 Control/Engine process는 자기 adapterhost에서 설정된 adapter binary를 탐색합니다. Engine은 자기 recording이 진행되는 동안 adapter process를 유지하므로 Control 교체 뒤에도 해당 Engine의 metadata/refresh 호출은 계속 가능합니다. 별도의 Host 소유 Adapter Runtime이나 Plugin Store는 아직 구현되지 않았습니다. 기존 명시적 adapter directory 설정이 계속 사용되며 adapter 세대별 설치/업데이트는 후속 작업입니다.
+
 - `internal/adapterproto` — 언어 중립 Protocol v1 envelope, descriptor/schema validation, resource, workflow, media source, refresh policy, adapter-owned state, 선택형 Watch 감지 메시지
-- `internal/adapterhost` — 명시된 adapter directory 탐색, 장기 실행 process 관리, descriptor/resource 검증, 설정 해석, workflow session 관리
+- `internal/adapterhost` — 소유 application process에서 명시된 adapter directory 탐색, 장기 실행 process 관리, descriptor/resource 검증, 설정 해석, workflow session 관리
 - `internal/watch` — 별도 durable management 저장소, bounded polling scheduler, session 중복 방지, 자동 Recording 시작/복귀
 - `internal/pluginconfig` — 사용자 설정/secret과 adapter-owned opaque state/state secret을 분리 저장. interface는 backend-neutral하며 현재 구현은 file backend
 - `internal/interaction` — 제한과 만료가 적용되는 generic interaction progress message
 - `cmd/adapters/owncast`, `internal/adapters/owncast` — 첫 번째 standalone adapter. Core는 Owncast package를 import하지 않음
-- `internal/hls` — 지원하는 HLS subset parser. `internal/acquire` — polling, refresh, retry, segment acquisition, sequence epoch, recording lifecycle
+- `internal/hls` — 지원하는 HLS subset parser. `internal/acquire` — `recorder-engine`이 소유하며 polling, refresh, retry, segment acquisition, sequence epoch, metadata 관측, recording lifecycle 처리
 - `internal/network` — public destination 검증 및 매 연결마다 검증한 주소에 고정하는 dial
-- `internal/domain` — adapter wire type과 분리된 archive type. `internal/storage` — 내구성 있는 payload와 self-describing metadata 기록. `internal/server` — API와 embedded React SPA
+- `internal/domain` — adapter wire type과 분리된 archive type. `internal/storage` — 내구성 있는 payload와 self-describing metadata 기록. `internal/server` — Control 세대 안에서 API와 embedded React SPA 제공
 
 ## Adapter process와 protocol
 
@@ -120,7 +146,9 @@ Adapter resource browsing은 protocol capability `resource_browse`를 선언한 
 
 ## 인증, settings와 파생 export
 
-기본 실행은 single administrator authentication을 활성화합니다. 초기에는 `DATA_DIR/security/bootstrap-token`의 0600 token으로 12바이트 이상 password를 설정하고 bcrypt hash만 저장합니다. Session token은 CSPRNG에서 만들고 SHA-256 key로 process memory에만 저장되므로 Core restart는 모든 session을 폐기합니다. Browser cookie는 HttpOnly, SameSite=Strict이며 mutation에는 CSRF token header가 필요합니다. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제합니다. `AUTH_DISABLED=1`은 loopback bind에서만 허용됩니다. 현재 user/role system, password reset, remote identity provider는 없습니다.
+기본 실행은 single administrator authentication을 활성화합니다. 초기에는 `DATA_DIR/security/bootstrap-token`의 0600 token으로 12바이트 이상 password를 설정하고 bcrypt hash만 저장합니다. Session token은 CSPRNG에서 생성합니다. token hash, CSRF hash, 만료 시각만 `DATA_DIR/security/sessions` 아래 별도 0600 session record로 저장하므로 Control 세대 교체 중 session과 server-side revocation을 공유합니다. Browser cookie는 HttpOnly, SameSite=Strict이며 mutation에는 CSRF token header가 필요합니다. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제합니다. `AUTH_DISABLED=1`은 loopback bind에서만 허용됩니다. 현재 user/role system, password reset, remote identity provider는 없습니다.
+
+Runtime Host는 `GET /api/runtime/update`와 인증 및 CSRF 보호가 적용된 `/check`, `/stage`, `/activate`, `/rollback` POST 작업을 처리합니다. update status는 path, PID, token, 원문 release notes를 제외하며 UI에서 텍스트로 표시하는 길이 제한된 릴리스 요약을 포함할 수 있습니다. 개발 build에서는 원격 update가 fail-closed됩니다. release 활성화는 기본 application 세대를 바꾸지만 진행 중인 Recording은 현재 Engine 세대에 남습니다. 이 API는 Runtime Host나 container image 자체를 업데이트하지 않습니다.
 
 `internal/systemsettings`는 UI theme(즉시 적용), integrity concurrency(저장 후 server restart 적용), storage/ingest 운영 한도(저장 후 restart 적용), 선택적 recording retention을 관리합니다. Storage 설정 API는 저장값과 시작 시 적용된 값을 별도로 반환하고 재시작이 필요한 항목을 표시합니다. canonical commit 순서를 보존하기 위해 writer concurrency는 현재 1만 허용합니다. Retention 기본값은 비활성화와 30일 기준입니다. 활성화하면 설정 일수보다 오래된 completed recording만 후보가 되며, tag가 하나라도 있는 recording과 integrity/derivative job 진행 중인 recording은 보호합니다. Server 시작 시 한 번, 이후 24시간마다 bounded pass를 수행하며 pass당 최대 100개를 삭제합니다. `GET /api/retention/candidates`는 미리보기이고 `POST /api/retention/run`은 명시적으로 pass를 실행합니다. Bind address, storage root, adapter directory는 read-only입니다. Settings JSON은 strict validation 및 atomic private-file replacement로 저장됩니다.
 
@@ -130,9 +158,9 @@ Recording directory는 `0700`, metadata/payload/sidecar 파일은 `0600`입니�
 
 ## Server lifecycle과 Docker
 
-SIGINT/SIGTERM에서 Core는 신규 HTTP 요청을 받지 않은 뒤 Watch scheduler를 중단하고 join한 다음 모든 recording worker를 먼저 취소하고 종료 및 durable terminal state 저장을 기다린 다음 adapter process를 종료합니다. Shutdown에는 제한 시간이 있습니다. Compose는 HTTP, Watch, worker 종료 제한 시간보다 긴 45초 grace period를 사용합니다. 실제 crash에서는 active recording이 재시작 후 `interrupted`로 표시되고 enabled Watch는 stagger/jitter를 두고 다시 조정됩니다.
+SIGINT/SIGTERM에서 Runtime Host는 안정된 listener를 닫고 child process의 제한된 종료를 감독합니다. 정상 Host/container 종료 시 Control은 새 management 작업을 막고 Watch scheduler를 종료합니다. Recorder Engine은 이미 승인된 ingest queue를 정리한 뒤 자기 recording worker와 adapter process를 닫습니다. 애플리케이션 release 활성화는 Engine을 종료하지 않습니다. Host/container 교체는 별도 유지보수입니다. Engine이 bounded shutdown을 마치지 못하거나 crash하면 active 녹화가 interrupted로 복구될 수 있습니다. Enabled Watch는 cold startup 뒤 stagger/jitter를 두고 다시 조정됩니다.
 
-Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 쓰며 control port는 host loopback에 공개합니다. Runtime image에는 Alpine v3.21 community repository의 `ffmpeg` package와 Owncast adapter가 포함됩니다. Alpine package metadata에서 해당 package의 license expression은 `GPL-2.0-or-later AND LGPL-2.1-or-later`입니다. FFmpeg upstream은 GPL 적용 optional component가 포함된 build의 licensing effect를 별도로 설명합니다. 이는 법률 자문이나 Integrated Recorder 자체 라이선스 변경을 뜻하지 않습니다. 배포자는 실제 image에 들어간 package/build 정보를 확인해야 합니다. 참고: [Alpine v3.21 ffmpeg package metadata](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html). 추가 executable adapter는 `./adapter-binaries`에 두고 `/external-adapters`에 read-only mount합니다. Compose 실행 전 executable bit를 설정해야 합니다. Core restart 후 새 binary를 발견하며 hot reload는 없습니다. Authentication을 명시적으로 disable한 배포도 loopback bind 외에는 허용하지 않습니다.
+Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 쓰며 Runtime Host listener를 host loopback에 공개합니다. Image에는 Runtime Host와 immutable 초기 Control/Engine release가 `/opt/integrated-recorder/initial` 아래 포함됩니다. 기존 `/data/recordings`, `/data/management`, `/data/security`는 그대로 사용하고, generation registry, runtime credential, 설치 release는 `/data/runtime`에 추가됩니다. Runtime image에는 Alpine v3.21 community repository의 `ffmpeg` package와 `/adapters`의 Owncast adapter도 포함됩니다. Alpine package metadata에서 해당 package의 license expression은 `GPL-2.0-or-later AND LGPL-2.1-or-later`입니다. FFmpeg upstream은 GPL 적용 optional component가 포함된 build의 licensing effect를 별도로 설명합니다. 이는 법률 자문이나 Integrated Recorder 자체 라이선스 변경을 뜻하지 않습니다. 배포자는 실제 image의 package/build 정보를 확인해야 합니다. 참고: [Alpine v3.21 ffmpeg package metadata](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg), [FFmpeg legal considerations](https://ffmpeg.org/legal.html). 추가 executable adapter는 `./adapter-binaries`에 두고 `/external-adapters`에 read-only mount합니다. 각 Control/Engine은 시작 시 설정된 directory를 탐색합니다. 이번 update milestone은 adapter plugin을 hot-install하거나 업데이트하지 않습니다. Authentication을 명시적으로 disable한 배포도 loopback bind 외에는 허용하지 않습니다.
 
 ## Playback과 의도적으로 미구현인 항목
 
@@ -144,7 +172,7 @@ Container는 UID 10001로 실행합니다. Compose는 named `/data` volume을 �
 
 관리 UI는 `web/`의 React 19 + TypeScript SPA입니다. Vite, Tailwind, shadcn 스타일의 Radix UI components, TanStack Query/Router/Table, Lucide, hls.js를 사용합니다. API 호출과 CSRF 처리는 공통 client에 모이며, 서버 상태는 TanStack Query가 관리합니다. 브라우저는 같은 출처의 `/api`를 사용하고 VOD 재생에 필요한 hls.js는 bundle에 포함됩니다.
 
-개발 시 Go API와 Vite를 별도 터미널에서 실행합니다:
+기존 monolithic local development command는 Go API와 Vite를 별도 터미널에서 실행합니다. API/UI 개발에 쓸 수 있지만 Runtime Host 세대 업데이트나 process 간 전역 resource coordinator를 제공하지는 않습니다.
 
 ```sh
 go run ./cmd/archiver

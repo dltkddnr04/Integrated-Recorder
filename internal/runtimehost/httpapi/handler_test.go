@@ -1,0 +1,338 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+)
+
+type fakeController struct {
+	status Status
+	err    error
+	calls  map[string]int
+}
+
+func (f *fakeController) call(name string) (Status, error) {
+	if f.calls == nil {
+		f.calls = make(map[string]int)
+	}
+	f.calls[name]++
+	return f.status, f.err
+}
+
+func (f *fakeController) Status(context.Context) (Status, error)   { return f.call("status") }
+func (f *fakeController) Check(context.Context) (Status, error)    { return f.call("check") }
+func (f *fakeController) Stage(context.Context) (Status, error)    { return f.call("stage") }
+func (f *fakeController) Activate(context.Context) (Status, error) { return f.call("activate") }
+func (f *fakeController) Rollback(context.Context) (Status, error) { return f.call("rollback") }
+
+type authFixture struct {
+	service *authn.Service
+	session authn.Session
+}
+
+var (
+	fixtureOnce sync.Once
+	fixture     authFixture
+	fixtureErr  error
+)
+
+func testAuth(t *testing.T) authFixture {
+	t.Helper()
+	fixtureOnce.Do(func() {
+		root, err := os.MkdirTemp("", "runtime-httpapi-auth-")
+		if err != nil {
+			fixtureErr = err
+			return
+		}
+		service, err := authn.Open(root)
+		if err != nil {
+			fixtureErr = err
+			return
+		}
+		bootstrapPath := filepath.Join(root, filepath.FromSlash(service.BootstrapTokenRelativePath()))
+		token, err := os.ReadFile(bootstrapPath)
+		if err != nil {
+			fixtureErr = err
+			return
+		}
+		if err := service.Bootstrap(strings.TrimSpace(string(token)), "runtime-httpapi-test-password"); err != nil {
+			fixtureErr = err
+			return
+		}
+		session, err := service.Login("runtime-httpapi-test-password")
+		if err != nil {
+			fixtureErr = err
+			return
+		}
+		fixture = authFixture{service: service, session: session}
+	})
+	if fixtureErr != nil {
+		t.Fatalf("initialize auth fixture: %v", fixtureErr)
+	}
+	return fixture
+}
+
+func validStatus() Status {
+	return Status{
+		Host:                    BuildIdentity{Version: "1.2.3", Commit: strings.Repeat("a", 40), BuildTime: "2026-09-30T01:02:03Z", ReleaseChannel: "stable", RuntimeProtocolVersion: 1},
+		Application:             BuildIdentity{Version: "1.2.3", Commit: strings.Repeat("a", 40), BuildTime: "2026-09-30T01:02:03Z", ReleaseChannel: "stable", RuntimeProtocolVersion: 1},
+		ActiveControl:           &GenerationSummary{ID: strings.Repeat("a", 32), Version: "1.2.3", Commit: strings.Repeat("a", 40), InstalledAt: time.Date(2026, 9, 30, 1, 2, 3, 0, time.UTC), State: "active", ActiveRecordings: 1},
+		DefaultEngine:           &GenerationSummary{ID: strings.Repeat("a", 32), Version: "1.2.3", Commit: strings.Repeat("a", 40), InstalledAt: time.Date(2026, 9, 30, 1, 2, 3, 0, time.UTC), State: "active", ActiveRecordings: 1},
+		ActiveGenerations:       []GenerationSummary{},
+		DrainingGenerations:     []GenerationSummary{},
+		VerificationState:       "verified",
+		UpdateUnavailableReason: "",
+	}
+}
+
+func TestRoutesDispatchAndFallback(t *testing.T) {
+	controller := &fakeController{status: validStatus()}
+	fallbackCalls := 0
+	api, err := New(nil, true, false, controller, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbackCalls++
+		w.WriteHeader(http.StatusTeapot)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{
+		{http.MethodGet, Endpoint, http.StatusOK},
+		{http.MethodPost, checkPath, http.StatusOK},
+		{http.MethodPost, stagePath, http.StatusOK},
+		{http.MethodPost, activatePath, http.StatusOK},
+		{http.MethodPost, rollbackPath, http.StatusOK},
+		{http.MethodPost, Endpoint, http.StatusTeapot},
+		{http.MethodGet, checkPath, http.StatusTeapot},
+		{http.MethodGet, Endpoint + "/unknown", http.StatusTeapot},
+	} {
+		recorder := httptest.NewRecorder()
+		api.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path, nil))
+		if recorder.Code != tc.want {
+			t.Errorf("%s %s status = %d, want %d", tc.method, tc.path, recorder.Code, tc.want)
+		}
+	}
+	if fallbackCalls != 3 {
+		t.Fatalf("fallback calls = %d, want 3", fallbackCalls)
+	}
+	for _, name := range []string{"status", "check", "stage", "activate", "rollback"} {
+		if controller.calls[name] != 1 {
+			t.Errorf("controller %s calls = %d, want 1", name, controller.calls[name])
+		}
+	}
+}
+
+func TestStatusGETRequiresAuthenticationButNotCSRF(t *testing.T) {
+	fixture := testAuth(t)
+	controller := &fakeController{status: validStatus()}
+	api, err := New(fixture.service, false, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthenticated := httptest.NewRecorder()
+	api.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, Endpoint, nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET status = %d", unauthenticated.Code)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, Endpoint, nil)
+	request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: fixture.session.Token})
+	recorder := httptest.NewRecorder()
+	api.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("authenticated GET without CSRF status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var got Status
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode status response: %v", err)
+	}
+	if got.Host.Version != "1.2.3" || got.ActiveControl == nil || got.ActiveControl.ActiveRecordings != 1 {
+		t.Fatalf("unexpected status DTO: %+v", got)
+	}
+	if strings.Contains(recorder.Body.String(), "/") && strings.Contains(recorder.Body.String(), "tmp") {
+		t.Fatalf("status leaked path-like content: %s", recorder.Body.String())
+	}
+}
+
+func TestEveryPostRequiresAuthenticationAndCSRF(t *testing.T) {
+	fixture := testAuth(t)
+	controller := &fakeController{status: validStatus()}
+	api, err := New(fixture.service, false, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{checkPath, stagePath, activatePath, rollbackPath} {
+		unauthenticated := httptest.NewRecorder()
+		api.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodPost, path, nil))
+		if unauthenticated.Code != http.StatusUnauthorized {
+			t.Errorf("POST %s without auth status = %d", path, unauthenticated.Code)
+		}
+
+		request := httptest.NewRequest(http.MethodPost, path, nil)
+		request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: fixture.session.Token})
+		noCSRF := httptest.NewRecorder()
+		api.ServeHTTP(noCSRF, request)
+		if noCSRF.Code != http.StatusForbidden {
+			t.Errorf("POST %s without CSRF status = %d", path, noCSRF.Code)
+		}
+
+		request = httptest.NewRequest(http.MethodPost, path, nil)
+		request.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: fixture.session.Token})
+		request.Header.Set("X-CSRF-Token", fixture.session.CSRFToken)
+		allowed := httptest.NewRecorder()
+		api.ServeHTTP(allowed, request)
+		if allowed.Code != http.StatusOK {
+			t.Errorf("POST %s with auth+CSRF status = %d, body=%s", path, allowed.Code, allowed.Body.String())
+		}
+	}
+}
+
+func TestPostBodyIsEmptyOrEmptyJSONObjectAndBounded(t *testing.T) {
+	controller := &fakeController{status: validStatus()}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		body        string
+		contentType string
+		want        int
+	}{
+		{"", "", http.StatusOK},
+		{" \n\t", "", http.StatusOK},
+		{"{}", "application/json", http.StatusOK},
+		{" { } ", "application/json; charset=utf-8", http.StatusOK},
+		{`{"activate":true}`, "application/json", http.StatusBadRequest},
+		{"[]", "application/json", http.StatusBadRequest},
+		{"{}", "text/plain", http.StatusBadRequest},
+		{strings.Repeat(" ", MaxRequestBody+1), "", http.StatusBadRequest},
+	} {
+		request := httptest.NewRequest(http.MethodPost, stagePath, strings.NewReader(tc.body))
+		if tc.contentType != "" {
+			request.Header.Set("Content-Type", tc.contentType)
+		}
+		recorder := httptest.NewRecorder()
+		api.ServeHTTP(recorder, request)
+		if recorder.Code != tc.want {
+			t.Errorf("body %q content-type %q status = %d, want %d", tc.body[:min(len(tc.body), 32)], tc.contentType, recorder.Code, tc.want)
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, stagePath, strings.NewReader("{}"))
+	request.ContentLength = MaxRequestBody + 1
+	recorder := httptest.NewRecorder()
+	api.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("oversized declared body status = %d", recorder.Code)
+	}
+}
+
+func TestControllerInvocationAndErrorMapping(t *testing.T) {
+	controller := &fakeController{status: validStatus()}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, checkPath, nil))
+	if controller.calls["check"] != 1 {
+		t.Fatalf("check calls = %d", controller.calls["check"])
+	}
+
+	controller.err = NewControllerError("verification_failed")
+	recorder := httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, stagePath, nil))
+	if recorder.Code != http.StatusUnprocessableEntity || !strings.Contains(recorder.Body.String(), "verification_failed") {
+		t.Fatalf("safe controller error response = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	controller.err = errors.New("open /private/runtime/token?signature=sensitive failed")
+	recorder = httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, stagePath, nil))
+	if recorder.Code != http.StatusInternalServerError || strings.Contains(recorder.Body.String(), "private") || strings.Contains(recorder.Body.String(), "sensitive") {
+		t.Fatalf("arbitrary controller error was exposed: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	controller.err = &ControllerError{StatusCode: http.StatusInternalServerError, Code: "internal_error", Message: "/tmp/key"}
+	recorder = httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, stagePath, nil))
+	if recorder.Code != http.StatusInternalServerError || strings.Contains(recorder.Body.String(), "/tmp/key") {
+		t.Fatalf("malformed typed controller error was exposed: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestUnsafeStatusRejectedAndHeadersAlwaysSet(t *testing.T) {
+	controller := &fakeController{status: validStatus()}
+	api, err := New(nil, true, true, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.status.Application.Version = "/data/runtime/releases/secret"
+	recorder := httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, Endpoint, nil))
+	if recorder.Code != http.StatusInternalServerError || strings.Contains(recorder.Body.String(), "/data") {
+		t.Fatalf("unsafe status was exposed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	assertJSONSecurityHeaders(t, recorder)
+
+	controller.status = validStatus()
+	controller.status.AvailableRelease = &ReleaseSummary{
+		Version: "1.3.0", Commit: strings.Repeat("b", 40), BuildTime: "2026-09-30T01:02:03Z",
+		ReleaseChannel: "stable", NotesSummary: "literal <img src=x> release text",
+	}
+	controller.status.UpdatesAvailable = true
+	recorder = httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, Endpoint, nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `\u003cimg`) {
+		t.Fatalf("bounded release summary was not safely JSON-encoded: %d %s", recorder.Code, recorder.Body.String())
+	}
+	controller.status.AvailableRelease.NotesSummary = strings.Repeat("x", 513)
+	recorder = httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, Endpoint, nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("oversized release summary status = %d, want 500", recorder.Code)
+	}
+	controller.status = validStatus()
+	recorder = httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, Endpoint, nil))
+	assertJSONSecurityHeaders(t, recorder)
+}
+
+func TestInvalidDependenciesRejected(t *testing.T) {
+	controller := &fakeController{status: validStatus()}
+	if _, err := New(nil, false, false, controller, http.NotFoundHandler()); err == nil {
+		t.Fatal("New accepted missing auth service in auth-enabled mode")
+	}
+	if _, err := New(nil, true, false, controller, nil); err == nil {
+		t.Fatal("New accepted nil fallback")
+	}
+	if _, err := New(nil, true, false, nil, http.NotFoundHandler()); err == nil {
+		t.Fatal("New accepted nil controller")
+	}
+}
+
+func assertJSONSecurityHeaders(t *testing.T, recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := recorder.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q", got)
+	}
+	if got := recorder.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q", got)
+	}
+}

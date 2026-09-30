@@ -31,6 +31,8 @@ Adapters declare input/settings schemas and may discover opaque resources or sus
 
 Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, the Preview Frame Index, and automatic recording Watches to backend APIs. A Watch is a durable recording intent; each detected broadcast becomes a separate Recording. Automatic recording is shown only for adapters that declare the `watch` capability. First-run administrator setup uses `<DATA_DIR>/security/bootstrap-token`. If FFmpeg is available, segment preview generation and separate remux exports are offered without changing the canonical recording.
 
+The production container separates a stable-listener Runtime Host, replaceable Control Plane, and Recorder Engine that owns segment acquisition and canonical archive writes. Activating an application release leaves existing Engine generations running until their recordings finish; new recordings use the new default generation. Replacing the Host/container itself is a separate maintenance operation. See the [architecture](docs/ARCHITECTURE.md) and [release process](docs/RELEASING.md) for generation and signed-release behavior.
+
 Scene previews are an opt-in derivative per recording and default to disabled. A background service produces at most one reusable frame for each committed primary-track segment. It first tries the target segment alone (including the required fMP4 init object); only after decode failure does it stage bounded prior-segment context. Posters, storyboards, and future navigation views reuse the stored frames, and slow or failed FFmpeg work never blocks acquisition.
 
 Currently supported:
@@ -73,6 +75,8 @@ go build -o adapters/integrated-recorder-adapter-owncast ./cmd/adapters/owncast
 DATA_DIR=./data ADAPTER_DIR=./adapters ADDR=127.0.0.1:8080 go run ./cmd/archiver
 ```
 
+`cmd/archiver` is the monolithic local development path and does not provide production Runtime Host generation updates or cross-process global resource coordination. Production deployment and application updates use the Docker image's `runtime-host` entrypoint.
+
 Then open `http://localhost:8080/`.
 
 Docker configuration is included. The standard runtime image includes Alpine Linux's `ffmpeg` package for scene previews and MKV remux derivatives. Host installations do not require FFmpeg; canonical recording and VOD playback work without it. Alpine v3.21 package metadata identifies the `ffmpeg` license expression as `GPL-2.0-or-later AND LGPL-2.1-or-later`. FFmpeg upstream notes that optional GPL-covered components can affect distribution licensing. Before redistribution, check the exact image package metadata and the [Alpine package record](https://pkgs.alpinelinux.org/package/v3.21/community/x86/ffmpeg) and [FFmpeg legal considerations](https://ffmpeg.org/legal.html).
@@ -81,7 +85,7 @@ Docker configuration is included. The standard runtime image includes Alpine Lin
 docker compose up --build
 ```
 
-The container uses a named `/data` volume and publishes the control API on host loopback. The image includes Owncast under `/adapters`; place extra executable adapters in `./adapter-binaries`, mounted read-only at `/external-adapters`, then restart Core to discover them. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
+The container uses a named `/data` volume and publishes the Runtime Host listener on host loopback. The image includes the Runtime Host, initial Control/Engine release, and Owncast under `/adapters`; extra executable adapters in `./adapter-binaries` are mounted read-only at `/external-adapters` and discovered when each application generation starts. An Adapter Store/adapter auto-update is not implemented yet. Remote application updates require a separately provisioned Ed25519 public trust key; deployments without one fail closed. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
 
 ## API
 

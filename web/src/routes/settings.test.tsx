@@ -1,10 +1,10 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { dashboardAPI, productAPI } from '@/api'
+import { dashboardAPI, productAPI, runtimeUpdateAPI } from '@/api'
 import { ToastProvider } from '@/components/ui/toast'
 import { APIError } from '@/api/client'
-import type { StorageSettings, SystemSettings } from '@/types/api'
+import type { RuntimeUpdateStatus, StorageSettings, SystemSettings } from '@/types/api'
 import { SettingsPage } from './settings'
 
 const storageDefaults: StorageSettings = {
@@ -20,6 +20,18 @@ const settingsDefaults: SystemSettings = {
 }
 const storageInfo = { archive_root: '', filesystem_total_bytes: 0, filesystem_used_bytes: 0, filesystem_available_bytes: 0, recordings_bytes: 0, recording_count: 0, segment_count: 0, init_segment_count: 0, manifest_count: 0 }
 const systemInfo = { version: 'test', commit: 'test', go_version: 'go', goos: 'linux', goarch: 'amd64', started_at: '2026-09-29T00:00:00Z', uptime_seconds: 1, export_available: false }
+const runtimeIdentity = { version: '1.0.0', commit: 'abcdef0123456789', build_time: '2026-09-28T12:00:00Z', release_channel: 'stable', runtime_protocol_version: 1 }
+const updateStatus: RuntimeUpdateStatus = {
+  host: runtimeIdentity,
+  application: runtimeIdentity,
+  active_control: { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', version: '1.0.0', commit: runtimeIdentity.commit, installed_at: runtimeIdentity.build_time, state: 'active', active_recordings: 0 },
+  default_engine: { id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', version: '1.0.0', commit: runtimeIdentity.commit, installed_at: runtimeIdentity.build_time, state: 'active', active_recordings: 2 },
+  active_generations: [{ id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', version: '1.0.0', commit: runtimeIdentity.commit, installed_at: runtimeIdentity.build_time, state: 'active', active_recordings: 2 }],
+  draining_generations: [],
+  available_release: { version: '1.1.0', commit: '123456789abcdef0', build_time: '2026-09-29T12:00:00Z', release_channel: 'stable', notes_summary: '변경 사항 <img src=x onerror=alert(1)>' },
+  previous_release: { version: '0.9.0', commit: '1234567abcdef012', build_time: '2026-09-20T12:00:00Z', release_channel: 'stable' },
+  verification_state: 'not_checked', updates_available: true,
+}
 
 function renderSettings() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
@@ -33,6 +45,11 @@ beforeEach(() => {
   vi.spyOn(productAPI, 'retentionCandidates').mockResolvedValue({ enabled: false, candidate_count: 0, candidates: [] })
   vi.spyOn(dashboardAPI, 'storage').mockResolvedValue(storageInfo)
   vi.spyOn(dashboardAPI, 'info').mockResolvedValue(systemInfo)
+  vi.spyOn(runtimeUpdateAPI, 'status').mockResolvedValue(structuredClone(updateStatus))
+  vi.spyOn(runtimeUpdateAPI, 'check').mockResolvedValue(structuredClone(updateStatus))
+  vi.spyOn(runtimeUpdateAPI, 'stage').mockResolvedValue({ ...structuredClone(updateStatus), staged_release: updateStatus.available_release, verification_state: 'verified' })
+  vi.spyOn(runtimeUpdateAPI, 'activate').mockResolvedValue({ ...structuredClone(updateStatus), application: { ...runtimeIdentity, version: '1.1.0', commit: '123456789abcdef0' }, staged_release: undefined, verification_state: 'verified' })
+  vi.spyOn(runtimeUpdateAPI, 'rollback').mockResolvedValue({ ...structuredClone(updateStatus), application: runtimeIdentity, staged_release: undefined })
   vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() })))
 })
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
@@ -87,5 +104,56 @@ describe('storage ingest settings UI', () => {
     fireEvent.change(screen.getByLabelText('녹화별 버퍼 한도'), { target: { value: '1100' } })
     fireEvent.click(screen.getByRole('button', { name: '수집·저장 설정 저장' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('녹화별 버퍼 한도는 전체 버퍼 한도보다 클 수 없습니다.')
+  })
+})
+
+describe('runtime update settings UI', () => {
+  function openUpdatesTab() { fireEvent.click(screen.getByRole('tab', { name: '업데이트' })) }
+
+  it('loads release state, runs update actions and refreshes the displayed status', async () => {
+    const { container } = renderSettings()
+    openUpdatesTab()
+    expect(await screen.findByRole('heading', { name: '애플리케이션 업데이트' })).toBeInTheDocument()
+    await waitFor(() => expect(runtimeUpdateAPI.status).toHaveBeenCalledTimes(1))
+    expect(screen.getAllByText('1.0.0').length).toBeGreaterThan(0)
+    expect(screen.getByText('1.1.0')).toBeInTheDocument()
+    expect(screen.getByText('녹화 2개')).toBeInTheDocument()
+    expect(screen.getByText('변경 사항 <img src=x onerror=alert(1)>')).toBeInTheDocument()
+    expect(container.querySelector('img[src="x"]')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
+    await waitFor(() => expect(runtimeUpdateAPI.check).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: '다운로드 및 검증' }))
+    expect(await screen.findByText('검증 상태 · 검증 완료')).toBeInTheDocument()
+    await waitFor(() => expect(runtimeUpdateAPI.stage).toHaveBeenCalledTimes(1))
+
+    const activate = screen.getByRole('button', { name: '활성화' })
+    expect(activate).toBeEnabled()
+    fireEvent.click(activate)
+    await waitFor(() => expect(runtimeUpdateAPI.activate).toHaveBeenCalledTimes(1))
+    expect(screen.getAllByText('1.1.0').length).toBeGreaterThan(0)
+
+    fireEvent.click(screen.getByRole('button', { name: '이전 버전으로 롤백' }))
+    await waitFor(() => expect(runtimeUpdateAPI.rollback).toHaveBeenCalledTimes(1))
+  })
+
+  it('shows update action errors', async () => {
+    vi.mocked(runtimeUpdateAPI.check).mockRejectedValue(new APIError(502, '업데이트 확인에 실패했습니다.'))
+    renderSettings()
+    openUpdatesTab()
+    await screen.findByText('1.1.0')
+    fireEvent.click(screen.getByRole('button', { name: '업데이트 확인' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('업데이트 확인에 실패했습니다.')
+  })
+
+  it('shows unavailable reason and disables update operations for a development build', async () => {
+    vi.mocked(runtimeUpdateAPI.status).mockResolvedValue({ ...structuredClone(updateStatus), application: { ...runtimeIdentity, version: 'dev', commit: 'unknown', build_time: 'unknown', release_channel: 'development' }, update_unavailable_reason: 'development_build' })
+    renderSettings()
+    openUpdatesTab()
+    expect(await screen.findByText('개발 빌드에서는 애플리케이션 업데이트를 사용할 수 없습니다.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '업데이트 확인' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '다운로드 및 검증' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '활성화' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '이전 버전으로 롤백' })).toBeDisabled()
   })
 })
