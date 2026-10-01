@@ -23,7 +23,7 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
-Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. 새 adapter binary를 발견하려면 Core를 재시작해야 하며 설치된 adapter는 신뢰된 로컬 코드로 실행됩니다. 기본 file secret store는 권한이 제한되지만 저장 시 암호화되지 않습니다.
+Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. Runtime Host가 설정된 source directory를 주기적으로 확인해 새 executable을 검증·import하고 새 immutable adapter-set generation을 활성화하므로 Host나 container를 재시작할 필요가 없습니다. 부분 복사를 피하려면 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 최종 이름으로 atomic rename하세요. 기존 녹화는 시작 당시 adapter generation을 유지합니다. 설치된 adapter는 신뢰된 로컬 코드로 실행되며 remote Plugin Store는 아직 제공되지 않습니다. 기본 file secret store는 권한이 제한되지만 저장 시 암호화되지 않습니다.
 
 ## 현재 상태
 
@@ -91,7 +91,7 @@ docker compose up -d
 docker compose exec archiver runtime-host setup-code
 ```
 
-컨테이너는 named `/data` volume을 사용하며 Runtime Host listener를 host loopback에 공개합니다. Image에는 Runtime Host, initial Control/Engine release, `/adapters`의 Owncast binary가 포함됩니다. 추가 executable adapter를 `./adapter-binaries`에 넣으면 `/external-adapters`에 read-only mount되며 각 application generation 시작 시 발견됩니다. Adapter Store/adapter auto-update는 아직 지원하지 않습니다. 원격 애플리케이션 update에는 별도로 provision한 Ed25519 public trust key가 필요하며, trust key가 없는 배포는 fail-closed됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
+컨테이너는 named `/data` volume을 사용하며 Runtime Host listener를 host loopback에 공개합니다. Image에는 Runtime Host, initial Control/Engine release, `/adapters`의 Owncast binary가 포함됩니다. 추가 executable adapter를 `./adapter-binaries`에 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 이름으로 atomic rename하면 `/external-adapters` read-only mount를 Runtime Host가 자동으로 확인·검증하고 새 immutable adapter set을 활성화합니다. Host나 container를 재시작할 필요가 없으며 이미 진행 중인 녹화는 시작 당시 Engine/adapter generation을 계속 사용합니다. Plugin Store, 원격 plugin download/signing, adapter auto-update는 아직 지원하지 않습니다. 원격 애플리케이션 update에는 별도로 provision한 Ed25519 public trust key가 필요하며, trust key가 없는 배포는 fail-closed됩니다. 인증 없는 control API는 신뢰하는 host/private network 또는 인증 reverse proxy 안에서만 사용하고 untrusted network에 직접 공개하지 마세요.
 
 ## API
 

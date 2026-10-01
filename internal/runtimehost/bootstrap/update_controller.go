@@ -15,9 +15,11 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/leases"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
@@ -56,6 +58,13 @@ type engineDrainRegistrar interface {
 	register(string, string, string, string) error
 }
 
+type hostAdapterCatalog interface {
+	Reconcile(context.Context, string) (adaptercatalog.Snapshot, error)
+	Empty() (adaptercatalog.Snapshot, error)
+	Load(string) (adaptercatalog.Snapshot, error)
+	Collect([]string) error
+}
+
 // EngineDetacher removes a confirmed-idle Engine from the running active
 // Control's runtime catalog before the Host retires that Engine process.
 type EngineDetacher interface {
@@ -67,6 +76,7 @@ type EngineDetacher interface {
 type engineAttachment struct {
 	generationID string
 	releaseDir   string
+	adapterSetID string
 	socketPath   string
 	tokenPath    string
 	instanceID   string
@@ -78,6 +88,8 @@ type updateControllerOptions struct {
 	HostBuild         buildinfo.Info
 	ApplicationBuild  buildinfo.Info
 	Registry          *generation.Registry
+	AdapterCatalog    hostAdapterCatalog
+	Installation      *installation.Store
 	Supervisor        updateSupervisor
 	Readiness         readinessRegistrar
 	Lifecycle         lifecycleRegistrar
@@ -103,6 +115,8 @@ type updateController struct {
 	hostBuild         buildinfo.Info
 	applicationBuild  buildinfo.Info
 	registry          *generation.Registry
+	adapterCatalog    hostAdapterCatalog
+	installation      *installation.Store
 	supervisor        updateSupervisor
 	readiness         readinessRegistrar
 	lifecycle         lifecycleRegistrar
@@ -190,7 +204,8 @@ func newUpdateController(options updateControllerOptions) (*updateController, er
 	}
 	c := &updateController{
 		config: options.Config, hostBuild: options.HostBuild, applicationBuild: options.ApplicationBuild,
-		registry: options.Registry, supervisor: options.Supervisor, readiness: options.Readiness,
+		registry: options.Registry, adapterCatalog: options.AdapterCatalog, installation: options.Installation,
+		supervisor: options.Supervisor, readiness: options.Readiness,
 		lifecycle: options.Lifecycle, drain: options.Drain, engineDetacher: options.EngineDetacher, coordinator: options.Coordinator,
 		installer: options.Installer, trustedKeys: keys, compatibility: options.Compatibility,
 		sourceFactory: options.SourceFactory, resourceSocket: options.ResourceSocket,
@@ -319,13 +334,18 @@ func (c *updateController) Stage(ctx context.Context) (httpapi.Status, error) {
 	if manifest == nil || !reflect.DeepEqual(*manifest, installed.Manifest) {
 		return httpapi.Status{}, c.fail("verification_failed")
 	}
+	activeGeneration, hasActive := snapshot.Generations[snapshot.ActiveGenerationID]
+	if !hasActive || activeGeneration.State != generation.StateActive {
+		return httpapi.Status{}, httpapi.NewControllerError("stage_failed")
+	}
 	genID, err := newGenerationID()
 	if err != nil {
 		return httpapi.Status{}, c.fail("internal_error")
 	}
 	newGeneration := generation.Generation{
 		ID: genID, Version: installed.Manifest.ReleaseVersion, Commit: strings.ToLower(installed.Manifest.Commit),
-		InstalledAt: time.Now().UTC(), State: generation.StateStaging,
+		AdapterSetID: activeGeneration.AdapterSetID,
+		InstalledAt:  time.Now().UTC(), State: generation.StateStaging,
 		ControlProtocol: installed.Manifest.ControlProtocolVersion, EngineProtocol: installed.Manifest.EngineProtocolVersion,
 		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: installed.Manifest.ArchiveReadMinimum, Maximum: installed.Manifest.ArchiveReadMaximum},
 		ArchiveWriteEpoch:        installed.Manifest.ArchiveWriteEpoch,
@@ -515,6 +535,167 @@ func (c *updateController) Rollback(ctx context.Context) (httpapi.Status, error)
 	_ = rollbackErr
 	_ = c.supervisor.StopControl(context.Background(), previousID)
 	return httpapi.Status{}, httpapi.NewControllerError("rollback_failed")
+}
+
+// ReconcileAdapters imports the configured trusted-local sources and, when
+// their immutable set changes, activates a new application generation bound to
+// that set. It shares the update gate so a release tuple cannot be mixed.
+func (c *updateController) ReconcileAdapters(ctx context.Context) (httpapi.AdapterReconcileResult, error) {
+	if ctx == nil {
+		return httpapi.AdapterReconcileResult{}, httpapi.NewControllerError("internal_error")
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+	result, _, err := c.reconcileAdapters(operationCtx, true)
+	return result, err
+}
+
+// reconcileAdaptersIfIdle is used only by the periodic Host loop. It skips a
+// tick when an update, lease reconciliation, or explicit adapter operation
+// already owns the common controller gate.
+func (c *updateController) reconcileAdaptersIfIdle(ctx context.Context) (bool, error) {
+	_, ran, err := c.reconcileAdapters(ctx, false)
+	return ran, err
+}
+
+func (c *updateController) reconcileAdapters(ctx context.Context, wait bool) (httpapi.AdapterReconcileResult, bool, error) {
+	if ctx == nil {
+		return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("internal_error")
+	}
+	if c.installation == nil || c.installation.Snapshot().State != installation.StateReady {
+		return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("installation_incomplete")
+	}
+	if c.adapterCatalog == nil {
+		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, false, nil
+	}
+	if err := c.lockOperation(ctx, wait); err != nil {
+		if !wait {
+			return httpapi.AdapterReconcileResult{}, false, nil
+		}
+		return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("operation_conflict")
+	}
+	defer c.releaseOperation()
+	if err := ctx.Err(); err != nil {
+		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, true, nil
+	}
+
+	registryState := c.registry.Snapshot()
+	active, exists := registryState.Generations[registryState.ActiveGenerationID]
+	if !exists || active.State != generation.StateActive {
+		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, true, nil
+	}
+	// A staged application release already owns the single candidate slot. Do
+	// not reconcile the catalog first: importing a changed adapter set can
+	// publish immutable artifacts even though it cannot be attached to another
+	// staged generation. Explicit requests report a conflict; the periodic loop
+	// simply waits for the staged operation to finish.
+	if registryState.StagedGenerationID != "" {
+		if wait {
+			return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("operation_conflict")
+		}
+		return httpapi.AdapterReconcileResult{}, false, nil
+	}
+	fallbackSetID := active.AdapterSetID
+	if fallbackSetID == "" {
+		empty, err := c.adapterCatalog.Empty()
+		if err != nil {
+			return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, true, nil
+		}
+		fallbackSetID = empty.ID
+	}
+	selected, err := c.adapterCatalog.Reconcile(ctx, fallbackSetID)
+	if err != nil {
+		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, true, nil
+	}
+	activeCount := 0
+	if active.AdapterSetID != "" {
+		if current, loadErr := c.adapterCatalog.Load(active.AdapterSetID); loadErr == nil {
+			activeCount = len(current.Entries)
+		}
+	}
+	if selected.ID == active.AdapterSetID {
+		state := "unchanged"
+		if selected.RejectedCount > 0 {
+			state = "rejected"
+		}
+		return httpapi.AdapterReconcileResult{State: state, ActiveAdapterCount: activeCount, RejectedCount: selected.RejectedCount}, true, nil
+	}
+	genID, err := newGenerationID()
+	if err != nil {
+		return httpapi.AdapterReconcileResult{State: "failed", ActiveAdapterCount: activeCount, FailureCode: "reconcile_failed"}, true, nil
+	}
+	candidate := active
+	candidate.ID = genID
+	candidate.AdapterSetID = selected.ID
+	candidate.InstalledAt = time.Now().UTC()
+	candidate.State = generation.StateStaging
+	candidate.EngineDormant = false
+	if err := c.registry.Stage(candidate); err != nil {
+		return httpapi.AdapterReconcileResult{State: "failed", ActiveAdapterCount: activeCount, FailureCode: "reconcile_failed"}, true, nil
+	}
+	if err := c.registry.MarkVerified(genID); err != nil {
+		_ = c.registry.Fail(genID)
+		return httpapi.AdapterReconcileResult{State: "failed", ActiveAdapterCount: activeCount, FailureCode: "reconcile_failed"}, true, nil
+	}
+	directory, manifest, paths, err := c.applicationFiles(active)
+	if err != nil {
+		c.failCandidate(ctx, genID)
+		return httpapi.AdapterReconcileResult{State: "failed", ActiveAdapterCount: activeCount, FailureCode: "candidate_not_ready"}, true, nil
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, c.operationTimeout)
+	defer cancel()
+	attachment, err := c.startEngine(operationCtx, genID, directory, manifest, paths)
+	if err == nil {
+		err = c.registerEngine(genID, attachment)
+	}
+	if err == nil {
+		err = c.publishControl(operationCtx, genID, directory, manifest, paths, genID)
+	}
+	if err == nil {
+		err = c.registry.MarkReady(genID)
+	}
+	if err != nil {
+		c.failCandidate(operationCtx, genID)
+		return httpapi.AdapterReconcileResult{State: "failed", ActiveAdapterCount: activeCount, FailureCode: "candidate_not_ready"}, true, nil
+	}
+	activationErr := c.supervisor.ActivateControlWith(operationCtx, genID,
+		func() error { return c.registry.Activate(genID) },
+		func() error { return c.registry.AbortActivation(genID, active.ID) },
+	)
+	current := c.registry.Snapshot()
+	if current.ActiveGenerationID != genID || c.supervisor.Snapshot().ActiveControlGeneration != genID {
+		c.failCandidate(operationCtx, genID)
+		_ = activationErr
+		return httpapi.AdapterReconcileResult{State: "failed", ActiveAdapterCount: activeCount, FailureCode: "activation_failed"}, true, nil
+	}
+	if err := c.registry.FinalizeActivation(genID); err != nil {
+		// The durable activation journal is recovered by Host startup. The new
+		// route is already active, so report committed success without tearing it
+		// down or disturbing its Engine.
+	}
+	c.mu.Lock()
+	if manifest.ReleaseVersion != "" {
+		c.manifests[genID] = manifest
+		c.buildIdentities[genID] = buildInfoFromManifest(manifest)
+	}
+	c.mu.Unlock()
+	return httpapi.AdapterReconcileResult{State: "activated", ActiveAdapterCount: len(selected.Entries), RejectedCount: selected.RejectedCount, GenerationID: genID}, true, nil
+}
+
+func (c *updateController) applicationFiles(active generation.Generation) (string, release.Manifest, map[string]string, error) {
+	if attachment, ok := c.engineAttachment(active.ID); ok && attachment.releaseDir == c.config.BundleDir {
+		directory, paths := c.bundleExecutables()
+		manifest := release.Manifest{}
+		if attachment.manifest != nil {
+			manifest = *attachment.manifest
+		}
+		return directory, manifest, paths, nil
+	}
+	installed, err := c.inspectGeneration(active)
+	if err != nil {
+		return "", release.Manifest{}, nil, err
+	}
+	return installed.Directory, installed.Manifest, installed.ArtifactPaths, nil
 }
 
 // ReconcileLeases performs one complete confirmed inventory pass over every
@@ -756,6 +937,175 @@ func (c *updateController) finishRetiredGeneration(ctx context.Context, g genera
 	delete(c.releaseNotes, g.ID)
 	delete(c.buildIdentities, g.ID)
 	c.mu.Unlock()
+	c.collectAdapterSets()
+}
+
+func (c *updateController) collectAdapterSets() {
+	if c.adapterCatalog == nil || c.registry == nil || c.supervisor == nil {
+		return
+	}
+	registryState := c.registry.Snapshot()
+	keep, consistent := adapterSetCollectionRoots(registryState, c.EngineAttachments(), c.supervisor.Snapshot())
+	if !consistent {
+		// The registry and live Engine views no longer identify every possible
+		// reader. Retain all immutable sets until a later consistent pass.
+		return
+	}
+	_ = c.adapterCatalog.Collect(keep)
+}
+
+// adapterSetCollectionRoots returns only adapter sets referenced by live
+// generation state, recording leases, or Host Engine attachments. An
+// inconsistent registry/process view disables collection entirely so an
+// unknown Engine can never lose the artifact it may need to restart.
+func adapterSetCollectionRoots(registryState generation.Snapshot, attachments []engineAttachment, processes supervisor.Snapshot) ([]string, bool) {
+	if registryState.Generations == nil || registryState.Leases == nil {
+		return nil, false
+	}
+	setRoots := make(map[string]struct{})
+	addSet := func(setID string) bool {
+		if setID == "" {
+			return true
+		}
+		if !validAdapterSetIdentity(setID) {
+			return false
+		}
+		setRoots[setID] = struct{}{}
+		return true
+	}
+	lookup := func(id string) (generation.Generation, bool) {
+		item, exists := registryState.Generations[id]
+		return item, exists && item.ID == id && generationPattern.MatchString(id)
+	}
+	checkPointer := func(id string, expected generation.State) bool {
+		if id == "" {
+			return true
+		}
+		item, exists := lookup(id)
+		return exists && item.State == expected
+	}
+	if !checkPointer(registryState.ActiveGenerationID, generation.StateActive) ||
+		!checkPointer(registryState.PreviousGenerationID, generation.StateDraining) ||
+		!checkPointer(registryState.ActivationPreviousGenerationID, generation.StateDraining) {
+		return nil, false
+	}
+	if registryState.StagedGenerationID != "" {
+		staged, exists := lookup(registryState.StagedGenerationID)
+		if !exists || (staged.State != generation.StateStaging && staged.State != generation.StateVerified && staged.State != generation.StateReady) {
+			return nil, false
+		}
+	}
+
+	rootGenerations := make(map[string]struct{})
+	activeCount := 0
+	for id, item := range registryState.Generations {
+		if item.ID != id || !generationPattern.MatchString(id) || (item.AdapterSetID != "" && !validAdapterSetIdentity(item.AdapterSetID)) {
+			return nil, false
+		}
+		switch item.State {
+		case generation.StateActive:
+			activeCount++
+			if id != registryState.ActiveGenerationID {
+				return nil, false
+			}
+			rootGenerations[id] = struct{}{}
+		case generation.StateDraining:
+			rootGenerations[id] = struct{}{}
+		case generation.StateStaging, generation.StateVerified, generation.StateReady:
+			// A candidate in any pre-activation state must remain rooted. The
+			// registry state machine permits exactly the staged pointer to own it.
+			if id != registryState.StagedGenerationID {
+				return nil, false
+			}
+			rootGenerations[id] = struct{}{}
+		case generation.StateFailed, generation.StateRetired:
+			// These records are collectible unless a lease or Engine attachment
+			// below still identifies a consumer.
+		default:
+			return nil, false
+		}
+	}
+	if (registryState.ActiveGenerationID == "") != (activeCount == 0) || activeCount > 1 {
+		return nil, false
+	}
+	for recordingID, lease := range registryState.Leases {
+		item, exists := lookup(lease.EngineGeneration)
+		if recordingID == "" || recordingID != lease.RecordingID || !exists || (item.State != generation.StateActive && item.State != generation.StateDraining) || item.EngineDormant {
+			return nil, false
+		}
+		rootGenerations[lease.EngineGeneration] = struct{}{}
+	}
+	for id := range rootGenerations {
+		if !addSet(registryState.Generations[id].AdapterSetID) {
+			return nil, false
+		}
+	}
+
+	attachmentByGeneration := make(map[string]engineAttachment, len(attachments))
+	for _, attachment := range attachments {
+		item, exists := lookup(attachment.generationID)
+		if !exists || item.AdapterSetID != attachment.adapterSetID || !addSet(attachment.adapterSetID) {
+			return nil, false
+		}
+		if _, duplicate := attachmentByGeneration[attachment.generationID]; duplicate {
+			return nil, false
+		}
+		attachmentByGeneration[attachment.generationID] = attachment
+	}
+	seenProcesses := make(map[string]struct{}, len(processes.Generations))
+	for _, process := range processes.Generations {
+		if !generationPattern.MatchString(process.ID) {
+			return nil, false
+		}
+		if _, duplicate := seenProcesses[process.ID]; duplicate {
+			return nil, false
+		}
+		seenProcesses[process.ID] = struct{}{}
+		item, exists := lookup(process.ID)
+		if !exists {
+			return nil, false
+		}
+		if !stoppedProcessState(process.Engine.State) {
+			if _, attached := attachmentByGeneration[process.ID]; !attached || item.EngineDormant || item.State == generation.StateFailed || item.State == generation.StateRetired {
+				return nil, false
+			}
+		}
+	}
+	if processes.ActiveControlGeneration != "" {
+		activeControl, exists := lookup(processes.ActiveControlGeneration)
+		if !exists || activeControl.State != generation.StateActive {
+			return nil, false
+		}
+		found := false
+		for _, process := range processes.Generations {
+			if process.ID == processes.ActiveControlGeneration && process.ControlActive && process.Control.State == supervisor.ProcessReady {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+
+	keep := make([]string, 0, len(setRoots))
+	for setID := range setRoots {
+		keep = append(keep, setID)
+	}
+	sort.Strings(keep)
+	return keep, true
+}
+
+func validAdapterSetIdentity(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9') && !(character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *updateController) isBundledGeneration(g generation.Generation) bool {
@@ -935,7 +1285,15 @@ func (c *updateController) startEngine(ctx context.Context, id, directory string
 		return engineAttachment{}, errors.New("generation resource owner identity could not be created")
 	}
 	owner := "e" + id + "-" + ownerNonce
-	env := commonChildEnv(c.config)
+	gen, ok := c.registry.Snapshot().Generations[id]
+	if !ok {
+		return engineAttachment{}, errors.New("Recorder Engine generation is unavailable")
+	}
+	adapterDir, err := c.adapterDirectory(gen.AdapterSetID)
+	if err != nil {
+		return engineAttachment{}, err
+	}
+	env := commonChildEnv(c.config, adapterDir)
 	env = append(env, "RUNTIME_RESOURCE_SOCKET_PATH="+c.resourceSocket, "RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath, "RUNTIME_RESOURCE_OWNER="+owner)
 	env = append(env, "ENGINE_SOCKET_PATH="+socket, "ENGINE_GENERATION_ID="+id, "ENGINE_RECOVERY_MODE=fresh", "ENGINE_IPC_TOKEN_FILE="+tokenPath)
 	spec := supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleEngine, Executable: executable, Dir: directory, Env: env}
@@ -947,7 +1305,7 @@ func (c *updateController) startEngine(ctx context.Context, id, directory string
 	if err != nil || !ready.Ready || ready.GenerationID != id || ready.InstanceID == "" || ready.ProtocolVersion != runtimeipc.ProtocolVersion {
 		return engineAttachment{}, errors.New("Recorder Engine readiness identity is invalid")
 	}
-	attachment := engineAttachment{generationID: id, releaseDir: directory, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
+	attachment := engineAttachment{generationID: id, releaseDir: directory, adapterSetID: gen.AdapterSetID, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
 	if manifest.ReleaseVersion != "" {
 		copyManifest := manifest
 		attachment.manifest = &copyManifest
@@ -1010,7 +1368,15 @@ func (c *updateController) publishControl(ctx context.Context, id, directory str
 		return errors.New("generation resource owner identity could not be created")
 	}
 	resourceOwner := "c" + id + "-" + ownerNonce
-	env := append([]string(nil), commonChildEnv(c.config)...)
+	gen, ok := c.registry.Snapshot().Generations[id]
+	if !ok {
+		return errors.New("Control Plane generation is unavailable")
+	}
+	adapterDir, err := c.adapterDirectory(gen.AdapterSetID)
+	if err != nil {
+		return err
+	}
+	env := append([]string(nil), commonChildEnv(c.config, adapterDir)...)
 	env = append(env,
 		"CONTROL_ADDR="+controlAddr,
 		"CONTROL_GENERATION_ID="+id,
@@ -1044,6 +1410,23 @@ func (c *updateController) publishControl(ctx context.Context, id, directory str
 		c.mu.Unlock()
 	}
 	return nil
+}
+
+func (c *updateController) adapterDirectory(setID string) (string, error) {
+	if c.adapterCatalog == nil {
+		if setID != "" {
+			return "", errors.New("immutable adapter catalog is unavailable")
+		}
+		return "", nil
+	}
+	if setID == "" {
+		return "", errors.New("generation adapter set identity is unavailable")
+	}
+	snapshot, err := c.adapterCatalog.Load(setID)
+	if err != nil || snapshot.ID != setID || !filepath.IsAbs(snapshot.Directory) || filepath.Clean(snapshot.Directory) != snapshot.Directory {
+		return "", errors.New("immutable generation adapter set is unavailable")
+	}
+	return snapshot.Directory, nil
 }
 
 func (c *updateController) catalogEntries(activeEngineID string) ([]controlplane.EngineCatalogEntry, error) {

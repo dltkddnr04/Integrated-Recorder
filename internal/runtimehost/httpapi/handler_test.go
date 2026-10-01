@@ -17,9 +17,11 @@ import (
 )
 
 type fakeController struct {
-	status Status
-	err    error
-	calls  map[string]int
+	status        Status
+	err           error
+	adapterResult AdapterReconcileResult
+	adapterErr    error
+	calls         map[string]int
 }
 
 func (f *fakeController) call(name string) (Status, error) {
@@ -35,6 +37,13 @@ func (f *fakeController) Check(context.Context) (Status, error)    { return f.ca
 func (f *fakeController) Stage(context.Context) (Status, error)    { return f.call("stage") }
 func (f *fakeController) Activate(context.Context) (Status, error) { return f.call("activate") }
 func (f *fakeController) Rollback(context.Context) (Status, error) { return f.call("rollback") }
+func (f *fakeController) ReconcileAdapters(context.Context) (AdapterReconcileResult, error) {
+	if f.calls == nil {
+		f.calls = make(map[string]int)
+	}
+	f.calls["reconcile_adapters"]++
+	return f.adapterResult, f.adapterErr
+}
 
 type authFixture struct {
 	service *authn.Service
@@ -97,7 +106,7 @@ func validStatus() Status {
 }
 
 func TestRoutesDispatchAndFallback(t *testing.T) {
-	controller := &fakeController{status: validStatus()}
+	controller := &fakeController{status: validStatus(), adapterResult: AdapterReconcileResult{State: "activated", ActiveAdapterCount: 2, GenerationID: strings.Repeat("b", 32)}}
 	fallbackCalls := 0
 	api, err := New(nil, true, false, controller, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fallbackCalls++
@@ -117,6 +126,7 @@ func TestRoutesDispatchAndFallback(t *testing.T) {
 		{http.MethodPost, stagePath, http.StatusOK},
 		{http.MethodPost, activatePath, http.StatusOK},
 		{http.MethodPost, rollbackPath, http.StatusOK},
+		{http.MethodPost, AdaptersEndpoint, http.StatusOK},
 		{http.MethodPost, Endpoint, http.StatusTeapot},
 		{http.MethodGet, checkPath, http.StatusTeapot},
 		{http.MethodGet, Endpoint + "/unknown", http.StatusTeapot},
@@ -130,7 +140,7 @@ func TestRoutesDispatchAndFallback(t *testing.T) {
 	if fallbackCalls != 3 {
 		t.Fatalf("fallback calls = %d, want 3", fallbackCalls)
 	}
-	for _, name := range []string{"status", "check", "stage", "activate", "rollback"} {
+	for _, name := range []string{"status", "check", "stage", "activate", "rollback", "reconcile_adapters"} {
 		if controller.calls[name] != 1 {
 			t.Errorf("controller %s calls = %d, want 1", name, controller.calls[name])
 		}
@@ -171,12 +181,12 @@ func TestStatusGETRequiresAuthenticationButNotCSRF(t *testing.T) {
 
 func TestEveryPostRequiresAuthenticationAndCSRF(t *testing.T) {
 	fixture := testAuth(t)
-	controller := &fakeController{status: validStatus()}
+	controller := &fakeController{status: validStatus(), adapterResult: AdapterReconcileResult{State: "unchanged"}}
 	api, err := New(fixture.service, false, false, controller, http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{checkPath, stagePath, activatePath, rollbackPath} {
+	for _, path := range []string{checkPath, stagePath, activatePath, rollbackPath, AdaptersEndpoint} {
 		unauthenticated := httptest.NewRecorder()
 		api.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodPost, path, nil))
 		if unauthenticated.Code != http.StatusUnauthorized {
@@ -199,6 +209,70 @@ func TestEveryPostRequiresAuthenticationAndCSRF(t *testing.T) {
 		if allowed.Code != http.StatusOK {
 			t.Errorf("POST %s with auth+CSRF status = %d, body=%s", path, allowed.Code, allowed.Body.String())
 		}
+	}
+}
+
+func TestAdapterReconcileRouteReturnsOnlySafeProjection(t *testing.T) {
+	controller := &fakeController{adapterResult: AdapterReconcileResult{State: "rejected", ActiveAdapterCount: 1, RejectedCount: 2}}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, AdaptersEndpoint, strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	api.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reconcile status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var got AdapterReconcileResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "rejected" || got.ActiveAdapterCount != 1 || got.RejectedCount != 2 {
+		t.Fatalf("unexpected reconciliation result: %+v", got)
+	}
+	for _, forbidden := range []string{"/tmp", "sha256", "descriptor", "pid", "credential"} {
+		if strings.Contains(strings.ToLower(recorder.Body.String()), forbidden) {
+			t.Fatalf("reconcile response leaked %q: %s", forbidden, recorder.Body.String())
+		}
+	}
+}
+
+func TestAdapterReconcileRoutePreservesRejectedCountAfterActivation(t *testing.T) {
+	controller := &fakeController{adapterResult: AdapterReconcileResult{
+		State: "activated", ActiveAdapterCount: 2, RejectedCount: 1, GenerationID: strings.Repeat("b", 32),
+	}}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, AdaptersEndpoint, strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	api.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reconcile status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var got AdapterReconcileResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != "activated" || got.ActiveAdapterCount != 2 || got.RejectedCount != 1 || got.GenerationID != strings.Repeat("b", 32) {
+		t.Fatalf("partial activation result was not preserved: %+v", got)
+	}
+}
+
+func TestAdapterReconcileSetupIncompleteUsesSafeConflict(t *testing.T) {
+	controller := &fakeController{adapterErr: NewControllerError("installation_incomplete")}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	api.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, AdaptersEndpoint, nil))
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), `"code":"installation_incomplete"`) {
+		t.Fatalf("setup-incomplete reconcile response = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

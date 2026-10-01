@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -53,6 +53,7 @@ export const derivativeAPI = {
 }
 export const adaptersAPI = {
   list: () => api<Adapter[]>('/api/adapters'), get: (id: string) => api<Adapter>(`/api/adapters/${encodeURIComponent(id)}`),
+  reconcile: () => api<AdapterReconcileResult>('/api/runtime/adapters/reconcile', { method: 'POST', body: {} }),
   schema: (id: string, resource?: ResourceRef) => api<{ input_schema: Schema; configuration_schema: Schema; resource_types?: AdapterDescriptor['resource_types']; media_types: string[] }>(`/api/adapters/${encodeURIComponent(id)}/schema${resource ? queryString({ resource: encodeRef(resource) }) : ''}`),
   config: (id: string, resource?: ResourceRef) => api<AdapterConfig>(`/api/adapters/${encodeURIComponent(id)}/config${resource ? queryString({ resource: encodeRef(resource) }) : ''}`),
   saveConfig: (id: string, body: { resource?: ResourceRef; values?: Record<string, unknown>; secrets?: Record<string, string>; clear_values?: string[]; clear_secrets?: string[] }) => api<AdapterConfig>(`/api/adapters/${encodeURIComponent(id)}/config`, { method: 'PUT', body }),

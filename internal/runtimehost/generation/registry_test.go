@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -354,6 +355,55 @@ func TestSnapshotMapsAreIndependent(t *testing.T) {
 	snapshot.Leases[recordingOne] = Lease{}
 	if got := r.Snapshot().Generations[generationOne].ID; got != generationOne {
 		t.Fatalf("caller mutated registry generation: %q", got)
+	}
+}
+
+func TestAdapterSetIdentityPersistsAndOldEmptyIdentityLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "generations.json")
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withSet := testGeneration(generationOne, StateStaging)
+	withSet.AdapterSetID = strings.Repeat("a", 64)
+	if err := r.Stage(withSet); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Snapshot().Generations[generationOne].AdapterSetID; got != withSet.AdapterSetID {
+		t.Fatalf("adapter set identity did not survive persistence: %q", got)
+	}
+
+	legacy := testGeneration(generationTwo, StateStaging)
+	if err := r.Fail(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stage(legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacyReload, err := Open(path)
+	if err != nil {
+		t.Fatalf("old generation without adapter_set_id failed to load: %v", err)
+	}
+	if got := legacyReload.Snapshot().Generations[generationTwo].AdapterSetID; got != "" {
+		t.Fatalf("legacy empty adapter set identity changed to %q", got)
+	}
+}
+
+func TestAdapterSetIdentityMustBeCanonicalSHA256(t *testing.T) {
+	for _, value := range []string{"not-a-digest", strings.Repeat("A", 64), strings.Repeat("a", 63), strings.Repeat("a", 65)} {
+		item := testGeneration(generationOne, StateStaging)
+		item.AdapterSetID = value
+		if err := validateGeneration(item); err == nil {
+			t.Errorf("noncanonical adapter set identity %q was accepted", value)
+		}
+	}
+	legacy := testGeneration(generationOne, StateStaging)
+	if err := validateGeneration(legacy); err != nil {
+		t.Fatalf("legacy generation with omitted adapter set was rejected: %v", err)
 	}
 }
 

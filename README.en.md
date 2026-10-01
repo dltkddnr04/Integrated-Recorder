@@ -23,7 +23,7 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
-Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. Core must restart to discover newly installed adapter binaries. Installed adapters run as trusted local code. The default file secret stores use restricted permissions but do not encrypt values at rest.
+Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. The Runtime Host periodically imports and validates executable adapters from configured source directories into immutable adapter artifacts and activates a new adapter-set-backed application generation; Host/container restart is not required. Install a binary by copying it under a temporary name and atomically renaming it to `integrated-recorder-adapter-*`. Existing recordings remain pinned to their original Engine and adapter set. The remote Plugin Store, plugin download/signing, and adapter auto-update are not implemented. Installed adapters run as trusted local code. The default file secret stores use restricted permissions but do not encrypt values at rest.
 
 ## Current status
 
@@ -91,7 +91,7 @@ Open `http://localhost:8080/` in a browser to complete setup. Obtain the one-tim
 docker compose exec archiver runtime-host setup-code
 ```
 
-The container uses a named `/data` volume and publishes the Runtime Host listener on host loopback. The image includes the Runtime Host, initial Control/Engine release, and Owncast under `/adapters`; extra executable adapters in `./adapter-binaries` are mounted read-only at `/external-adapters` and discovered when each application generation starts. An Adapter Store/adapter auto-update is not implemented yet. Remote application updates require a separately provisioned Ed25519 public trust key; deployments without one fail closed. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
+The container uses a named `/data` volume and publishes the Runtime Host listener on host loopback. The image includes the Runtime Host, initial Control/Engine release, and Owncast under `/adapters`; extra executable adapters in `./adapter-binaries` are mounted read-only at `/external-adapters`. The Runtime Host periodically imports and validates new binaries into immutable adapter artifacts and activates a new adapter-set-backed application generation without restarting the Host or container. Copy to a temporary name and atomically rename to `integrated-recorder-adapter-*` to avoid exposing a partial copy. Existing recordings stay on their original Engine/adapter set. The remote Plugin Store, plugin download/signing, and adapter auto-update are not implemented. Remote application updates require a separately provisioned Ed25519 public trust key; deployments without one fail closed. The unauthenticated control API is intended for a trusted host/private network or an authenticated reverse proxy; do not expose it directly to untrusted networks.
 
 ## API
 

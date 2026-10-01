@@ -14,7 +14,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -23,9 +25,11 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/leases"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
@@ -197,6 +201,442 @@ func TestUpdateControllerDevelopmentBuildFailsClosed(t *testing.T) {
 	if _, err := controller.Check(context.Background()); controllerErrorCode(err) != "update_unavailable" {
 		t.Fatalf("Check() error = %v, want update_unavailable", err)
 	}
+}
+
+func TestApplicationUpdateStageInheritsActiveAdapterSet(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	setID := strings.Repeat("a", 64)
+	bindActiveAdapterSet(t, fixture, setID)
+	if _, err := fixture.controller.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.Stage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state := fixture.registry.Snapshot()
+	candidate := state.Generations[state.StagedGenerationID]
+	if candidate.AdapterSetID != setID {
+		t.Fatalf("application update candidate adapter set = %q, want inherited %q", candidate.AdapterSetID, setID)
+	}
+}
+
+func TestAdapterReconcileUnchangedSetDoesNotRollGeneration(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	setID := strings.Repeat("a", 64)
+	bindActiveAdapterSet(t, fixture, setID)
+	store := readyInstallation(t, fixture.root)
+	fixture.controller.installation = store
+	directory := t.TempDir()
+	catalog := &testHostAdapterCatalog{desired: adaptercatalog.Snapshot{ID: setID, Directory: directory, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0"}}}, sets: map[string]adaptercatalog.Snapshot{setID: {ID: setID, Directory: directory, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0"}}}}}
+	fixture.controller.adapterCatalog = catalog
+	before := fixture.registry.Snapshot()
+	result, err := fixture.controller.ReconcileAdapters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := fixture.registry.Snapshot()
+	if result.State != "unchanged" || result.ActiveAdapterCount != 1 || before.ActiveGenerationID != after.ActiveGenerationID || fixture.sup.startEngineCalls != 0 || fixture.sup.startControlCalls != 0 {
+		t.Fatalf("unchanged adapter set caused rollout: result=%+v before=%+v after=%+v starts=(%d,%d)", result, before, after, fixture.sup.startEngineCalls, fixture.sup.startControlCalls)
+	}
+}
+
+func TestAdapterReconcileExplicitStagedGenerationConflict(t *testing.T) {
+	fixture, catalog, before := newStagedAdapterReconcileFixture(t)
+
+	_, err := fixture.controller.ReconcileAdapters(context.Background())
+	if controllerErrorCode(err) != "operation_conflict" {
+		t.Fatalf("ReconcileAdapters() error = %v, want operation_conflict", err)
+	}
+	assertStagedAdapterReconcileDidNotTouchCatalog(t, fixture, catalog, before)
+}
+
+func TestAdapterReconcilePeriodicStagedGenerationSkips(t *testing.T) {
+	fixture, catalog, before := newStagedAdapterReconcileFixture(t)
+
+	ran, err := fixture.controller.reconcileAdaptersIfIdle(context.Background())
+	if err != nil || ran {
+		t.Fatalf("reconcileAdaptersIfIdle() = (%t, %v), want (false, nil)", ran, err)
+	}
+	assertStagedAdapterReconcileDidNotTouchCatalog(t, fixture, catalog, before)
+}
+
+func newStagedAdapterReconcileFixture(t *testing.T) (*controllerFixture, *testHostAdapterCatalog, generation.Snapshot) {
+	t.Helper()
+	fixture := newControllerFixture(t, false)
+	oldSetID, desiredSetID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	bindActiveAdapterSet(t, fixture, oldSetID)
+	fixture.controller.installation = readyInstallation(t, fixture.root)
+	oldDir, desiredDir := t.TempDir(), t.TempDir()
+	catalog := &testHostAdapterCatalog{
+		desired: adaptercatalog.Snapshot{ID: desiredSetID, Directory: desiredDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0"}}},
+		sets: map[string]adaptercatalog.Snapshot{
+			oldSetID:     {ID: oldSetID, Directory: oldDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0"}}},
+			desiredSetID: {ID: desiredSetID, Directory: desiredDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0"}}},
+		},
+	}
+	fixture.controller.adapterCatalog = catalog
+	if _, err := fixture.controller.Check(context.Background()); err != nil {
+		t.Fatalf("Check(): %v", err)
+	}
+	if _, err := fixture.controller.Stage(context.Background()); err != nil {
+		t.Fatalf("Stage(): %v", err)
+	}
+	before := fixture.registry.Snapshot()
+	if before.StagedGenerationID == "" || before.Generations[before.StagedGenerationID].State != generation.StateVerified {
+		t.Fatalf("fixture did not produce a verified staged generation: %+v", before)
+	}
+	return fixture, catalog, before
+}
+
+func assertStagedAdapterReconcileDidNotTouchCatalog(t *testing.T, fixture *controllerFixture, catalog *testHostAdapterCatalog, before generation.Snapshot) {
+	t.Helper()
+	catalog.mu.Lock()
+	emptyCalls, loadCalls, reconcileCalls, collectCalls := catalog.emptyCalls, catalog.loadCalls, catalog.reconcileCalls, len(catalog.collected)
+	catalog.mu.Unlock()
+	if emptyCalls != 0 || loadCalls != 0 || reconcileCalls != 0 || collectCalls != 0 {
+		t.Fatalf("staged reconciliation touched adapter catalog: Empty=%d Load=%d Reconcile=%d Collect=%d", emptyCalls, loadCalls, reconcileCalls, collectCalls)
+	}
+	after := fixture.registry.Snapshot()
+	if after.ActiveGenerationID != before.ActiveGenerationID || after.StagedGenerationID != before.StagedGenerationID {
+		t.Fatalf("staged reconciliation changed active/staged pointers: before=(%s,%s) after=(%s,%s)", before.ActiveGenerationID, before.StagedGenerationID, after.ActiveGenerationID, after.StagedGenerationID)
+	}
+	if fixture.sup.Snapshot().ActiveControlGeneration != before.ActiveGenerationID {
+		t.Fatalf("staged reconciliation changed active Control generation: got %s, want %s", fixture.sup.Snapshot().ActiveControlGeneration, before.ActiveGenerationID)
+	}
+	if fixture.sup.startEngineCalls != 0 || fixture.sup.startControlCalls != 0 {
+		t.Fatalf("staged reconciliation started candidate processes: Engine=%d Control=%d", fixture.sup.startEngineCalls, fixture.sup.startControlCalls)
+	}
+	for id, expected := range before.Generations {
+		if actual, exists := after.Generations[id]; !exists || actual != expected {
+			t.Fatalf("staged reconciliation changed generation %s: before=%+v after=%+v exists=%t", id, expected, actual, exists)
+		}
+	}
+}
+
+func TestAdapterReconcileActivatesPinnedSetAndRollbackRestoresTuple(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	oldSetID, newSetID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	bindActiveAdapterSet(t, fixture, oldSetID)
+	store := readyInstallation(t, fixture.root)
+	fixture.controller.installation = store
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	catalog := &testHostAdapterCatalog{
+		desired: adaptercatalog.Snapshot{ID: newSetID, Directory: newDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0"}}},
+		sets: map[string]adaptercatalog.Snapshot{
+			oldSetID: {ID: oldSetID, Directory: oldDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0"}}},
+			newSetID: {ID: newSetID, Directory: newDir, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "2.0.0"}}},
+		},
+	}
+	fixture.controller.adapterCatalog = catalog
+	recordingID := strings.Repeat("1", 32)
+	lease := generation.Lease{RecordingID: recordingID, EngineGeneration: fixture.initialID, WorkerInstance: strings.Repeat("2", 32), StartedAt: time.Now().UTC()}
+	if err := fixture.registry.PinRecording(lease); err != nil {
+		t.Fatal(err)
+	}
+	result, err := fixture.controller.ReconcileAdapters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := fixture.registry.Snapshot()
+	newGeneration := state.Generations[state.ActiveGenerationID]
+	if result.State != "activated" || newGeneration.AdapterSetID != newSetID || newGeneration.Version != "1.0.0" || newGeneration.Commit != strings.Repeat("a", 40) {
+		t.Fatalf("adapter-only generation did not preserve application release: result=%+v generation=%+v", result, newGeneration)
+	}
+	if state.Generations[fixture.initialID].State != generation.StateDraining || state.Leases[recordingID].EngineGeneration != fixture.initialID {
+		t.Fatalf("old Recording lease moved during adapter activation: %+v", state)
+	}
+	oldAttachment, oldFound := fixture.controller.engineAttachment(fixture.initialID)
+	newAttachment, newFound := fixture.controller.engineAttachment(newGeneration.ID)
+	if !oldFound || !newFound || oldAttachment.adapterSetID != oldSetID || newAttachment.adapterSetID != newSetID {
+		t.Fatalf("generation Engine attachments lost adapter-set pinning: old=%+v new=%+v", oldAttachment, newAttachment)
+	}
+	if got := childEnvValue(fixture.sup.engineSpecs[len(fixture.sup.engineSpecs)-1].Env, "ADAPTER_DIR"); got != newDir {
+		t.Fatalf("new Engine ADAPTER_DIR = %q, want immutable set directory", got)
+	}
+	if got := childEnvValue(fixture.sup.controlSpecs[len(fixture.sup.controlSpecs)-1].Env, "ADAPTER_DIR"); got != newDir {
+		t.Fatalf("new Control ADAPTER_DIR = %q, want immutable set directory", got)
+	}
+
+	// Rollback reuses the retained generation's original adapter set.
+	if _, err := fixture.controller.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state = fixture.registry.Snapshot()
+	if state.ActiveGenerationID != fixture.initialID || state.Generations[fixture.initialID].AdapterSetID != oldSetID || state.Generations[newGeneration.ID].AdapterSetID != newSetID || state.Leases[recordingID].EngineGeneration != fixture.initialID {
+		t.Fatalf("rollback changed generation tuple or Recording pin: %+v", state)
+	}
+	if got := childEnvValue(fixture.sup.controlSpecs[len(fixture.sup.controlSpecs)-1].Env, "ADAPTER_DIR"); got != oldDir {
+		t.Fatalf("rollback Control ADAPTER_DIR = %q, want retained old set", got)
+	}
+}
+
+func TestRejectedAdapterCandidateKeepsActiveGenerationStable(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	setID := strings.Repeat("a", 64)
+	bindActiveAdapterSet(t, fixture, setID)
+	fixture.controller.installation = readyInstallation(t, fixture.root)
+	directory := t.TempDir()
+	fixture.controller.adapterCatalog = &testHostAdapterCatalog{
+		desired: adaptercatalog.Snapshot{ID: setID, Directory: directory, RejectedCount: 1, RejectedCodes: []string{"probe_failed"}},
+		sets:    map[string]adaptercatalog.Snapshot{setID: {ID: setID, Directory: directory, Entries: []adaptercatalog.Entry{{AdapterID: "fixture", Version: "1.0.0"}}}},
+	}
+	before := fixture.registry.Snapshot()
+	result, err := fixture.controller.ReconcileAdapters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := fixture.registry.Snapshot()
+	if result.State != "rejected" || result.RejectedCount != 1 || after.ActiveGenerationID != before.ActiveGenerationID || after.StagedGenerationID != "" || fixture.sup.startEngineCalls != 0 || fixture.sup.startControlCalls != 0 {
+		t.Fatalf("rejected adapter changed active generation: result=%+v before=%+v after=%+v", result, before, after)
+	}
+}
+
+func TestAdapterReconcileActivatesValidAdditionsAndReportsUnrelatedRejectedCandidate(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	oldSetID, newSetID := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	bindActiveAdapterSet(t, fixture, oldSetID)
+	fixture.controller.installation = readyInstallation(t, fixture.root)
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	selected := adaptercatalog.Snapshot{
+		ID: newSetID, Directory: newDir, RejectedCount: 1, RejectedCodes: []string{"probe_failed"},
+		Entries: []adaptercatalog.Entry{
+			{AdapterID: "existing", Version: "1.0.0"},
+			{AdapterID: "new-valid", Version: "1.0.0"},
+		},
+	}
+	fixture.controller.adapterCatalog = &testHostAdapterCatalog{
+		desired: selected,
+		sets: map[string]adaptercatalog.Snapshot{
+			oldSetID: {ID: oldSetID, Directory: oldDir, Entries: []adaptercatalog.Entry{{AdapterID: "existing", Version: "1.0.0"}}},
+			newSetID: selected,
+		},
+	}
+	before := fixture.registry.Snapshot()
+	result, err := fixture.controller.ReconcileAdapters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := fixture.registry.Snapshot()
+	active := after.Generations[after.ActiveGenerationID]
+	if result.State != "activated" || result.RejectedCount != 1 || result.ActiveAdapterCount != 2 || result.GenerationID != active.ID {
+		t.Fatalf("valid adapter addition was not activated with rejected count preserved: result=%+v active=%+v", result, active)
+	}
+	if after.ActiveGenerationID == before.ActiveGenerationID || active.AdapterSetID != newSetID || fixture.sup.startEngineCalls != 1 || fixture.sup.startControlCalls != 1 {
+		t.Fatalf("mixed valid/invalid candidates did not cause one adapter-set generation rollout: before=%+v after=%+v starts=(%d,%d)", before, after, fixture.sup.startEngineCalls, fixture.sup.startControlCalls)
+	}
+}
+
+func TestAdapterSetCollectionRootsKeepLiveReferencesAndDropUnleasedFailureHistory(t *testing.T) {
+	makeGeneration := func(idRune, setRune rune, state generation.State) generation.Generation {
+		return generation.Generation{ID: strings.Repeat(string(idRune), 32), AdapterSetID: strings.Repeat(string(setRune), 64), State: state}
+	}
+	active := makeGeneration('a', 'a', generation.StateActive)
+	previous := makeGeneration('b', 'b', generation.StateDraining)
+	activationPrevious := makeGeneration('c', 'c', generation.StateDraining)
+	staged := makeGeneration('d', 'd', generation.StateVerified)
+	leased := makeGeneration('e', 'e', generation.StateDraining)
+	failed := makeGeneration('f', 'f', generation.StateFailed)
+	retired := makeGeneration('6', '6', generation.StateRetired)
+	failedWithAttachment := makeGeneration('7', '7', generation.StateFailed)
+	generations := []generation.Generation{active, previous, activationPrevious, staged, leased, failed, retired, failedWithAttachment}
+	registryState := generation.Snapshot{
+		SchemaVersion: generation.SchemaVersion, ActiveGenerationID: active.ID,
+		PreviousGenerationID: previous.ID, ActivationPreviousGenerationID: activationPrevious.ID,
+		StagedGenerationID: staged.ID, Generations: make(map[string]generation.Generation, len(generations)),
+		Leases: map[string]generation.Lease{
+			strings.Repeat("1", 32): {RecordingID: strings.Repeat("1", 32), EngineGeneration: leased.ID, WorkerInstance: strings.Repeat("2", 32), StartedAt: time.Now().UTC()},
+		},
+	}
+	for _, item := range generations {
+		registryState.Generations[item.ID] = item
+	}
+	attachments := []engineAttachment{
+		{generationID: active.ID, adapterSetID: active.AdapterSetID},
+		{generationID: previous.ID, adapterSetID: previous.AdapterSetID},
+		{generationID: activationPrevious.ID, adapterSetID: activationPrevious.AdapterSetID},
+		{generationID: staged.ID, adapterSetID: staged.AdapterSetID},
+		{generationID: leased.ID, adapterSetID: leased.AdapterSetID},
+		{generationID: failedWithAttachment.ID, adapterSetID: failedWithAttachment.AdapterSetID},
+	}
+	processes := supervisor.Snapshot{
+		ActiveControlGeneration: active.ID,
+		Generations: []supervisor.GenerationSnapshot{
+			{ID: active.ID, Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessReady}, Control: supervisor.ProcessSnapshot{State: supervisor.ProcessReady}, ControlActive: true},
+			{ID: previous.ID, Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessReady}},
+			{ID: activationPrevious.ID, Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessReady}},
+			{ID: staged.ID, Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessReady}},
+			{ID: leased.ID, Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessReady}},
+			{ID: failedWithAttachment.ID, Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessFailed}},
+		},
+	}
+	got, consistent := adapterSetCollectionRoots(registryState, attachments, processes)
+	if !consistent {
+		t.Fatal("valid registry and Engine views were treated as inconsistent")
+	}
+	want := []string{active.AdapterSetID, previous.AdapterSetID, activationPrevious.AdapterSetID, staged.AdapterSetID, leased.AdapterSetID, failedWithAttachment.AdapterSetID}
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("adapter GC roots = %v, want live references %v (failed=%s retired=%s should be collectible)", got, want, failed.AdapterSetID, retired.AdapterSetID)
+	}
+
+	unattachedProcess := processes
+	unattachedProcess.Generations = append(append([]supervisor.GenerationSnapshot(nil), processes.Generations...), supervisor.GenerationSnapshot{
+		ID: strings.Repeat("9", 32), Engine: supervisor.ProcessSnapshot{State: supervisor.ProcessReady},
+	})
+	if _, consistent := adapterSetCollectionRoots(registryState, attachments, unattachedProcess); consistent {
+		t.Fatal("live Engine without a registry/attachment reference did not fail closed")
+	}
+}
+
+func TestAdapterReconciliationLoopWaitsForInstallationReadyAndSkipsBusyGate(t *testing.T) {
+	fixture := newControllerFixture(t, false)
+	setID := strings.Repeat("a", 64)
+	bindActiveAdapterSet(t, fixture, setID)
+	store, err := installation.Reconcile(filepath.Join(fixture.root, "incomplete"), installation.AdminMissing, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.controller.installation = store
+	directory := t.TempDir()
+	catalog := &testHostAdapterCatalog{desired: adaptercatalog.Snapshot{ID: setID, Directory: directory}, sets: map[string]adaptercatalog.Snapshot{setID: {ID: setID, Directory: directory}}}
+	fixture.controller.adapterCatalog = catalog
+	if _, err := fixture.controller.ReconcileAdapters(context.Background()); controllerErrorCode(err) != "installation_incomplete" {
+		t.Fatalf("explicit adapter reconciliation before setup completion error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startPeriodicAdapterReconciliation(ctx, store, fixture.controller, 5*time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
+	catalog.mu.Lock()
+	if catalog.reconcileCalls != 0 {
+		catalog.mu.Unlock()
+		cancel()
+		<-done
+		t.Fatalf("periodic adapter reconciliation ran before installation ready: %d", catalog.reconcileCalls)
+	}
+	catalog.mu.Unlock()
+	if _, err := store.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		catalog.mu.Lock()
+		calls := catalog.reconcileCalls
+		catalog.mu.Unlock()
+		if calls > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("periodic adapter reconciliation did not start after installation became ready")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	fixture.controller.gate <- struct{}{}
+	catalog.mu.Lock()
+	busyBefore := catalog.reconcileCalls
+	catalog.mu.Unlock()
+	ran, err := fixture.controller.reconcileAdaptersIfIdle(context.Background())
+	catalog.mu.Lock()
+	busyAfter := catalog.reconcileCalls
+	catalog.mu.Unlock()
+	<-fixture.controller.gate
+	if err != nil || ran || busyAfter != busyBefore {
+		t.Fatalf("periodic pass should skip a busy update gate: ran=%t calls=%d->%d err=%v", ran, busyBefore, busyAfter, err)
+	}
+	cancel()
+	<-done
+}
+
+func bindActiveAdapterSet(t *testing.T, fixture *controllerFixture, setID string) {
+	t.Helper()
+	state := fixture.registry.Snapshot()
+	active := state.Generations[fixture.initialID]
+	active.AdapterSetID = setID
+	state.Generations[fixture.initialID] = active
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(fixture.root, "runtime", "state", "generations.json")
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := generation.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.registry = registry
+	fixture.controller.registry = registry
+	fixture.controller.mu.Lock()
+	attachment := fixture.controller.engines[fixture.initialID]
+	attachment.adapterSetID = setID
+	fixture.controller.engines[fixture.initialID] = attachment
+	fixture.controller.mu.Unlock()
+}
+
+func readyInstallation(t *testing.T, root string) *installation.Store {
+	t.Helper()
+	store, err := installation.Reconcile(root, installation.AdminConfigured, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+type testHostAdapterCatalog struct {
+	mu             sync.Mutex
+	desired        adaptercatalog.Snapshot
+	sets           map[string]adaptercatalog.Snapshot
+	emptyCalls     int
+	loadCalls      int
+	reconcileCalls int
+	collected      [][]string
+}
+
+func (c *testHostAdapterCatalog) Reconcile(_ context.Context, fallback string) (adaptercatalog.Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reconcileCalls++
+	if c.desired.ID == "" {
+		c.desired.ID = fallback
+	}
+	return cloneAdapterSnapshot(c.desired), nil
+}
+
+func (c *testHostAdapterCatalog) Empty() (adaptercatalog.Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.emptyCalls++
+	return cloneAdapterSnapshot(c.sets[""]), nil
+}
+
+func (c *testHostAdapterCatalog) Load(id string) (adaptercatalog.Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loadCalls++
+	snapshot, ok := c.sets[id]
+	if !ok {
+		return adaptercatalog.Snapshot{}, adaptercatalog.ErrSetNotFound
+	}
+	return cloneAdapterSnapshot(snapshot), nil
+}
+
+func (c *testHostAdapterCatalog) Collect(ids []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.collected = append(c.collected, append([]string(nil), ids...))
+	return nil
+}
+
+func cloneAdapterSnapshot(snapshot adaptercatalog.Snapshot) adaptercatalog.Snapshot {
+	snapshot.Entries = append([]adaptercatalog.Entry(nil), snapshot.Entries...)
+	snapshot.RejectedCodes = append([]string(nil), snapshot.RejectedCodes...)
+	return snapshot
 }
 
 func TestUpdateControllerRejectsBadSignatureWithoutChangingActiveGeneration(t *testing.T) {

@@ -9,7 +9,18 @@ import (
 	"testing"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
+	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
 )
+
+func TestNormalizeEngineDetachResultIsIdempotentOnlyWhenAlreadyAbsent(t *testing.T) {
+	if err := normalizeEngineDetachResult(recorderengine.ErrGenerationNotAttached); err != nil {
+		t.Fatalf("already absent Engine detach error = %v, want idempotent success", err)
+	}
+	other := context.DeadlineExceeded
+	if err := normalizeEngineDetachResult(other); err != other {
+		t.Fatalf("unrelated Engine detach error = %v, want original %v", err, other)
+	}
+}
 
 func TestPassiveControlPreparationUsesLatestSharedStateWithoutAdmission(t *testing.T) {
 	gate := controlplane.NewMutationGate()

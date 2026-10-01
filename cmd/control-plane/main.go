@@ -674,7 +674,20 @@ func (a *controlApplication) detachEngine(ctx context.Context, generationID stri
 	if a == nil || a.manager == nil {
 		return errors.New("recorder Engine manager is unavailable")
 	}
-	return a.manager.DetachGenerationContext(ctx, generationID)
+	err := a.manager.DetachGenerationContext(ctx, generationID)
+	return normalizeEngineDetachResult(err)
+}
+
+func normalizeEngineDetachResult(err error) error {
+	if errors.Is(err, recorderengine.ErrGenerationNotAttached) {
+		// A candidate Control only attaches Engine processes that were ready
+		// when its immutable catalog was created. A dormant rollback Engine can
+		// therefore already be absent when Host later asks to retire it. Treat
+		// that state as an idempotent detach; all other IPC/inventory failures
+		// still prevent Host retirement.
+		return nil
+	}
+	return err
 }
 
 func (a *controlApplication) startBackground(parent context.Context) error {

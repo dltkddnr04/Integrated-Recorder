@@ -15,6 +15,7 @@ export type AdapterDescriptor = {
 }
 export type AdapterStatus = { id: string; name?: string; version?: string; protocol_version?: number; state: string; error?: string; generation?: number; restart_attempts?: number }
 export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }
+export type AdapterReconcileResult = { state: 'unchanged' | 'activated' | 'rejected' | 'failed'; active_adapter_count: number; rejected_count: number; failure_code?: string; generation_id?: string }
 export type WatchState = 'disabled' | 'offline' | 'checking' | 'starting' | 'recording' | 'backoff' | 'attention_required' | 'suppressed'
 export type WatchView = {
   id: string; adapter_id: string; adapter_name?: string; resource?: ResourceRef & { display_name?: string };

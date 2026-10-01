@@ -20,6 +20,13 @@ import (
 
 const maxFixtureResponseBytes = 64 << 10
 
+// These linker-overridable fields let the Runtime Host process E2E build
+// multiple immutable adapter artifacts from the same deterministic fixture.
+var (
+	fixtureAdapterID      = "runtime-update-fixture"
+	fixtureAdapterVersion = "0.1.0"
+)
+
 func main() {
 	if err := serve(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "runtime update fixture adapter stopped")
@@ -150,7 +157,7 @@ type fixtureState struct {
 
 func descriptor() adapterproto.Descriptor {
 	return adapterproto.Descriptor{
-		ID: "runtime-update-fixture", Name: "Runtime Update Fixture", Version: "0.1.0", ProtocolVersion: adapterproto.Version,
+		ID: fixtureAdapterID, Name: "Runtime Update Fixture", Version: fixtureAdapterVersion, ProtocolVersion: adapterproto.Version,
 		Capabilities:        []string{adapterproto.CapabilityResolve, adapterproto.CapabilityWatch, adapterproto.CapabilityMetadata, adapterproto.CapabilityRefresh},
 		InputSchema:         adapterproto.Schema{Fields: []adapterproto.Field{{Key: "source_url", Control: "text", Label: "Fixture source URL", Required: true}}},
 		ConfigurationSchema: adapterproto.Schema{Fields: []adapterproto.Field{}}, ResourceTypes: []adapterproto.ResourceType{}, MediaTypes: []string{"hls"},

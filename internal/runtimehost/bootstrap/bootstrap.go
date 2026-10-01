@@ -26,6 +26,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
@@ -280,7 +281,32 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	generationID, needsRegistryStage := selected.generationID, selected.needsStage
+	adapterSourceDirs, err := configuredAdapterSourceDirs(config.AdapterDirs)
+	if err != nil {
+		return errors.New("configured adapter source directories are invalid")
+	}
+	adapterCatalog, err := adaptercatalog.Open(filepath.Join(config.DataDir, "runtime", "adapters"), adapterSourceDirs)
+	if err != nil {
+		return errors.New("Runtime Host adapter catalog is unavailable")
+	}
+	adapterSet, activeGeneration, activeExists, err := reconcileStartupAdapterSet(ctx, adapterCatalog, registrySnapshot)
+	if err != nil {
+		return err
+	}
+	// A Host crash during an application activation leaves a durable journal.
+	// First complete recovery using the journal's active tuple; a changed source
+	// set is picked up by the normal periodic reconciliation after readiness.
+	if registrySnapshot.ActivationPreviousGenerationID != "" && activeExists && adapterSet.ID != activeGeneration.AdapterSetID {
+		adapterSet, err = adapterCatalog.Load(activeGeneration.AdapterSetID)
+		if err != nil {
+			return errors.New("active Runtime Host adapter set is unavailable")
+		}
+	}
+	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID)
+	if err != nil {
+		return err
+	}
+	generationID := selected.generationID
 	engineToken, err := randomSecret()
 	if err != nil {
 		return err
@@ -314,7 +340,7 @@ func Run(ctx context.Context, config Config) error {
 		"RUNTIME_RESOURCE_TOKEN_FILE=" + resourceTokenPath,
 		"RUNTIME_RESOURCE_OWNER=" + ownerID,
 	}
-	commonEnv := commonChildEnv(config)
+	commonEnv := commonChildEnv(config, adapterSet.Directory)
 	engineRecoveryMode := initialEngineRecoveryMode(installState.Snapshot().State)
 	engineSpec := supervisor.ProcessSpec{
 		GenerationID: generationID, Role: supervisor.RoleEngine,
@@ -327,7 +353,7 @@ func Run(ctx context.Context, config Config) error {
 	}
 	readiness.register(generationID, supervisor.RoleEngine, engineSocket, engineTokenPath)
 	if needsRegistryStage {
-		if err := registry.Stage(runtimeGeneration(generationID, build)); err != nil {
+		if err := registry.Stage(startupGeneration); err != nil {
 			return fmt.Errorf("stage bundled generation: %w", err)
 		}
 		if err := registry.MarkVerified(generationID); err != nil {
@@ -436,12 +462,13 @@ func Run(ctx context.Context, config Config) error {
 		return fmt.Errorf("initialize immutable release installer: %w", err)
 	}
 	initialEngine := engineAttachment{
-		generationID: generationID, releaseDir: selected.directory, socketPath: engineSocket,
+		generationID: generationID, releaseDir: selected.directory, adapterSetID: adapterSet.ID, socketPath: engineSocket,
 		tokenPath: engineTokenPath, instanceID: engineReady.InstanceID, manifest: selected.manifest,
 	}
 	updates, err := newUpdateController(updateControllerOptions{
 		Config: config, HostBuild: build, ApplicationBuild: selected.appBuild,
-		Registry: registry, Supervisor: sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
+		Registry: registry, AdapterCatalog: adapterCatalog, Installation: installState,
+		Supervisor: sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
 		EngineDetacher: lifecycle,
 		Coordinator:    coordinator, Installer: installer, TrustedKeys: config.TrustedReleaseKeys,
 		Compatibility: currentHostCompatibility(), SourceFactory: configuredReleaseSourceFactory(config, selected.appBuild),
@@ -479,9 +506,11 @@ func Run(ctx context.Context, config Config) error {
 			}
 		}
 	}()
+	adapterReconcileDone := startPeriodicAdapterReconciliation(leaseCtx, installState, updates, 3*time.Second)
 	serveErr := sup.ServeWithHostHandler(ctx, listener, "/api", setupHandler)
 	stopLeaseReconciliation()
 	<-leaseDone
+	<-adapterReconcileDone
 	supervisorClosed = true
 	return serveErr
 }
@@ -580,19 +609,86 @@ func childEnvValue(environment []string, key string) string {
 	return ""
 }
 
-func commonChildEnv(config Config) []string {
+func commonChildEnv(config Config, adapterDirectory string) []string {
 	env := []string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOME=" + config.DataDir,
 		"TMPDIR=/tmp",
 		"DATA_DIR=" + config.DataDir,
 		"RUNTIME_INSTALLATION_MANAGED=1",
-		"ADAPTER_DIR=" + config.AdapterDirs,
+		"ADAPTER_DIR=" + adapterDirectory,
 	}
 	if config.FFmpegPath != "" {
 		env = append(env, "FFMPEG_PATH="+config.FFmpegPath)
 	}
 	return env
+}
+
+func configuredAdapterSourceDirs(value string) ([]string, error) {
+	parts := filepath.SplitList(value)
+	if len(parts) == 0 || len(parts) > 32 {
+		return nil, errors.New("adapter source directory count is invalid")
+	}
+	dirs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || !filepath.IsAbs(part) || filepath.Clean(part) != part || strings.ContainsRune(part, 0) {
+			return nil, errors.New("adapter source directory is invalid")
+		}
+		dirs = append(dirs, part)
+	}
+	return dirs, nil
+}
+
+// reconcileStartupAdapterSet uses only a previously persisted active
+// generation's immutable set as a rejection fallback. A fresh installation
+// has no good set to preserve yet, so valid candidates must still be imported
+// when a different source binary is rejected.
+func reconcileStartupAdapterSet(ctx context.Context, catalog hostAdapterCatalog, registryState generation.Snapshot) (adaptercatalog.Snapshot, generation.Generation, bool, error) {
+	if catalog == nil {
+		return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("Runtime Host adapter catalog is unavailable")
+	}
+	fallbackSetID := ""
+	var activeGeneration generation.Generation
+	activeExists := false
+	if registryState.ActiveGenerationID != "" {
+		activeGeneration, activeExists = registryState.Generations[registryState.ActiveGenerationID]
+		if !activeExists || activeGeneration.State != generation.StateActive {
+			return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("active adapter generation is inconsistent")
+		}
+		fallbackSetID = activeGeneration.AdapterSetID
+	}
+	selected, err := catalog.Reconcile(ctx, fallbackSetID)
+	if err != nil {
+		return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("Runtime Host adapter discovery failed")
+	}
+	return selected, activeGeneration, activeExists, nil
+}
+
+func startPeriodicAdapterReconciliation(ctx context.Context, store *installation.Store, controller *updateController, interval time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if interval <= 0 {
+			return
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if store == nil || store.Snapshot().State != installation.StateReady || controller == nil {
+					continue
+				}
+				callCtx, cancel := context.WithTimeout(ctx, controller.operationTimeout)
+				_, _ = controller.reconcileAdaptersIfIdle(callCtx)
+				cancel()
+			}
+		}
+	}()
+	return done
 }
 
 func selectGeneration(snapshot generation.Snapshot, build buildinfo.Info) (string, bool, error) {
@@ -623,6 +719,44 @@ func runtimeGeneration(id string, build buildinfo.Info) generation.Generation {
 		ControlProtocol: runtimeipc.ProtocolVersion, EngineProtocol: runtimeipc.ProtocolVersion,
 		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: 1, Maximum: 1}, ArchiveWriteEpoch: 1,
 	}
+}
+
+// prepareStartupGeneration binds the selected application release to the
+// reconciled immutable adapter set. A set change over an existing active
+// application allocates a new generation identity and copies the exact
+// application compatibility tuple; it never edits the old generation.
+func prepareStartupGeneration(selected runtimeRelease, registryState generation.Snapshot, adapterSetID string) (runtimeRelease, generation.Generation, bool, error) {
+	if adapterSetID == "" {
+		return runtimeRelease{}, generation.Generation{}, false, errors.New("adapter set identity is unavailable")
+	}
+	if registryState.ActiveGenerationID != "" {
+		active, ok := registryState.Generations[registryState.ActiveGenerationID]
+		if !ok || active.State != generation.StateActive {
+			return runtimeRelease{}, generation.Generation{}, false, errors.New("active application generation is inconsistent")
+		}
+		if active.AdapterSetID != adapterSetID {
+			id, err := newGenerationID()
+			if err != nil {
+				return runtimeRelease{}, generation.Generation{}, false, err
+			}
+			candidate := active
+			candidate.ID = id
+			candidate.AdapterSetID = adapterSetID
+			candidate.InstalledAt = time.Now().UTC()
+			candidate.State = generation.StateStaging
+			candidate.EngineDormant = false
+			selected.generationID = id
+			selected.needsStage = true
+			return selected, candidate, true, nil
+		}
+		return selected, active, false, nil
+	}
+	if !selected.needsStage || !generationPattern.MatchString(selected.generationID) {
+		return runtimeRelease{}, generation.Generation{}, false, errors.New("initial application generation is inconsistent")
+	}
+	candidate := runtimeGeneration(selected.generationID, selected.appBuild)
+	candidate.AdapterSetID = adapterSetID
+	return selected, candidate, true, nil
 }
 
 func newGenerationID() (string, error) {

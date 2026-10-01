@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/dltkddnr04/integrated-recorder/internal/authn"
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
@@ -270,6 +272,91 @@ func TestSelectRuntimeReleaseUsesDurableActiveIdentity(t *testing.T) {
 	selected, err = selectRuntimeRelease(empty, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil)
 	if err != nil || !selected.needsStage || !generationPattern.MatchString(selected.generationID) {
 		t.Fatalf("fresh bundle selection = %+v, %v", selected, err)
+	}
+}
+
+func TestPrepareStartupGenerationCreatesAdapterOnlyTupleWithoutMutatingOldGeneration(t *testing.T) {
+	bundle := t.TempDir()
+	build := buildinfoForTest()
+	id := strings.Repeat("a", 32)
+	oldSetID, newSetID := strings.Repeat("b", 64), strings.Repeat("c", 64)
+	registryState := generationSnapshotForTest(id, build)
+	old := registryState.Generations[id]
+	old.AdapterSetID = oldSetID
+	old.ArchiveReadCompatibility = generation.CompatibilityRange{Minimum: 2, Maximum: 7}
+	old.ArchiveWriteEpoch = 5
+	registryState.Generations[id] = old
+	selected, err := selectRuntimeRelease(registryState, build, bundle, filepath.Join(t.TempDir(), "runtime"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, candidate, needsStage, err := prepareStartupGeneration(selected, registryState, newSetID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsStage || !prepared.needsStage || prepared.generationID == id || candidate.ID != prepared.generationID || candidate.AdapterSetID != newSetID || candidate.State != generation.StateStaging {
+		t.Fatalf("adapter-set-only startup did not allocate a staged generation: selected=%+v candidate=%+v stage=%t", prepared, candidate, needsStage)
+	}
+	if candidate.Version != old.Version || candidate.Commit != old.Commit || candidate.ArchiveReadCompatibility != old.ArchiveReadCompatibility || candidate.ArchiveWriteEpoch != old.ArchiveWriteEpoch {
+		t.Fatalf("adapter-only candidate changed application release compatibility: old=%+v new=%+v", old, candidate)
+	}
+	if got := registryState.Generations[id]; got.AdapterSetID != oldSetID || got.State != generation.StateActive {
+		t.Fatalf("startup adapter reconciliation mutated existing generation: %+v", got)
+	}
+
+	unchanged, same, stage, err := prepareStartupGeneration(selected, registryState, oldSetID)
+	if err != nil || stage || unchanged.generationID != id || same.ID != id || same.AdapterSetID != oldSetID {
+		t.Fatalf("same adapter set should reuse active generation: selected=%+v generation=%+v stage=%t err=%v", unchanged, same, stage, err)
+	}
+}
+
+func TestFreshStartupImportsValidAdaptersWhenAnotherCandidateIsRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adapter executable fixture uses a POSIX shell")
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeStartupAdapter(t, filepath.Join(source, "integrated-recorder-adapter-good"))
+	if err := os.WriteFile(filepath.Join(source, "integrated-recorder-adapter-invalid"), []byte("#!/bin/sh\nprintf 'not-json\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := adaptercatalog.Open(filepath.Join(root, "runtime", "adapters"), []string{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { makeRuntimeE2ETreeWritable(root) })
+	selected, active, activeExists, err := reconcileStartupAdapterSet(context.Background(), catalog, generation.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeExists || active.ID != "" {
+		t.Fatalf("fresh install unexpectedly has an active generation: exists=%t active=%+v", activeExists, active)
+	}
+	if len(selected.Entries) != 1 || selected.Entries[0].AdapterID != "startup-good" || selected.RejectedCount != 1 {
+		t.Fatalf("fresh startup did not keep valid candidate alongside rejected candidate: %+v", selected)
+	}
+}
+
+func writeStartupAdapter(t *testing.T, path string) {
+	t.Helper()
+	descriptor := `{"id":"startup-good","name":"Startup Test","version":"1.0.0","protocol_version":1,"capabilities":["resolve"],"input_schema":{"fields":[]},"configuration_schema":{"fields":[]},"media_types":["hls"]}`
+	script := `#!/bin/sh
+while IFS= read -r line; do
+ id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^" ]*\)".*/\1/p')
+ case "$line" in
+	  *'"method":"describe"'*) printf '{"protocol_version":1,"id":"%s","result":%s}\n' "$id" '` + descriptor + `' ;;
+	  *'"method":"shutdown"'*) printf '{"protocol_version":1,"id":"%s","result":{}}\n' "$id"; exit 0 ;;
+ esac
+done
+`
+	if err := os.WriteFile(path, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0700); err != nil {
+		t.Fatal(err)
 	}
 }
 

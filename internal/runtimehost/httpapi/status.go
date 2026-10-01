@@ -12,11 +12,42 @@ import (
 
 const (
 	Endpoint          = "/api/runtime/update"
+	AdaptersEndpoint  = "/api/runtime/adapters/reconcile"
 	MaxRequestBody    = 4 << 10
 	maxResponseBytes  = 128 << 10
 	maxGenerations    = 64
+	maxAdapters       = 1024
 	maxGenerationName = 128
 )
+
+// AdapterReconcileResult is a safe, bounded projection of one Host-owned
+// adapter import and application-generation reconciliation.
+type AdapterReconcileResult struct {
+	State              string `json:"state"`
+	ActiveAdapterCount int    `json:"active_adapter_count"`
+	RejectedCount      int    `json:"rejected_count"`
+	FailureCode        string `json:"failure_code,omitempty"`
+	GenerationID       string `json:"generation_id,omitempty"`
+}
+
+func (r AdapterReconcileResult) Validate() error {
+	if !enumContains(adapterReconcileStates, r.State) || r.ActiveAdapterCount < 0 || r.ActiveAdapterCount > maxAdapters || r.RejectedCount < 0 || r.RejectedCount > maxAdapters {
+		return fmt.Errorf("adapter reconciliation result is invalid")
+	}
+	if r.FailureCode != "" && !enumContains(adapterReconcileFailureCodes, r.FailureCode) {
+		return fmt.Errorf("adapter reconciliation failure code is invalid")
+	}
+	if r.GenerationID != "" && (len(r.GenerationID) > maxGenerationName || !genIDPattern.MatchString(r.GenerationID)) {
+		return fmt.Errorf("adapter reconciliation generation identity is invalid")
+	}
+	if r.State == "failed" && r.FailureCode == "" {
+		return fmt.Errorf("failed adapter reconciliation has no safe failure code")
+	}
+	if r.State != "failed" && r.FailureCode != "" {
+		return fmt.Errorf("successful adapter reconciliation has a failure code")
+	}
+	return nil
+}
 
 // BuildIdentity is the bounded public build identity of a Runtime Host or
 // application release. It contains no executable, installation, or data path.
@@ -87,7 +118,9 @@ var (
 		"release_incompatible": {}, "stage_failed": {}, "activation_failed": {},
 		"rollback_unavailable": {}, "rollback_failed": {}, "internal_error": {},
 	}
-	unavailableReasons = map[string]struct{}{
+	adapterReconcileStates       = map[string]struct{}{"unchanged": {}, "activated": {}, "rejected": {}, "failed": {}}
+	adapterReconcileFailureCodes = map[string]struct{}{"reconcile_failed": {}, "candidate_not_ready": {}, "activation_failed": {}}
+	unavailableReasons           = map[string]struct{}{
 		"development_build": {}, "source_unavailable": {}, "unsupported_platform": {},
 		"trust_key_unavailable": {}, "updates_disabled": {}, "host_update_required": {},
 	}
