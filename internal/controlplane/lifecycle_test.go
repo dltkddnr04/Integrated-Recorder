@@ -56,6 +56,46 @@ func TestLifecycleStartsAndDrainsExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestLifecycleInstallationValidationAndReadySignalRequireActiveControl(t *testing.T) {
+	var validated, activated atomic.Int32
+	lifecycle, err := NewLifecycleWithHooks("control-setup", true, LifecycleHooks{
+		Start:   func(context.Context) error { return nil },
+		Prepare: func(context.Context) error { return nil },
+		Resume:  func(context.Context) error { return nil },
+		Drain:   func(context.Context) error { return nil },
+		ValidateInstallation: func(context.Context) error {
+			validated.Add(1)
+			return nil
+		},
+		InstallationReady: func(context.Context) error {
+			activated.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{OperationControlValidateInstall, OperationControlInstallReady} {
+		if _, err := lifecycle.Handle(context.Background(), operation, json.RawMessage(`{}`)); err == nil {
+			t.Fatalf("passive Control accepted %s", operation)
+		}
+	}
+	if _, err := lifecycle.Handle(context.Background(), OperationControlActivate, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{OperationControlValidateInstall, OperationControlInstallReady} {
+		if _, err := lifecycle.Handle(context.Background(), operation, json.RawMessage(`{"unexpected":true}`)); err == nil {
+			t.Fatalf("%s accepted unknown request fields", operation)
+		}
+		if _, err := lifecycle.Handle(context.Background(), operation, json.RawMessage(`{}`)); err != nil {
+			t.Fatalf("active Control rejected %s: %v", operation, err)
+		}
+	}
+	if validated.Load() != 1 || activated.Load() != 1 {
+		t.Fatalf("installation callbacks validate=%d activate=%d", validated.Load(), activated.Load())
+	}
+}
+
 func TestLifecyclePreparationKeepsGenerationPassiveUntilActivation(t *testing.T) {
 	var prepared, started, drained atomic.Int32
 	lifecycle, err := NewLifecycleWithHooks("control-candidate", true, LifecycleHooks{

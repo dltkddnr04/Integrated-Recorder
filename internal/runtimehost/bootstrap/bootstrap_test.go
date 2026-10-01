@@ -18,8 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dltkddnr04/integrated-recorder/internal/authn"
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
 )
@@ -35,6 +37,25 @@ func TestConfigRejectsAuthDisabledOnPublicListener(t *testing.T) {
 	config.ListenAddr = "127.0.0.1:8080"
 	if err := config.Validate(); err != nil {
 		t.Fatalf("loopback auth-disabled config rejected: %v", err)
+	}
+}
+
+func TestInitialEngineRecoveryIsGatedByInstallationReadiness(t *testing.T) {
+	tests := []struct {
+		state installation.State
+		want  string
+	}{
+		{state: installation.StateUninitialized, want: "fresh"},
+		{state: installation.StateSetupInProgress, want: "fresh"},
+		{state: installation.StateRecoveryRequired, want: "fresh"},
+		{state: installation.StateReady, want: "recover"},
+	}
+	for _, test := range tests {
+		t.Run(string(test.state), func(t *testing.T) {
+			if got := initialEngineRecoveryMode(test.state); got != test.want {
+				t.Fatalf("initialEngineRecoveryMode(%q)=%q, want %q", test.state, got, test.want)
+			}
+		})
 	}
 }
 
@@ -65,6 +86,126 @@ func TestPrivateRuntimeFilesAndDirectories(t *testing.T) {
 	}
 	if err := ensurePrivateDirectory(filepath.Join(link, "nested")); err == nil {
 		t.Fatal("symlinked private directory path unexpectedly accepted")
+	}
+}
+
+func bootstrapTestDir(t *testing.T, prefix string) string {
+	t.Helper()
+	base := os.TempDir()
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
+	root, err := os.MkdirTemp(base, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
+}
+
+func TestPrintSetupCodeOnlyReadsExistingOneTimeToken(t *testing.T) {
+	root := bootstrapTestDir(t, "runtime-host-setup-code-")
+	authService, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := authn.ReadSetupCode(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	if err := PrintSetupCode(root, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != expected+"\n" {
+		t.Fatalf("setup-code output=%q, want exact credential plus newline", output.String())
+	}
+	if err := authService.Bootstrap(expected, "runtime-host-setup-code-password"); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := PrintSetupCode(root, &output); err == nil || output.Len() != 0 {
+		t.Fatalf("setup code exposed after claim: err=%v output=%q", err, output.String())
+	}
+}
+
+func TestPrintSetupCodeRefusesReadyMissingAndCorruptStatesWithoutPaths(t *testing.T) {
+	readyRoot := bootstrapTestDir(t, "runtime-host-setup-ready-")
+	if _, err := installation.Reconcile(readyRoot, installation.AdminMissing, true); err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	if err := PrintSetupCode(readyRoot, &output); err == nil || output.Len() != 0 {
+		t.Fatalf("ready installation exposed setup code: err=%v output=%q", err, output.String())
+	}
+
+	missingRoot := bootstrapTestDir(t, "runtime-host-setup-missing-")
+	output.Reset()
+	if err := PrintSetupCode(missingRoot, &output); err == nil || output.Len() != 0 || strings.Contains(err.Error(), missingRoot) {
+		t.Fatalf("missing token error/output unsafe: err=%v output=%q", err, output.String())
+	}
+
+	corruptRoot := bootstrapTestDir(t, "runtime-host-setup-corrupt-")
+	if err := os.MkdirAll(filepath.Join(corruptRoot, "security"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptRoot, "security", "bootstrap-token"), []byte("not-a-valid-32-byte-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := PrintSetupCode(corruptRoot, &output); err == nil || output.Len() != 0 || strings.Contains(err.Error(), corruptRoot) {
+		t.Fatalf("corrupt token error/output unsafe: err=%v output=%q", err, output.String())
+	}
+}
+
+func TestPrintSetupCodeRefusesStaleTokenAfterAdministratorClaim(t *testing.T) {
+	t.Run("installation state absent", func(t *testing.T) {
+		root := bootstrapTestDir(t, "runtime-host-setup-claimed-no-state-")
+		createClaimedAdminWithStaleToken(t, root, false)
+		var output strings.Builder
+		err := PrintSetupCode(root, &output)
+		if err == nil || err.Error() != "setup code is unavailable" || output.Len() != 0 || strings.Contains(err.Error(), root) {
+			t.Fatalf("PrintSetupCode() = (%q, %v), want generic path-free refusal", output.String(), err)
+		}
+	})
+
+	t.Run("setup in progress", func(t *testing.T) {
+		root := bootstrapTestDir(t, "runtime-host-setup-claimed-progress-")
+		createClaimedAdminWithStaleToken(t, root, true)
+		var output strings.Builder
+		err := PrintSetupCode(root, &output)
+		if err == nil || err.Error() != "setup code is unavailable" || output.Len() != 0 || strings.Contains(err.Error(), root) {
+			t.Fatalf("PrintSetupCode() = (%q, %v), want generic path-free refusal", output.String(), err)
+		}
+	})
+}
+
+func createClaimedAdminWithStaleToken(t *testing.T, root string, setupInProgress bool) {
+	t.Helper()
+	if setupInProgress {
+		if _, err := installation.Reconcile(root, installation.AdminMissing, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service, err := authn.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := authn.ReadSetupCode(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Bootstrap(code, "runtime-host-setup-code-password"); err != nil {
+		t.Fatal(err)
+	}
+	if setupInProgress {
+		if _, err := installation.Reconcile(root, installation.AdminConfigured, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	security := filepath.Join(root, "security")
+	if err := os.WriteFile(filepath.Join(security, "bootstrap-token"), []byte(code), 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -1,11 +1,17 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
   bootstrap: (token: string, password: string) => api<ApiSession>('/api/auth/bootstrap', { method: 'POST', body: { token, password } }),
   login: (password: string) => api<ApiSession>('/api/auth/login', { method: 'POST', body: { password } }),
   logout: () => api<void>('/api/auth/logout', { method: 'POST' }),
+}
+export const setupAPI = {
+  status: () => api<InstallationStatus>('/api/setup/status'),
+  begin: () => api<InstallationStatus>('/api/setup/begin', { method: 'POST', body: {} }),
+  storageTest: () => api<SetupStorageTest>('/api/setup/storage-test', { method: 'POST', body: {} }),
+  complete: () => api<InstallationStatus>('/api/setup/complete', { method: 'POST', body: {} }),
 }
 export const dashboardAPI = {
   get: () => api<Dashboard>('/api/dashboard'), storage: () => api<StorageInfo>('/api/system/storage'), info: () => api<SystemInfo>('/api/system/info'),

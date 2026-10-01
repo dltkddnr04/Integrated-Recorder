@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/authn"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 )
 
 const csrfCookieName = "ir_csrf"
@@ -23,7 +24,7 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.auth.NeedsBootstrap() {
-		writeJSON(w, http.StatusOK, map[string]any{"auth_enabled": true, "authenticated": false, "needs_bootstrap": true, "bootstrap_token_path": s.auth.BootstrapTokenRelativePath()})
+		writeJSON(w, http.StatusOK, map[string]any{"auth_enabled": true, "authenticated": false, "needs_bootstrap": true})
 		return
 	}
 	token := authn.SessionToken(r)
@@ -45,6 +46,13 @@ type authCredentialRequest struct {
 }
 
 func (s *Server) authBootstrap(w http.ResponseWriter, r *http.Request) {
+	if s.installationManaged {
+		state := installationStateForServer(s)
+		if state != installation.StateUninitialized {
+			writeError(w, http.StatusConflict, "administrator setup is unavailable")
+			return
+		}
+	}
 	if s.auth == nil || !s.auth.NeedsBootstrap() {
 		writeError(w, http.StatusConflict, "administrator setup is unavailable")
 		return
@@ -86,7 +94,7 @@ func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, password st
 		MaxAge: maxInt(1, int(time.Until(session.ExpiresAt)/time.Second)), HttpOnly: false,
 		Secure: (r.TLS != nil) || s.forceSecureCookie, SameSite: http.SameSiteStrictMode,
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrf_token": session.CSRFToken, "expires_at": session.ExpiresAt})
+	writeJSON(w, http.StatusOK, map[string]any{"auth_enabled": s.auth != nil, "authenticated": true, "needs_bootstrap": false, "csrf_token": session.CSRFToken, "expires_at": session.ExpiresAt})
 }
 
 func maxInt(a, b int) int {

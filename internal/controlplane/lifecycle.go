@@ -26,6 +26,8 @@ const (
 	OperationControlResume            = "control_resume"
 	OperationControlDeactivate        = "control_deactivate"
 	OperationControlDetachEngine      = "control_detach_engine"
+	OperationControlValidateInstall   = "control_validate_installation"
+	OperationControlInstallReady      = "control_installation_ready"
 )
 
 const maxDetachEngineRequestBytes = 512
@@ -70,7 +72,9 @@ type LifecycleHooks struct {
 	// DetachEngine removes a fully drained, non-default Engine from the active
 	// Control's manager router. Host lease accounting must establish that the
 	// Engine is safe to retire before invoking this operation.
-	DetachEngine func(context.Context, string) error
+	DetachEngine         func(context.Context, string) error
+	ValidateInstallation func(context.Context) error
+	InstallationReady    func(context.Context) error
 }
 
 // Lifecycle gates a Control generation's management background work. The
@@ -142,6 +146,24 @@ func (l *Lifecycle) Handle(ctx context.Context, operation string, payload json.R
 		}
 		return l.Snapshot(), nil
 	}
+	if operation == OperationControlValidateInstall {
+		if len(payload) != 0 && string(payload) != "null" && string(payload) != "{}" {
+			return nil, controlError("invalid_request", "installation validation request must be empty")
+		}
+		if err := l.validateInstallation(ctx); err != nil {
+			return nil, err
+		}
+		return l.Snapshot(), nil
+	}
+	if operation == OperationControlInstallReady {
+		if len(payload) != 0 && string(payload) != "null" && string(payload) != "{}" {
+			return nil, controlError("invalid_request", "installation readiness request must be empty")
+		}
+		if err := l.installationReady(ctx); err != nil {
+			return nil, err
+		}
+		return l.Snapshot(), nil
+	}
 	if len(payload) != 0 && string(payload) != "null" && string(payload) != "{}" {
 		return nil, controlError("invalid_request", "control lifecycle request must be empty")
 	}
@@ -172,6 +194,50 @@ func (l *Lifecycle) Handle(ctx context.Context, operation string, payload json.R
 		return nil, controlError("unsupported_operation", "control lifecycle operation is unsupported")
 	}
 	return l.Snapshot(), nil
+}
+
+func (l *Lifecycle) validateInstallation(ctx context.Context) error {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	active := l.state == LifecycleActive
+	hook := l.hooks.ValidateInstallation
+	l.mu.Unlock()
+	if !active {
+		return controlError("invalid_state", "Control generation is not active")
+	}
+	if hook == nil {
+		return nil
+	}
+	if err := hook(ctx); err != nil {
+		return controlError("installation_validation_failed", "Control installation validation failed")
+	}
+	return nil
+}
+
+func (l *Lifecycle) installationReady(ctx context.Context) error {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	active := l.state == LifecycleActive
+	hook := l.hooks.InstallationReady
+	l.mu.Unlock()
+	if !active {
+		return controlError("invalid_state", "Control generation is not active")
+	}
+	if hook == nil {
+		return nil
+	}
+	if err := hook(ctx); err != nil {
+		return controlError("installation_activation_failed", "Control background services could not be activated")
+	}
+	return nil
 }
 
 type detachEngineRequest struct {

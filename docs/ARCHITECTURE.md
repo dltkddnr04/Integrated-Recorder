@@ -146,7 +146,17 @@ The dashboard, paginated recording query, tags, delete, archive index, events, i
 
 ## Authentication, settings, and derived media
 
-Single-administrator authentication is enabled by default. First-run setup uses the mode-`0600` token at `DATA_DIR/security/bootstrap-token` and a password of at least 12 bytes; only a bcrypt hash is stored. Session tokens come from a cryptographic RNG. Only the token hash, CSRF hash, and expiry are stored as mode-`0600` per-session records under `DATA_DIR/security/sessions`; this lets overlapping Control generations share revocation and preserves a browser session across an application release activation. Browser cookies are HttpOnly and SameSite=Strict, and mutations require a CSRF header. Set `COOKIE_SECURE=1` behind a TLS reverse proxy. `AUTH_DISABLED=1` is accepted only for loopback binds. There is no user/role system, password reset, or external identity provider.
+Single-administrator authentication is enabled by default. First-run setup is a separate Runtime Host-owned installation lifecycle. The local `runtime-host setup-code` command prints the existing mode-`0600` one-time claim token; the browser submits it in the bootstrap form body, never in a URL or status API. A password must be 12–72 bytes and only its bcrypt hash is stored. Session tokens come from a cryptographic RNG. Only the token hash, CSRF hash, and expiry are stored as mode-`0600` per-session records under `DATA_DIR/security/sessions`; this lets overlapping Control generations share revocation and preserves a browser session across an application release activation. Browser cookies are HttpOnly and SameSite=Strict, and mutations require a CSRF header. Set `COOKIE_SECURE=1` behind a TLS reverse proxy. `AUTH_DISABLED=1` is accepted only for loopback binds. There is no user/role system, password reset, or external identity provider.
+
+Installation identity and readiness are shared across application generations and stored at `DATA_DIR/runtime/installation.json`, separate from the canonical recording archive and product-management records. Runtime Host validates this bounded mode-`0600` state and owns its transitions:
+
+```text
+uninitialized → setup_in_progress → ready
+       └──────────────→ ready (loopback-only AUTH_DISABLED)
+any invalid/corrupt critical state → recovery_required
+```
+
+If the installation record is absent but a valid administrator already exists, Host atomically migrates the legacy install to `ready`; if a `ready` install loses its administrator, it fails closed to `recovery_required`. Before `ready`, Control serves only setup/authentication and allowlisted read-only diagnostics. Watch scheduling, retention, preview reconciliation, and storage metrics producers stay stopped; ordinary product mutations and update activation are rejected. Setup completion asks the active Control over lifecycle IPC to validate storage readiness, commits `ready` durably in Host, then sends an idempotent activation signal. A Host/Control restart reconciles producer activation from the durable state, so no restart is required after the wizard finishes and setup state is never generation-local.
 
 The Runtime Host intercepts `GET /api/runtime/update` and authenticated, CSRF-protected `POST` operations at `/check`, `/stage`, `/activate`, and `/rollback`. Update status is a bounded public projection and omits paths, PIDs, tokens, and raw release notes; it may include a bounded, plain-text release-notes summary rendered as text. Development builds fail closed for remote updates. A release activation replaces the default application generation while active Recordings stay pinned to their current Engine. The Runtime Host/container itself is not self-updated by this API.
 
@@ -182,4 +192,4 @@ npm --prefix web run dev
 
 Production Go binaries embed Vite output under `internal/server/static/ui/`. `make build` builds the frontend before Go; the Dockerfile uses a separate Node build stage. Only allowlisted client routes receive the SPA entry on direct navigation. `/api/**` and `/static/**` are excluded from SPA fallback.
 
-On first start, the UI checks `/api/auth/session` and displays bootstrap or login. The bootstrap token is stored at `DATA_DIR/security/bootstrap-token` and is submitted with the password to `/api/auth/bootstrap`. After login, the shared API client automatically sends the session CSRF token on mutation requests.
+On first start, the UI checks the Runtime Host's public `/api/setup/status` before authentication. An incomplete installation opens `/setup`; a ready installation then checks `/api/auth/session` and opens `/login` when necessary. The administrator claim reuses `/api/auth/bootstrap`, after which the authenticated browser begins and completes the Host-owned setup transaction. Setup code is never placed in a URL or returned by an API. After login, the shared API client automatically sends the session CSRF token on mutation requests.

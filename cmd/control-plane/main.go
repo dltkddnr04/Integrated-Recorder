@@ -29,6 +29,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
 	"github.com/dltkddnr04/integrated-recorder/internal/preview"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
@@ -71,12 +72,14 @@ func run() error {
 		},
 	)
 	lifecycle, err := controlplane.NewLifecycleWithHooks(config.generationID, true, controlplane.LifecycleHooks{
-		PrepareActivation: appLifecycle.prepareActivation,
-		Start:             appLifecycle.start,
-		Prepare:           appLifecycle.prepareHandoff,
-		Resume:            appLifecycle.resume,
-		Drain:             appLifecycle.drain,
-		DetachEngine:      appLifecycle.detachEngine,
+		PrepareActivation:    appLifecycle.prepareActivation,
+		Start:                appLifecycle.start,
+		Prepare:              appLifecycle.prepareHandoff,
+		Resume:               appLifecycle.resume,
+		Drain:                appLifecycle.drain,
+		DetachEngine:         appLifecycle.detachEngine,
+		ValidateInstallation: appLifecycle.validateInstallation,
+		InstallationReady:    appLifecycle.installationReady,
 	})
 	if err != nil {
 		return err
@@ -129,19 +132,20 @@ func run() error {
 }
 
 type processConfig struct {
-	dataDir            string
-	controlAddr        string
-	generationID       string
-	controlIPCSocket   string
-	controlTokenFile   string
-	engineCatalog      string
-	activeEngine       string
-	resourceSocket     string
-	resourceTokenFile  string
-	resourceOwner      string
-	adapterDirs        []string
-	authDisabled       bool
-	forceSecureCookies bool
+	dataDir             string
+	controlAddr         string
+	generationID        string
+	controlIPCSocket    string
+	controlTokenFile    string
+	engineCatalog       string
+	activeEngine        string
+	resourceSocket      string
+	resourceTokenFile   string
+	resourceOwner       string
+	adapterDirs         []string
+	authDisabled        bool
+	forceSecureCookies  bool
+	installationManaged bool
 }
 
 func loadProcessConfig() (processConfig, error) {
@@ -149,7 +153,7 @@ func loadProcessConfig() (processConfig, error) {
 		dataDir: strings.TrimSpace(os.Getenv("DATA_DIR")), controlAddr: strings.TrimSpace(os.Getenv("CONTROL_ADDR")),
 		generationID: strings.TrimSpace(os.Getenv("CONTROL_GENERATION_ID")), controlIPCSocket: strings.TrimSpace(os.Getenv("CONTROL_IPC_SOCKET_PATH")),
 		controlTokenFile: strings.TrimSpace(os.Getenv("CONTROL_IPC_TOKEN_FILE")), engineCatalog: strings.TrimSpace(os.Getenv("ENGINE_CATALOG_FILE")),
-		activeEngine: strings.TrimSpace(os.Getenv("ACTIVE_ENGINE_GENERATION")), authDisabled: os.Getenv("AUTH_DISABLED") == "1", forceSecureCookies: os.Getenv("COOKIE_SECURE") == "1",
+		activeEngine: strings.TrimSpace(os.Getenv("ACTIVE_ENGINE_GENERATION")), authDisabled: os.Getenv("AUTH_DISABLED") == "1", forceSecureCookies: os.Getenv("COOKIE_SECURE") == "1", installationManaged: os.Getenv("RUNTIME_INSTALLATION_MANAGED") == "1",
 		resourceSocket: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_SOCKET_PATH")), resourceTokenFile: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_TOKEN_FILE")), resourceOwner: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_OWNER")),
 	}
 	if c.dataDir == "" || c.controlAddr == "" || c.generationID == "" || c.controlIPCSocket == "" || c.controlTokenFile == "" || c.engineCatalog == "" || c.activeEngine == "" {
@@ -199,6 +203,11 @@ type controlApplicationLifecycle struct {
 	open     controlApplicationFactory
 	app      controlApplicationRuntime
 	active   bool
+}
+
+type installationLifecycleApplication interface {
+	validateInstallation(context.Context) error
+	installationReady(context.Context) error
 }
 
 func newControlApplicationLifecycle(gate *controlplane.MutationGate, slot *handlerSlot, passive http.Handler, lifetime context.Context, open controlApplicationFactory) *controlApplicationLifecycle {
@@ -300,6 +309,38 @@ func (l *controlApplicationLifecycle) detachEngine(ctx context.Context, generati
 		return errors.New("active Control application is unavailable")
 	}
 	return l.app.detachEngine(ctx, generationID)
+}
+
+func (l *controlApplicationLifecycle) validateInstallation(ctx context.Context) error {
+	if l == nil {
+		return errors.New("Control application lifecycle is unavailable")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || !l.active {
+		return errors.New("active Control application is unavailable")
+	}
+	app, ok := l.app.(installationLifecycleApplication)
+	if !ok {
+		return errors.New("Control installation validation is unavailable")
+	}
+	return app.validateInstallation(ctx)
+}
+
+func (l *controlApplicationLifecycle) installationReady(ctx context.Context) error {
+	if l == nil {
+		return errors.New("Control application lifecycle is unavailable")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.app == nil || !l.active {
+		return errors.New("active Control application is unavailable")
+	}
+	app, ok := l.app.(installationLifecycleApplication)
+	if !ok {
+		return errors.New("Control installation activation is unavailable")
+	}
+	return app.installationReady(ctx)
 }
 
 func (l *controlApplicationLifecycle) resume(context.Context) error {
@@ -460,12 +501,13 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	}()
 	var authService *authn.Service
 	if !config.authDisabled {
-		authService, err = authn.Open(config.dataDir)
+		if config.installationManaged && installation.ReadOnly(config.dataDir).State == installation.StateRecoveryRequired {
+			authService, err = authn.OpenWithoutBootstrap(config.dataDir)
+		} else {
+			authService, err = authn.Open(config.dataDir)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("initialize administrator authentication: %w", err)
-		}
-		if authService.NeedsBootstrap() {
-			log.Printf("first administrator setup: read %s inside DATA_DIR", authService.BootstrapTokenRelativePath())
 		}
 	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
@@ -474,9 +516,10 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 		InitialIntegrityConcurrency: settings.IntegrityConcurrency(), InitialStorageSettings: &startupSettings.Storage,
 		ForceSecureCookies: config.forceSecureCookies, StartedAt: time.Now().UTC(), BuildInfo: buildinfo.Current(),
 		MutationGate: gate, BackgroundMutationGate: gate,
+		InstallationManaged: config.installationManaged,
 	})
 	cleanupAdapters, cleanupIntegrity, cleanupExport, cleanupPreview, cleanupWatch = false, false, false, false, false
-	return &controlApplication{adapters: adapters, manager: manager, store: store, integrity: integrityService, exports: exportService, previews: previewService, watches: watchService, api: api, gate: gate, lifetime: processCtx}, nil
+	return &controlApplication{adapters: adapters, manager: manager, store: store, integrity: integrityService, exports: exportService, previews: previewService, watches: watchService, api: api, gate: gate, lifetime: processCtx, dataDir: config.dataDir, installationManaged: config.installationManaged}, nil
 }
 
 func configureRuntimeResources(store *storage.Store, config processConfig) error {
@@ -561,16 +604,18 @@ func (b controlRuntimeStorageTelemetryBridge) StorageTelemetrySnapshot() (storag
 }
 
 type controlApplication struct {
-	adapters  *adapterhost.Host
-	manager   *recorderengine.ManagerRouter
-	store     *storage.Store
-	integrity *integrity.Service
-	exports   *derivative.Service
-	previews  *preview.Service
-	watches   *watch.Service
-	api       *server.Server
-	gate      *controlplane.MutationGate
-	lifetime  context.Context
+	adapters            *adapterhost.Host
+	manager             *recorderengine.ManagerRouter
+	store               *storage.Store
+	integrity           *integrity.Service
+	exports             *derivative.Service
+	previews            *preview.Service
+	watches             *watch.Service
+	api                 *server.Server
+	gate                *controlplane.MutationGate
+	lifetime            context.Context
+	dataDir             string
+	installationManaged bool
 
 	mu                     sync.Mutex
 	backgroundCancel       context.CancelFunc
@@ -591,6 +636,40 @@ type controlApplication struct {
 
 func (a *controlApplication) handler() http.Handler { return a.api }
 
+func (a *controlApplication) installationIsReady() bool {
+	return a == nil || !a.installationManaged || installation.ReadOnly(a.dataDir).State == installation.StateReady
+}
+
+func (a *controlApplication) validateInstallation(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a == nil || a.store == nil || a.manager == nil || a.adapters == nil || ctx.Err() != nil {
+		return errors.New("Control installation dependencies are unavailable")
+	}
+	probe := a.store.RunSetupProbe()
+	if probe.FreeBytes == 0 || !probe.WritePassed || !probe.DurabilityPassed {
+		return errors.New("primary storage self-test failed")
+	}
+	return nil
+}
+
+func (a *controlApplication) installationReady(ctx context.Context) error {
+	if a == nil {
+		return errors.New("Control application is unavailable")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	parent := a.lifetime
+	if parent == nil {
+		parent = context.Background()
+	}
+	return a.startBackground(parent)
+}
+
 func (a *controlApplication) detachEngine(ctx context.Context, generationID string) error {
 	if a == nil || a.manager == nil {
 		return errors.New("recorder Engine manager is unavailable")
@@ -599,10 +678,13 @@ func (a *controlApplication) detachEngine(ctx context.Context, generationID stri
 }
 
 func (a *controlApplication) startBackground(parent context.Context) error {
+	if !a.installationIsReady() {
+		return nil
+	}
 	a.mu.Lock()
 	if a.backgroundCancel != nil {
 		a.mu.Unlock()
-		return errors.New("Control background loops already started")
+		return nil
 	}
 	ctx, cancel := context.WithCancel(parent)
 	a.backgroundCancel = cancel
@@ -854,6 +936,9 @@ func (a *controlApplication) pauseForHandoff(ctx context.Context) error {
 }
 
 func (a *controlApplication) resumeAfterHandoff() error {
+	if !a.installationIsReady() {
+		return nil
+	}
 	if err := a.watches.Resume(); err != nil {
 		return err
 	}

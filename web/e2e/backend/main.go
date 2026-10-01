@@ -189,6 +189,25 @@ func run() error {
 		adapters.Close()
 		return err
 	}
+	setupCode, err := authn.ReadSetupCode(dataDir)
+	if err != nil {
+		_ = watchService.Close(context.Background())
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("read isolated E2E setup credential: %w", err)
+	}
+	if err := auth.Bootstrap(setupCode, "browser-e2e-strong-password"); err != nil {
+		_ = watchService.Close(context.Background())
+		_ = previewService.Close(context.Background())
+		_ = exportService.Close(context.Background())
+		_ = integrityService.Close(context.Background())
+		_ = manager.Close(context.Background())
+		adapters.Close()
+		return fmt.Errorf("seed isolated E2E administrator: %w", err)
+	}
 	api := server.NewWithOptions(manager, adapters, configs, server.Options{
 		Management: products, Integrity: integrityService, Derivatives: exportService,
 		Previews: previewService, Watches: watchService,
@@ -200,7 +219,7 @@ func run() error {
 	if addr == "" {
 		addr = "127.0.0.1:4173"
 	}
-	web := &http.Server{Addr: addr, Handler: api, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	web := &http.Server{Addr: addr, Handler: legacyWorkflowReadyHostProjection(api), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- web.ListenAndServe() }()
 	log.Printf("browser e2e API listening on %s", addr)
@@ -251,6 +270,28 @@ func run() error {
 	}
 	adapters.Close()
 	return nil
+}
+
+// legacyWorkflowReadyHostProjection exists only for the legacy application-
+// workflow E2E server, which runs the Control Plane in process without a
+// Runtime Host. The separate setup E2E exercises the real Host-owned setup API.
+// Keep this projection narrowly scoped so every other request reaches the real
+// application server unchanged.
+func legacyWorkflowReadyHostProjection(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/setup/status" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"state": "ready", "administrator_configured": true,
+				"claim_required": false, "recovery_required": false,
+				"auth_disabled": false, "version": "browser-e2e",
+				"release_channel": "development",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func closeServices(manager *acquire.Manager, integrityService *integrity.Service, exportService *derivative.Service, previewService *preview.Service, adapters *adapterhost.Host) error {

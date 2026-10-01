@@ -67,6 +67,40 @@ type storageMetricsResponse struct {
 	Items                 []storageMetricSample `json:"items"`
 }
 
+type setupStorageTestResponse struct {
+	Status         string `json:"status"`
+	FreeBytes      uint64 `json:"free_bytes"`
+	WriteTest      string `json:"write_test"`
+	DurabilityTest string `json:"durability_test"`
+	DiagnosticCode string `json:"diagnostic_code,omitempty"`
+}
+
+func (s *Server) setupStorageTest(w http.ResponseWriter, _ *http.Request) {
+	response := setupStorageTestResponse{Status: "error", WriteTest: "failed", DurabilityTest: "failed", DiagnosticCode: "storage_probe_failed"}
+	if s.storage == nil {
+		writeJSON(w, http.StatusServiceUnavailable, response)
+		return
+	}
+	probe := s.storage.RunSetupProbe()
+	response.FreeBytes = probe.FreeBytes
+	if probe.WritePassed {
+		response.WriteTest = "passed"
+	}
+	if probe.DurabilityPassed {
+		response.DurabilityTest = "passed"
+	}
+	if !probe.WritePassed {
+		response.Status = "error"
+	} else if !probe.DurabilityPassed || probe.FreeBytes < 1<<30 {
+		response.Status = "warning"
+		response.DiagnosticCode = "storage_probe_warning"
+	} else {
+		response.Status = "ready"
+		response.DiagnosticCode = ""
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 type storageMetricSample struct {
 	At                  time.Time `json:"at"`
 	ReadBytesPerSecond  uint64    `json:"read_bytes_per_second"`

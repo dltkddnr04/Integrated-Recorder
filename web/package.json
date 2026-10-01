@@ -10,6 +10,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:e2e": "node e2e/run-playwright.mjs",
+    "test:e2e:setup": "node e2e/run-setup-playwright.mjs",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {

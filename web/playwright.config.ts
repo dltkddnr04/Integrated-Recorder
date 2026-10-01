@@ -4,6 +4,9 @@ if (!e2eDataDir) throw new Error('Run Playwright through `npm run test:e2e` so t
 
 export default defineConfig({
   testDir: './e2e',
+  // First-run setup is a distinct production Host/Control/Engine process test
+  // with its own private data directory and credential handoff.
+  testIgnore: ['**/setup-first-run.spec.ts'],
   fullyParallel: false,
   workers: 1,
   reporter: 'list',

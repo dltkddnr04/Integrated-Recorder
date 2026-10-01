@@ -2,7 +2,8 @@ import { lazy } from 'react'
 import { createRootRouteWithContext, createRoute, createRouter, redirect } from '@tanstack/react-router'
 import type { QueryClient } from '@tanstack/react-query'
 import { RootComponent, RootError } from '@/components/route-shell'
-import { sessionQuery } from '@/api/queries'
+import { installationQuery, sessionQuery } from '@/api/queries'
+import { installationRouteRedirect } from '@/lib/installation-routing'
 const DashboardPage = lazy(() => import('@/routes/dashboard').then(module => ({ default: module.DashboardPage })))
 const RecordingsPage = lazy(() => import('@/routes/recordings').then(module => ({ default: module.RecordingsPage })))
 const RecordingDetailPage = lazy(() => import('@/routes/recording-detail').then(module => ({ default: module.RecordingDetailPage })))
@@ -18,6 +19,7 @@ const WatchDetailPage = lazy(() => import('@/routes/watch-detail').then(module =
 const StoragePage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StoragePage })))
 const StoragePoolDetailPage = lazy(() => import('@/routes/storage').then(module => ({ default: module.StoragePoolDetailPage })))
 const LoginPage = lazy(() => import('@/routes/login').then(module => ({ default: module.LoginPage })))
+const SetupPage = lazy(() => import('@/routes/setup').then(module => ({ default: module.SetupPage })))
 import { NotFoundPage } from '@/routes/not-found'
 import { isRecordingState } from '@/types/api'
 
@@ -26,9 +28,18 @@ type RecordRouteSearch = { q?: string; state?: string; adapter?: string; resourc
 const rootRoute = createRootRouteWithContext<RouterContext>()({
   beforeLoad: async ({ context, location }) => {
     const path = location.pathname
-    if (path === '/login') return
+    const installation = await context.queryClient.ensureQueryData(installationQuery)
+    const bootstrapCompatibility = path === '/login' && (location.search as Record<string, unknown>).mode === 'bootstrap'
+    if (path === '/setup') {
+      const destination = installationRouteRedirect(path, installation, false)
+      if (destination) throw redirect({ to: destination })
+      return
+    }
+    if (installation.state !== 'ready' && !bootstrapCompatibility) throw redirect({ to: '/setup' })
+    if (bootstrapCompatibility) throw redirect({ to: '/setup' })
     const session = await context.queryClient.ensureQueryData(sessionQuery)
-    if (session.needs_bootstrap || !session.authenticated) throw redirect({ to: '/login', search: session.needs_bootstrap ? { mode: 'bootstrap' } : {} })
+    const destination = installationRouteRedirect(path, installation, installation.auth_disabled || session.authenticated)
+    if (destination) throw redirect({ to: destination })
   },
   component: RootComponent,
   notFoundComponent: NotFoundPage,
@@ -36,8 +47,9 @@ const rootRoute = createRootRouteWithContext<RouterContext>()({
 })
 const loginRoute = createRoute({ getParentRoute: () => rootRoute, path: '/login', validateSearch: (search: Record<string, unknown>): { mode?: 'bootstrap' } => search.mode === 'bootstrap' ? { mode: 'bootstrap' } : {}, beforeLoad: async ({ context }) => {
   const session = await context.queryClient.ensureQueryData(sessionQuery)
-  if (session.authenticated && !session.needs_bootstrap) throw redirect({ to: '/' })
+  if (session.authenticated) throw redirect({ to: '/' })
 }, component: LoginPage })
+const setupRoute = createRoute({ getParentRoute: () => rootRoute, path: '/setup', component: SetupPage })
 const dashboardRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: DashboardPage })
 const recordingsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/recordings', validateSearch: (search: Record<string, unknown>): RecordRouteSearch => ({
   q: typeof search.q === 'string' ? search.q : undefined, state: isRecordingState(search.state) ? search.state : undefined,
@@ -60,6 +72,6 @@ const watchDetailRoute = createRoute({ getParentRoute: () => rootRoute, path: '/
 const storageRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage', component: StoragePage })
 const storagePoolRoute = createRoute({ getParentRoute: () => rootRoute, path: '/storage/$poolId', component: StoragePoolDetailPage })
 
-const routeTree = rootRoute.addChildren([loginRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, storageRoute, storagePoolRoute, settingsRoute])
+const routeTree = rootRoute.addChildren([loginRoute, setupRoute, dashboardRoute, recordingsRoute, recordingRoute, newRoute, adaptersRoute, adapterRoute, workflowsRoute, workflowRoute, watchesRoute, watchNewRoute, watchDetailRoute, storageRoute, storagePoolRoute, settingsRoute])
 export const router = createRouter({ routeTree, context: { queryClient: undefined! }, defaultPreload: 'intent', defaultPreloadStaleTime: 0 })
 declare module '@tanstack/react-router' { interface Register { router: typeof router } }

@@ -1,8 +1,8 @@
 import { queryOptions } from '@tanstack/react-query'
-import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, runtimeUpdateAPI, storageAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
+import { adaptersAPI, authAPI, dashboardAPI, derivativeAPI, integrityAPI, productAPI, recordingsAPI, runtimeUpdateAPI, setupAPI, storageAPI, watchesAPI, workflowsAPI, type PreviewQuery, type RecordingQuery, type StorageMetricWindow } from './index'
 
 export const qk = {
-  session: ['auth', 'session'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
+  session: ['auth', 'session'] as const, installation: ['installation', 'status'] as const, dashboard: ['dashboard'] as const, storage: ['system', 'storage'] as const, info: ['system', 'info'] as const,
   storagePools: ['storage', 'pools'] as const, storageMetrics: (poolId: string, window: StorageMetricWindow) => ['storage', 'pool', poolId, 'metrics', window] as const,
   settings: ['settings'] as const, runtimeUpdate: ['runtime-update'] as const, recordings: (query: RecordingQuery) => ['recordings', query] as const,
   recording: (id: string) => ['recording', id] as const, tags: (id: string) => ['recording', id, 'tags'] as const,
@@ -18,6 +18,11 @@ export const qk = {
   notifications: ['notifications'] as const, audit: ['audit'] as const, logs: (query: unknown) => ['logs', query] as const,
 }
 export const sessionQuery = queryOptions({ queryKey: qk.session, queryFn: authAPI.session, retry: false, staleTime: 10_000 })
+export const installationQuery = queryOptions({
+  queryKey: qk.installation, queryFn: setupAPI.status, retry: false, staleTime: 0,
+  refetchInterval: query => query.state.data?.state === 'ready' ? false : 5_000,
+  refetchIntervalInBackground: false,
+})
 export const runtimeUpdateQuery = queryOptions({ queryKey: qk.runtimeUpdate, queryFn: () => runtimeUpdateAPI.status(), staleTime: 5_000, refetchInterval: 15_000, refetchIntervalInBackground: false })
 export const adaptersQuery = queryOptions({ queryKey: qk.adapters, queryFn: adaptersAPI.list, staleTime: 15_000, refetchInterval: 20_000, refetchIntervalInBackground: false })
 export const dashboardQuery = queryOptions({ queryKey: qk.dashboard, queryFn: dashboardAPI.get, staleTime: 10_000, refetchInterval: 15_000, refetchIntervalInBackground: false })

@@ -84,8 +84,9 @@ type Store struct {
 // LocalFilesystemBackend owns physical filesystem paths and crash-safe local
 // publication. Canonical metadata stores only logical relative paths.
 type LocalFilesystemBackend struct {
-	root      string
-	telemetry *telemetry
+	root         string
+	telemetry    *telemetry
+	setupProbeMu sync.Mutex
 
 	issuesMu sync.RWMutex
 	issues   []RecoveryIssue
@@ -116,6 +117,10 @@ func New(root string) (*Store, error) {
 	}
 	backend := &LocalFilesystemBackend{root: abs}
 	backend.telemetry = newTelemetry()
+	// Setup probes are disposable. If the Host was terminated while a probe
+	// was running, remove only stale, private probe directories when a later
+	// application generation opens storage.
+	cleanupSetupProbeResidue(filepath.Join(abs, "runtime", "state"))
 	return &Store{StorageBackend: backend, root: abs, ingestOptions: DefaultIngestOptions()}, nil
 }
 

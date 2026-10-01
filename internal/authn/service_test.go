@@ -115,6 +115,85 @@ func TestBootstrapRejectsWrongTokenConsumesTokenAndRejectsReplay(t *testing.T) {
 	}
 }
 
+func TestReadSetupCodeIsReadOnlyAndRefusesAfterClaim(t *testing.T) {
+	root := t.TempDir()
+	service, token := openForTest(t, root)
+	got, err := ReadSetupCode(root)
+	if err != nil || got != token {
+		t.Fatalf("ReadSetupCode = %q, %v; want existing token", got, err)
+	}
+	if err := service.Bootstrap(token, testPassword); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadSetupCode(root); got != "" || !errors.Is(err, ErrBootstrapUnavailable) {
+		t.Fatalf("claimed ReadSetupCode = %q, %v; want unavailable", got, err)
+	}
+}
+
+func TestAuthenticationInstancesRefreshAdministratorAfterCrossProcessBootstrap(t *testing.T) {
+	root := t.TempDir()
+	host, token := openForTest(t, root)
+	control, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control.bcryptCost = bcrypt.MinCost
+	if err := control.Bootstrap(token, testPassword); err != nil {
+		t.Fatal(err)
+	}
+	configured, err := host.AdministratorConfigured()
+	if err != nil || !configured {
+		t.Fatalf("Host administrator inspection configured=%v err=%v", configured, err)
+	}
+	if host.NeedsBootstrap() {
+		t.Fatal("Host auth instance still reports bootstrap required")
+	}
+	if _, err := host.Login(testPassword); err != nil {
+		t.Fatalf("Host auth instance could not log in after Control bootstrap: %v", err)
+	}
+	if err := host.Bootstrap(token, "another-valid-password"); !errors.Is(err, ErrBootstrapUnavailable) {
+		t.Fatalf("stale Host instance bootstrap replay error=%v", err)
+	}
+}
+
+func TestOpenWithoutBootstrapNeverCreatesReplacementToken(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, securityDirectory), 0700); err != nil {
+		t.Fatal(err)
+	}
+	service, err := OpenWithoutBootstrap(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Bootstrap("no-token", testPassword); !errors.Is(err, ErrBootstrapUnavailable) {
+		t.Fatalf("recovery-only auth bootstrap error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, securityDirectory, bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovery auth created bootstrap token: %v", err)
+	}
+}
+
+func TestOpenWithoutBootstrapServesFailClosedOnCorruptAdmin(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, securityDirectory), 0700); err != nil {
+		t.Fatal(err)
+	}
+	adminPath := filepath.Join(root, securityDirectory, adminFilename)
+	if err := os.WriteFile(adminPath, []byte(`{not-json`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	service, err := OpenWithoutBootstrap(root)
+	if err != nil {
+		t.Fatalf("recovery auth should still start read-only: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, securityDirectory, bootstrapTokenFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt admin generated setup token: %v", err)
+	}
+	if _, err := service.Login(testPassword); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("login against corrupt admin error=%v", err)
+	}
+}
+
 func TestPasswordPolicyAndBcryptPersistence(t *testing.T) {
 	root := t.TempDir()
 	service, token := openForTest(t, root)

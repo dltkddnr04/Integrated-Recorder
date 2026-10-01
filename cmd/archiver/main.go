@@ -168,9 +168,6 @@ func run() error {
 			adapters.Close()
 			return fmt.Errorf("initialize administrator authentication: %w", err)
 		}
-		if authService.NeedsBootstrap() {
-			log.Printf("first administrator setup: read %s inside DATA_DIR", authService.BootstrapTokenRelativePath())
-		}
 	}
 	forceSecureCookies := os.Getenv("COOKIE_SECURE") == "1"
 	startedAt := time.Now().UTC()

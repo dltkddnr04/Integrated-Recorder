@@ -51,6 +51,7 @@ type Server struct {
 	logs                        *applog.Store
 	initialIntegrityConcurrency int
 	forceSecureCookie           bool
+	installationManaged         bool
 	version                     string
 	commit                      string
 	buildInfo                   buildinfo.Info
@@ -98,6 +99,7 @@ type Options struct {
 	Version                     string
 	Commit                      string
 	BuildInfo                   buildinfo.Info
+	InstallationManaged         bool
 	MutationGate                interface {
 		Wrap(http.Handler) http.Handler
 	}
@@ -159,11 +161,12 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 			archiveStore = local.Store()
 		}
 	}
-	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
+	s := &Server{manager: manager, storage: archiveStore, adapters: adapters, configs: configs, products: options.Management, integrity: options.Integrity, derivatives: options.Derivatives, previews: options.Previews, watches: options.Watches, auth: options.Auth, settings: options.Settings, effectiveStorage: effectiveStorage, logs: logs, initialIntegrityConcurrency: options.InitialIntegrityConcurrency, forceSecureCookie: options.ForceSecureCookies, installationManaged: options.InstallationManaged, version: version, commit: commit, buildInfo: build, mux: http.NewServeMux(), workflowTitles: map[string]workflowTitle{}, startedAt: startedAt, retentionGate: make(chan struct{}, 1), backgroundMutationGate: options.BackgroundMutationGate}
 	s.retentionGate <- struct{}{}
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("GET /", s.index)
 	s.registerAuthRoutes()
+	s.mux.HandleFunc("POST /api/setup/storage-test", s.setupStorageTest)
 	static, _ := fs.Sub(staticFiles, "static")
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
 	s.mux.HandleFunc("POST /api/recordings", s.create)
@@ -195,6 +198,9 @@ func NewWithOptions(manager recordingManager, adapters *adapterhost.Host, config
 	}
 	if options.MutationGate != nil {
 		handler = options.MutationGate.Wrap(handler)
+	}
+	if options.InstallationManaged {
+		handler = s.installationMiddleware(handler)
 	}
 	handler = s.flushWorkflowLifecycleMiddleware(handler)
 	handler = requestLogMiddleware(s.logs, handler)

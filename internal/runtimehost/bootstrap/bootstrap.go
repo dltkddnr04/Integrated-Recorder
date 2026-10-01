@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
@@ -161,6 +164,35 @@ func Run(ctx context.Context, config Config) error {
 	if err := makePrivateRuntimeDirs(config.DataDir); err != nil {
 		return err
 	}
+	adminState := installation.AdminMissing
+	if !config.AuthDisabled {
+		configured, inspectErr := authn.InspectAdministrator(config.DataDir)
+		if inspectErr != nil {
+			adminState = installation.AdminUnknown
+		} else if configured {
+			adminState = installation.AdminConfigured
+		}
+	}
+	installState, err := installation.Reconcile(config.DataDir, adminState, config.AuthDisabled)
+	if err != nil {
+		return fmt.Errorf("initialize Runtime Host installation state: %w", err)
+	}
+	var hostAuth *authn.Service
+	if !config.AuthDisabled {
+		if installState.Snapshot().State == installation.StateRecoveryRequired {
+			hostAuth, err = authn.OpenWithoutBootstrap(config.DataDir)
+		} else {
+			hostAuth, err = authn.Open(config.DataDir)
+		}
+		if err != nil {
+			return fmt.Errorf("initialize Runtime Host authentication: %w", err)
+		}
+	}
+	if installState.Snapshot().State == installation.StateUninitialized || installState.Snapshot().State == installation.StateSetupInProgress {
+		log.Printf("First-run setup is required. Obtain the one-time setup code with `runtime-host setup-code` inside the runtime.")
+	} else if installState.Snapshot().State == installation.StateRecoveryRequired {
+		log.Printf("Installation recovery is required (diagnostic: %s).", installState.Snapshot().DiagnosticCode)
+	}
 	listener, err := net.Listen("tcp", config.ListenAddr)
 	if err != nil {
 		return errors.New("Runtime Host listener could not be opened")
@@ -283,13 +315,14 @@ func Run(ctx context.Context, config Config) error {
 		"RUNTIME_RESOURCE_OWNER=" + ownerID,
 	}
 	commonEnv := commonChildEnv(config)
+	engineRecoveryMode := initialEngineRecoveryMode(installState.Snapshot().State)
 	engineSpec := supervisor.ProcessSpec{
 		GenerationID: generationID, Role: supervisor.RoleEngine,
 		Executable: selected.enginePath, Dir: selected.directory,
 		Env: append(append(append([]string(nil), commonEnv...), resourceEnv...),
 			"ENGINE_SOCKET_PATH="+engineSocket,
 			"ENGINE_GENERATION_ID="+generationID,
-			"ENGINE_RECOVERY_MODE=recover",
+			"ENGINE_RECOVERY_MODE="+engineRecoveryMode,
 			"ENGINE_IPC_TOKEN_FILE="+engineTokenPath),
 	}
 	readiness.register(generationID, supervisor.RoleEngine, engineSocket, engineTokenPath)
@@ -398,13 +431,6 @@ func Run(ctx context.Context, config Config) error {
 		_ = registry.ReleaseRecording(recordingID, lease.EngineGeneration)
 	}
 
-	var hostAuth *authn.Service
-	if !config.AuthDisabled {
-		hostAuth, err = authn.Open(config.DataDir)
-		if err != nil {
-			return fmt.Errorf("initialize Runtime Host update authentication: %w", err)
-		}
-	}
 	installer, err := install.NewInstaller(filepath.Join(config.DataDir, "runtime"), config.TrustedReleaseKeys, currentHostCompatibility())
 	if err != nil {
 		return fmt.Errorf("initialize immutable release installer: %w", err)
@@ -429,6 +455,10 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return fmt.Errorf("initialize Runtime Host update API: %w", err)
 	}
+	setupHandler, err := httpapi.NewWithSetup(hostAuth, config.AuthDisabled, installState, build, lifecycle, updateHandler)
+	if err != nil {
+		return fmt.Errorf("initialize Runtime Host setup API: %w", err)
+	}
 	if err := updates.ReconcileLeases(ctx); err != nil {
 		return fmt.Errorf("confirm initial Recorder Engine inventory: %w", err)
 	}
@@ -449,11 +479,43 @@ func Run(ctx context.Context, config Config) error {
 			}
 		}
 	}()
-	serveErr := sup.ServeWithHostHandler(ctx, listener, httpapi.Endpoint, updateHandler)
+	serveErr := sup.ServeWithHostHandler(ctx, listener, "/api", setupHandler)
 	stopLeaseReconciliation()
 	<-leaseDone
 	supervisorClosed = true
 	return serveErr
+}
+
+// PrintSetupCode writes the already-created one-time setup credential to the
+// caller's local terminal. It performs no mutation and refuses to expose a
+// credential after administrator claim or installation completion.
+func PrintSetupCode(dataDir string, output io.Writer) error {
+	if output == nil || strings.TrimSpace(dataDir) == "" || !filepath.IsAbs(dataDir) || filepath.Clean(dataDir) != dataDir {
+		return errors.New("setup code is unavailable")
+	}
+	snapshot := installation.ReadOnly(dataDir)
+	if snapshot.State != installation.StateUninitialized && snapshot.State != installation.StateSetupInProgress {
+		return errors.New("setup code is unavailable")
+	}
+	code, err := authn.ReadSetupCode(dataDir)
+	if err != nil || code == "" || strings.ContainsAny(code, "\r\n") {
+		return errors.New("setup code is unavailable")
+	}
+	// Bootstrap runs in another process. Recheck shared durable state before
+	// writing any bytes so a setup code cannot be printed after a concurrent
+	// administrator claim. Keep the error deliberately generic and path-free.
+	configured, inspectErr := authn.InspectAdministrator(dataDir)
+	if inspectErr != nil || configured {
+		return errors.New("setup code is unavailable")
+	}
+	snapshot = installation.ReadOnly(dataDir)
+	if snapshot.State != installation.StateUninitialized && snapshot.State != installation.StateSetupInProgress {
+		return errors.New("setup code is unavailable")
+	}
+	if _, err := io.WriteString(output, code+"\n"); err != nil {
+		return errors.New("setup code could not be written")
+	}
+	return nil
 }
 
 func releaseProcessResources(coordinator *resources.Coordinator, spec supervisor.ProcessSpec) {
@@ -488,6 +550,17 @@ func newResourceOwnerIDForRole(role, generationID string) (string, error) {
 	return role + generationID + "-" + instanceID, nil
 }
 
+// initialEngineRecoveryMode prevents a first-run or recovery-required setup
+// Host from running archive recovery writes before installation is ready.
+// Legacy installations are reconciled to ready before this decision, so they
+// keep normal restart recovery behavior.
+func initialEngineRecoveryMode(state installation.State) string {
+	if state == installation.StateReady {
+		return "recover"
+	}
+	return "fresh"
+}
+
 // releaseEngineResources is retained as a narrow helper for older package
 // tests; production releases both Engine and Control process-owned leases.
 func releaseEngineResources(coordinator *resources.Coordinator, spec supervisor.ProcessSpec) {
@@ -513,6 +586,7 @@ func commonChildEnv(config Config) []string {
 		"HOME=" + config.DataDir,
 		"TMPDIR=/tmp",
 		"DATA_DIR=" + config.DataDir,
+		"RUNTIME_INSTALLATION_MANAGED=1",
 		"ADAPTER_DIR=" + config.AdapterDirs,
 	}
 	if config.FFmpegPath != "" {
@@ -918,8 +992,9 @@ func (r *processReadiness) WaitReady(ctx context.Context, spec supervisor.Proces
 }
 
 type controlLifecycle struct {
-	mu      chan struct{}
-	clients map[string]*runtimeipc.Client
+	mu       chan struct{}
+	clients  map[string]*runtimeipc.Client
+	activeID string
 }
 
 func newControlLifecycle() *controlLifecycle {
@@ -984,6 +1059,32 @@ func (c *controlLifecycle) Activate(ctx context.Context, generationID string) er
 	if err != nil || !snapshot.Ready || !snapshot.Prepared || snapshot.State != controlplane.LifecycleActive || !snapshot.Active {
 		return errors.New("candidate Control activation was not confirmed")
 	}
+	<-c.mu
+	c.activeID = generationID
+	c.mu <- struct{}{}
+	return nil
+}
+
+func (c *controlLifecycle) ValidateInstallation(ctx context.Context) error {
+	snapshot, err := c.call(ctx, c.activeGenerationID(), controlplane.OperationControlValidateInstall)
+	if err != nil || !snapshot.Active || snapshot.State != controlplane.LifecycleActive {
+		return errors.New("active Control installation validation was not confirmed")
+	}
+	return nil
+}
+
+func (c *controlLifecycle) activeGenerationID() string {
+	<-c.mu
+	id := c.activeID
+	c.mu <- struct{}{}
+	return id
+}
+
+func (c *controlLifecycle) InstallationReady(ctx context.Context) error {
+	snapshot, err := c.call(ctx, c.activeGenerationID(), controlplane.OperationControlInstallReady)
+	if err != nil || !snapshot.Active || snapshot.State != controlplane.LifecycleActive {
+		return errors.New("active Control installation activation was not confirmed")
+	}
 	return nil
 }
 
@@ -998,6 +1099,11 @@ func (c *controlLifecycle) Rollback(ctx context.Context, oldID, newID string) er
 		if snapshot, err := c.call(ctx, oldID, controlplane.OperationControlResume); err != nil || snapshot.State != controlplane.LifecycleActive {
 			errs = append(errs, errors.New("previous Control could not resume"))
 		}
+	}
+	if len(errs) == 0 && oldID != "" {
+		<-c.mu
+		c.activeID = oldID
+		c.mu <- struct{}{}
 	}
 	return errors.Join(errs...)
 }

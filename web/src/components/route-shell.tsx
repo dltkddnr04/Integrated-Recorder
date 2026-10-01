@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 
 export function RootComponent() {
   const pathname = useRouterState({ select: state => state.location.pathname })
-  return <Suspense fallback={<div className="grid min-h-screen place-items-center bg-background p-6 text-sm text-muted-foreground" role="status">화면 불러오는 중…</div>}>{pathname === '/login' ? <Outlet /> : <AppShell />}</Suspense>
+  return <Suspense fallback={<div className="grid min-h-screen place-items-center bg-background p-6 text-sm text-muted-foreground" role="status">화면 불러오는 중…</div>}>{pathname === '/login' || pathname === '/setup' ? <Outlet /> : <AppShell />}</Suspense>
 }
 
 export function RootError({ reset }: { reset: () => void }) {

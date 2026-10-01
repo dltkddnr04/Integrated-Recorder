@@ -30,6 +30,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
@@ -615,6 +616,10 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	baseURL := "http://" + listenAddr
 	client := &http.Client{Timeout: 3 * time.Minute}
 	status := waitRuntimeHostStatus(t, ctx, client, baseURL, process)
+	installationBefore := installation.ReadOnly(dataDir)
+	if installationBefore.State != installation.StateReady || installationBefore.InstallationID == "" {
+		t.Fatalf("AUTH_DISABLED bootstrap did not durably initialize installation: %+v", installationBefore)
+	}
 	if status.Host.Version != e2eVersionA || status.Host.Commit != e2eCommitA || status.Application.Version != e2eVersionA || status.Application.Commit != e2eCommitA {
 		t.Fatalf("initial production Host/Application identity = host=%+v application=%+v, want release A", status.Host, status.Application)
 	}
@@ -700,6 +705,11 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if refreshAt.After(activateFinished) {
 		releaseRefresh()
 		t.Fatalf("fixture refresh began after activation returned; expected an in-flight Engine A refresh: refresh=%s activation=%s..%s", refreshAt, activateStarted, activateFinished)
+	}
+	installationAfter := installation.ReadOnly(dataDir)
+	if installationAfter.State != installation.StateReady || installationAfter.InstallationID != installationBefore.InstallationID {
+		releaseRefresh()
+		t.Fatalf("A→B application activation changed Host-owned installation state: before=%+v after=%+v", installationBefore, installationAfter)
 	}
 	if err := waitProcessAbsent(t, controlABinary, 20*time.Second); err != nil {
 		releaseRefresh()

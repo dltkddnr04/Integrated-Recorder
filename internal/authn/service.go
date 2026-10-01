@@ -80,6 +80,7 @@ type Service struct {
 	securityDir string
 	sessionsDir string
 	adminHash   []byte
+	allowToken  bool
 
 	now        func() time.Time
 	bcryptCost int
@@ -89,6 +90,18 @@ type Service struct {
 // administrator exists. The bootstrap token is persisted in a restricted
 // file and is never returned by this API.
 func Open(dataRoot string) (*Service, error) {
+	return open(dataRoot, true)
+}
+
+// OpenWithoutBootstrap opens existing authentication state without creating a
+// new bootstrap credential. Runtime Host uses this in recovery mode so a
+// missing administrator can never silently turn a ready installation into a
+// claimable one.
+func OpenWithoutBootstrap(dataRoot string) (*Service, error) {
+	return open(dataRoot, false)
+}
+
+func open(dataRoot string, allowToken bool) (*Service, error) {
 	if strings.TrimSpace(dataRoot) == "" {
 		return nil, ErrStorage
 	}
@@ -120,6 +133,7 @@ func Open(dataRoot string) (*Service, error) {
 		sessionsDir: sessionsDir,
 		now:         time.Now,
 		bcryptCost:  defaultBcryptCost,
+		allowToken:  allowToken,
 	}
 	adminPath := filepath.Join(securityDir, adminFilename)
 	hash, err := readAdminHash(adminPath)
@@ -136,26 +150,104 @@ func Open(dataRoot string) (*Service, error) {
 		return s, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
+		if !allowToken {
+			// Recovery-mode servers still need to serve the bounded recovery UI.
+			// All authentication operations fail closed when the underlying admin
+			// record is corrupt; critically, no replacement claim token is made.
+			return s, nil
+		}
 		return nil, err
 	}
-	if err := ensureBootstrapToken(securityDir); err != nil {
-		return nil, err
+	if allowToken {
+		if err := ensureBootstrapToken(securityDir); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
-// NeedsBootstrap reports whether the administrator has not yet been set up.
-func (s *Service) NeedsBootstrap() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.adminHash) == 0
+// InspectAdministrator validates the persisted administrator record without
+// creating a token, changing permissions, or otherwise mutating auth state.
+func InspectAdministrator(dataRoot string) (bool, error) {
+	if strings.TrimSpace(dataRoot) == "" {
+		return false, ErrStorage
+	}
+	root, err := filepath.Abs(dataRoot)
+	if err != nil {
+		return false, ErrStorage
+	}
+	securityDir := filepath.Join(root, securityDirectory)
+	info, err := os.Lstat(securityDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, ErrStorage
+	}
+	_, err = readAdminHashReadOnly(filepath.Join(securityDir, adminFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-// BootstrapTokenRelativePath returns the stable, data-root-relative path
-// where the first-run token is stored. It never returns the token itself or
-// an absolute filesystem path.
-func (s *Service) BootstrapTokenRelativePath() string {
-	return filepath.ToSlash(filepath.Join(securityDirectory, bootstrapTokenFilename))
+// ReadSetupCode returns the existing one-time bootstrap credential for a
+// local CLI. It is deliberately read-only and never rotates or creates a
+// credential. Callers must not expose it through an HTTP API or logs.
+func ReadSetupCode(dataRoot string) (string, error) {
+	configured, err := InspectAdministrator(dataRoot)
+	if err != nil {
+		return "", err
+	}
+	if configured {
+		return "", ErrBootstrapUnavailable
+	}
+	root, err := filepath.Abs(dataRoot)
+	if err != nil {
+		return "", ErrStorage
+	}
+	path := filepath.Join(root, securityDirectory, bootstrapTokenFilename)
+	token, err := readBootstrapTokenReadOnly(path)
+	if err != nil {
+		return "", err
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(string(token))
+	if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != string(token) {
+		return "", ErrCorruptStore
+	}
+	return string(token), nil
+}
+
+// AdministratorConfigured re-reads the shared durable admin record so Host
+// and Control instances observe a bootstrap performed by the other process.
+func (s *Service) AdministratorConfigured() (bool, error) {
+	if s == nil {
+		return false, ErrStorage
+	}
+	hash, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		s.mu.Lock()
+		s.adminHash = nil
+		s.mu.Unlock()
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	s.adminHash = append(s.adminHash[:0], hash...)
+	s.mu.Unlock()
+	return true, nil
+}
+
+// NeedsBootstrap is retained for compatibility. Read failures fail closed by
+// reporting that bootstrap is unavailable.
+func (s *Service) NeedsBootstrap() bool {
+	configured, err := s.AdministratorConfigured()
+	return err != nil || !configured
 }
 
 // Bootstrap installs the single administrator password if token matches the
@@ -167,6 +259,15 @@ func (s *Service) Bootstrap(token, password string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.allowToken {
+		return ErrBootstrapUnavailable
+	}
+	if hash, err := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename)); err == nil {
+		s.adminHash = append(s.adminHash[:0], hash...)
+		return ErrBootstrapUnavailable
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ErrBootstrapUnavailable
+	}
 	if len(s.adminHash) != 0 {
 		return ErrBootstrapUnavailable
 	}
@@ -192,7 +293,10 @@ func (s *Service) Bootstrap(token, password string) error {
 	if err != nil {
 		return fmt.Errorf("%w: encode administrator record", ErrStorage)
 	}
-	if err := atomicWrite(filepath.Join(s.securityDir, adminFilename), append(record, '\n'), 0600); err != nil {
+	if err := atomicCreate(filepath.Join(s.securityDir, adminFilename), append(record, '\n'), 0600); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return ErrBootstrapUnavailable
+		}
 		return err
 	}
 	s.adminHash = append([]byte(nil), hash...)
@@ -205,17 +309,31 @@ func (s *Service) Bootstrap(token, password string) error {
 	return nil
 }
 
+// NeedsBootstrap reports whether the administrator has not yet been set up.
+// BootstrapTokenRelativePath returns the stable, data-root-relative path
+// where the first-run token is stored. It never returns the token itself or
+// an absolute filesystem path.
+func (s *Service) BootstrapTokenRelativePath() string {
+	return filepath.ToSlash(filepath.Join(securityDirectory, bootstrapTokenFilename))
+}
+
 // Login verifies the password and creates a durable, process-shared session.
 func (s *Service) Login(password string) (Session, error) {
 	if !validPasswordLength(password) {
 		return Session{}, ErrInvalidCredentials
 	}
-	s.mu.Lock()
-	if len(s.adminHash) == 0 {
+	passwordHash, readErr := readAdminHashReadOnly(filepath.Join(s.securityDir, adminFilename))
+	if errors.Is(readErr, os.ErrNotExist) {
+		s.mu.Lock()
+		s.adminHash = nil
 		s.mu.Unlock()
 		return Session{}, ErrNotBootstrapped
 	}
-	passwordHash := append([]byte(nil), s.adminHash...)
+	if readErr != nil {
+		return Session{}, ErrInvalidCredentials
+	}
+	s.mu.Lock()
+	s.adminHash = append(s.adminHash[:0], passwordHash...)
 	s.mu.Unlock()
 	if bcrypt.CompareHashAndPassword(passwordHash, []byte(password)) != nil {
 		return Session{}, ErrInvalidCredentials
@@ -514,6 +632,43 @@ func readAdminHash(path string) ([]byte, error) {
 	return hash, nil
 }
 
+func readAdminHashReadOnly(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, ErrStorage
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > 4096 {
+		return nil, ErrCorruptStore
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, ErrStorage
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, ErrCorruptStore
+	}
+	decoder := json.NewDecoder(io.LimitReader(f, 4096))
+	decoder.DisallowUnknownFields()
+	var record adminRecord
+	if err := decoder.Decode(&record); err != nil || record.PasswordHash == "" {
+		return nil, ErrCorruptStore
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, ErrCorruptStore
+	}
+	hash := []byte(record.PasswordHash)
+	if _, err := bcrypt.Cost(hash); err != nil {
+		return nil, ErrCorruptStore
+	}
+	return hash, nil
+}
+
 func ensureBootstrapToken(securityDir string) error {
 	path := filepath.Join(securityDir, bootstrapTokenFilename)
 	token, err := randomToken()
@@ -580,6 +735,33 @@ func readBootstrapToken(path string) ([]byte, error) {
 	return data, nil
 }
 
+func readBootstrapTokenReadOnly(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, os.ErrNotExist
+		}
+		return nil, ErrStorage
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maxBootstrapTokenLength {
+		return nil, ErrCorruptStore
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, ErrStorage
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, ErrCorruptStore
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBootstrapTokenLength+1))
+	if err != nil || len(data) == 0 || len(data) > maxBootstrapTokenLength {
+		return nil, ErrCorruptStore
+	}
+	return data, nil
+}
+
 func atomicWrite(path string, data []byte, mode os.FileMode) (retErr error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".authn-*.tmp")
@@ -609,6 +791,42 @@ func atomicWrite(path string, data []byte, mode os.FileMode) (retErr error) {
 		return fmt.Errorf("%w: publish record", ErrStorage)
 	}
 	if err := syncDirectory(dir); err != nil {
+		return fmt.Errorf("%w: sync record directory", ErrStorage)
+	}
+	return nil
+}
+
+// atomicCreate publishes a record only when no prior file exists. It is used
+// for the administrator identity so concurrent Host/Control bootstrap calls
+// cannot race through process-local mutexes and overwrite one another.
+func atomicCreate(path string, data []byte, mode os.FileMode) (retErr error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".authn-create-*.tmp")
+	if err != nil {
+		return fmt.Errorf("%w: create temporary record", ErrStorage)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(mode); err != nil {
+		return fmt.Errorf("%w: set record permissions", ErrStorage)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("%w: write record", ErrStorage)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("%w: sync record", ErrStorage)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("%w: close record", ErrStorage)
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		return err
+	}
+	if err := syncDirectory(dir); err != nil {
+		_ = os.Remove(path)
 		return fmt.Errorf("%w: sync record directory", ErrStorage)
 	}
 	return nil

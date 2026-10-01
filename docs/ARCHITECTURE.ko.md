@@ -146,7 +146,17 @@ Adapter resource browsing은 protocol capability `resource_browse`를 선언한 
 
 ## 인증, settings와 파생 export
 
-기본 실행은 single administrator authentication을 활성화합니다. 초기에는 `DATA_DIR/security/bootstrap-token`의 0600 token으로 12바이트 이상 password를 설정하고 bcrypt hash만 저장합니다. Session token은 CSPRNG에서 생성합니다. token hash, CSRF hash, 만료 시각만 `DATA_DIR/security/sessions` 아래 별도 0600 session record로 저장하므로 Control 세대 교체 중 session과 server-side revocation을 공유합니다. Browser cookie는 HttpOnly, SameSite=Strict이며 mutation에는 CSRF token header가 필요합니다. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제합니다. `AUTH_DISABLED=1`은 loopback bind에서만 허용됩니다. 현재 user/role system, password reset, remote identity provider는 없습니다.
+기본 실행은 single administrator authentication을 활성화합니다. 최초 설치는 Runtime Host가 소유하는 별도의 installation lifecycle입니다. 로컬 `runtime-host setup-code` 명령은 이미 생성된 mode-`0600` one-time claim code만 출력합니다. Browser는 이 값을 URL이 아닌 bootstrap form body로 제출합니다. Password는 12–72 byte이고 bcrypt hash만 저장합니다. Session token은 CSPRNG에서 생성합니다. token hash, CSRF hash, 만료 시각만 `DATA_DIR/security/sessions` 아래 별도 0600 session record로 저장하므로 Control 세대 교체 중 session과 server-side revocation을 공유합니다. Browser cookie는 HttpOnly, SameSite=Strict이며 mutation에는 CSRF token header가 필요합니다. TLS reverse proxy 뒤에서는 `COOKIE_SECURE=1`로 Secure cookie를 강제합니다. `AUTH_DISABLED=1`은 loopback bind에서만 허용됩니다. 현재 user/role system, password reset, remote identity provider는 없습니다.
+
+설치 identity와 readiness는 application generation과 무관하게 유지되며 canonical recording archive나 product-management record와 분리된 `DATA_DIR/runtime/installation.json`에 저장됩니다. Runtime Host만 bounded mode-`0600` state와 transition을 소유합니다.
+
+```text
+uninitialized → setup_in_progress → ready
+       └──────────────→ ready (loopback-only AUTH_DISABLED)
+critical state 손상/불일치 → recovery_required
+```
+
+Installation record가 없고 유효한 기존 administrator가 있으면 legacy 설치로 판정해 `ready`로 원자적 migration합니다. 반대로 `ready` 설치에서 administrator가 사라지면 새 claim을 만들지 않고 `recovery_required`로 fail-closed합니다. `ready` 전 Control은 setup/authentication과 명시적 read-only diagnostics만 제공합니다. Watch scheduler, retention, preview reconciliation, storage metrics producer는 정지하며 일반 product mutation과 update activation은 거부됩니다. Setup 완료 때 Host는 active Control에 lifecycle IPC로 storage readiness를 검증시키고, `ready`를 durable하게 기록한 뒤 idempotent activation signal을 보냅니다. Host/Control 재시작도 durable state로 producer activation을 reconcile하므로 wizard 완료 뒤 재시작은 필요하지 않으며 설치 state는 generation별로 복제되지 않습니다.
 
 Runtime Host는 `GET /api/runtime/update`와 인증 및 CSRF 보호가 적용된 `/check`, `/stage`, `/activate`, `/rollback` POST 작업을 처리합니다. update status는 path, PID, token, 원문 release notes를 제외하며 UI에서 텍스트로 표시하는 길이 제한된 릴리스 요약을 포함할 수 있습니다. 개발 build에서는 원격 update가 fail-closed됩니다. release 활성화는 기본 application 세대를 바꾸지만 진행 중인 Recording은 현재 Engine 세대에 남습니다. 이 API는 Runtime Host나 container image 자체를 업데이트하지 않습니다.
 
@@ -182,4 +192,4 @@ npm --prefix web run dev
 
 운영 binary에는 Vite build output이 `internal/server/static/ui/` 아래 embed됩니다. `make build`가 web asset build 후 Go build를 순서대로 실행하고, Dockerfile은 별도의 Node build stage에서 asset을 생성합니다. React client route는 allowlist된 경로에 한해서 직접 열 수 있으며 `/api/**`와 `/static/**`는 SPA fallback 대상이 아닙니다.
 
-첫 실행에서 UI는 `/api/auth/session`을 조회해 bootstrap 또는 login 화면을 표시합니다. Bootstrap token은 `DATA_DIR/security/bootstrap-token`에 있으며 password와 함께 `/api/auth/bootstrap`으로 제출됩니다. 로그인 후 mutation은 backend session의 CSRF token을 공통 API client가 자동 전송합니다.
+첫 실행에서 UI는 인증보다 먼저 Runtime Host의 public `/api/setup/status`를 조회합니다. 설치가 미완료면 `/setup`을 열고, 설치가 준비된 뒤에는 `/api/auth/session`을 확인해 인증이 필요하면 `/login`을 표시합니다. 관리자 claim은 기존 `/api/auth/bootstrap`을 재사용하고, 인증된 browser가 Host-owned setup transaction을 시작하고 완료합니다. Setup code는 URL이나 API 응답에 노출되지 않습니다. 로그인 후 mutation은 backend session의 CSRF token을 공통 API client가 자동 전송합니다.

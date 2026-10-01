@@ -158,4 +158,22 @@ export type ArchiveEntry = { kind: string; path: string; size: number; sha256?: 
 export type RecordingEvent = { id: string; recording_id: string; type: string; at: string; count?: number; message?: string }
 export type LogEntry = { at: string; level: string; component: string; message: string }
 export type AuditEvent = { id: string; type: string; at: string; object_id?: string }
-export type ApiSession = { auth_enabled: boolean; authenticated: boolean; needs_bootstrap: boolean; bootstrap_token_path?: string; csrf_token?: string; expires_at?: string }
+export type ApiSession = { auth_enabled: boolean; authenticated: boolean; needs_bootstrap: boolean; csrf_token?: string; expires_at?: string }
+export type InstallationState = 'uninitialized' | 'setup_in_progress' | 'ready' | 'recovery_required'
+export type InstallationStatus = {
+  state: InstallationState
+  administrator_configured: boolean
+  claim_required: boolean
+  recovery_required: boolean
+  auth_disabled: boolean
+  version: string
+  release_channel: string
+  diagnostic_code?: string
+}
+export type SetupStorageTest = {
+  status: 'ready' | 'warning' | 'error'
+  free_bytes: number
+  write_test: 'passed' | 'failed'
+  durability_test: 'passed' | 'failed'
+  diagnostic_code?: string
+}

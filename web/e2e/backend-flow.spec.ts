@@ -11,7 +11,6 @@ type RecordingWire = {
   state: string
   tracks?: Record<string, { segments?: unknown[] }>
 }
-type SessionWire = { needs_bootstrap: boolean }
 type IntegrityWire = { status: string; objects_total: number; objects_corrupt: number }
 type TagsWire = { tags: string[] }
 type ArchiveIndexWire = { entries: { path: string }[] }
@@ -30,8 +29,7 @@ type CSPViolation = { effectiveDirective: string; violatedDirective: string; blo
 
 test.describe.configure({ mode: 'serial' })
 
-test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete', async ({ page }) => {
-  const bootstrapToken = readFileSync(join(dataDir, 'security', 'bootstrap-token'), 'utf8').trim()
+test('actual Go backend: Owncast capture, VOD, management, and delete', async ({ page }) => {
   const sourceURL = readFileSync(join(dataDir, 'e2e-source-url'), 'utf8').trim()
   const expectedSegmentSHA256 = createHash('sha256').update(readFileSync(join(dataDir, 'e2e-source-segment'))).digest('hex')
   const requests: string[] = []
@@ -71,17 +69,15 @@ test('actual Go backend: bootstrap, Owncast capture, VOD, management, and delete
     if (path.startsWith('/static/ui/') && response.status() >= 400) staticAssetFailures.push(`${path}: ${response.status()}`)
     if (path.startsWith('/api/') && [401, 404, 501].includes(response.status())) expectedAPIResponseFailures.push({ path, status: response.status() })
   })
-  const bootstrapPage = await page.goto('/login?mode=bootstrap')
-  const cspHeader = bootstrapPage?.headers()['content-security-policy'] ?? ''
+  const loginPage = await page.goto('/login')
+  const cspHeader = loginPage?.headers()['content-security-policy'] ?? ''
   expect(cspHeader).toContain("script-src 'self'")
   expect(cspHeader).not.toContain("script-src 'unsafe-inline'")
   await assertResponsive(page)
   await page.setViewportSize({ width: 1440, height: 900 })
-  await expect(page.getByLabel('초기화 토큰')).toBeVisible()
-  await page.getByLabel('초기화 토큰').fill(bootstrapToken)
+  await expect(page.getByLabel('관리자 비밀번호')).toBeVisible()
   await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
-  await page.getByLabel('비밀번호 확인').fill('browser-e2e-strong-password')
-  await page.getByRole('button', { name: '서버 초기화' }).click()
+  await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
   await expect(page.getByRole('heading', { name: '대시보드' })).toBeVisible()
   await expectOwncastLogo(page)
@@ -566,18 +562,8 @@ test('actual workflow adapter: challenge, secret, action URL, continue, cancel, 
 
 async function login(page: Page) {
   await page.goto('/login')
-  const session = await getJSON<SessionWire>(page, '/api/auth/session')
-  if (session.needs_bootstrap) {
-    const bootstrapToken = readFileSync(join(dataDir!, 'security', 'bootstrap-token'), 'utf8').trim()
-    await page.goto('/login?mode=bootstrap')
-    await page.getByLabel('초기화 토큰').fill(bootstrapToken)
-    await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
-    await page.getByLabel('비밀번호 확인').fill('browser-e2e-strong-password')
-    await page.getByRole('button', { name: '서버 초기화' }).click()
-  } else {
-    await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
-    await page.getByRole('button', { name: '로그인' }).click()
-  }
+  await page.getByLabel('관리자 비밀번호').fill('browser-e2e-strong-password')
+  await page.getByRole('button', { name: '로그인' }).click()
   await expect(page).toHaveURL('/')
 }
 
