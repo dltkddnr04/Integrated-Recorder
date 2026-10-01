@@ -23,11 +23,11 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
-Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. The Runtime Host periodically imports and validates executable adapters from configured source directories into immutable adapter artifacts and activates a new adapter-set-backed application generation; Host/container restart is not required. Install a binary by copying it under a temporary name and atomically renaming it to `integrated-recorder-adapter-*`. Existing recordings remain pinned to their original Engine and adapter set. The remote Plugin Store, plugin download/signing, and adapter auto-update are not implemented. Installed adapters run as trusted local code. The default file secret stores use restricted permissions but do not encrypt values at rest.
+Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. The Runtime Host treats configured source directories as import sources, validates executable adapters, and stores immutable artifacts and adapter sets. An application generation is identified by `(application release, adapter set)`; adapter changes activate a new generation without restarting the Host or container, and application release updates carry forward the selected adapter set. Existing recordings remain pinned to their original Engine and adapter artifacts until their leases drain. Install a binary by copying it under a temporary name and atomically renaming it to `integrated-recorder-adapter-*`. The remote Plugin Store, plugin catalog/download/signing, and adapter auto-update are not implemented. Installed adapters run as trusted local code. The default file secret stores use restricted permissions but do not encrypt values at rest.
 
 ## Current status
 
-**Milestone 1 and the external adapter protocol milestone are complete.**
+**Milestone 1, the external adapter protocol, and the restartless immutable adapter lifecycle are complete.**
 
 Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, the Preview Frame Index, and automatic recording Watches to backend APIs. A Watch is a durable recording intent; each detected broadcast becomes a separate Recording. Automatic recording is shown only for adapters that declare the `watch` capability. Fresh installs use the `/setup` wizard to claim the administrator and complete installation diagnostics before normal operation starts. If FFmpeg is available, segment preview generation and separate remux exports are offered without changing the canonical recording.
 
@@ -172,6 +172,7 @@ go vet ./...
 
 - [x] Original segment acquisition + restart-safe VOD playback
 - [x] Platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
+- [x] Restartless immutable adapter lifecycle (Host import, adapter-set generations, and recording pinning)
 - [x] Resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] Chat timeline
 - [ ] Finalized archive packaging + random-access index

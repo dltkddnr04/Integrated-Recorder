@@ -26,12 +26,21 @@ identifier grammar below.
 
 ## Process and installation contract
 
-Core scans only explicitly configured adapter directories; it never searches
-`PATH`. A discovered filename starts with
-`integrated-recorder-adapter-`. The candidate must be a regular file with at
-least one executable permission bit. Candidate paths are sorted before startup.
-Descriptor IDs, rather than filename suffixes, are the adapter identity. Two
-executables with the same descriptor ID are rejected as duplicates.
+In production, Runtime Host scans only explicitly configured adapter source
+directories; it never searches `PATH`. The Host validates candidates and
+imports them into content-addressed immutable artifacts and immutable
+adapter-set snapshots. Control and Recorder Engine receive only the private
+`bin` directory assigned to their application generation. Changing a source
+directory does not mutate a running generation: Host reconciliation activates
+a new generation, while existing Recordings remain pinned to their original
+Engine and adapter set. The monolithic development command may use its supplied
+adapter directory directly.
+
+A discovered filename starts with `integrated-recorder-adapter-`. The
+candidate must be a regular file with at least one executable permission bit.
+Candidate paths are sorted before startup. Descriptor IDs, rather than filename
+suffixes, are the adapter identity. Two executables with the same descriptor ID
+are rejected as duplicates.
 
 An adapter is a trusted local executable. It runs as the same operating-system
 user as Core. It is **not sandboxed** and can access whatever that user can

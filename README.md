@@ -23,11 +23,11 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
-Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. Runtime Host가 설정된 source directory를 주기적으로 확인해 새 executable을 검증·import하고 새 immutable adapter-set generation을 활성화하므로 Host나 container를 재시작할 필요가 없습니다. 부분 복사를 피하려면 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 최종 이름으로 atomic rename하세요. 기존 녹화는 시작 당시 adapter generation을 유지합니다. 설치된 adapter는 신뢰된 로컬 코드로 실행되며 remote Plugin Store는 아직 제공되지 않습니다. 기본 file secret store는 권한이 제한되지만 저장 시 암호화되지 않습니다.
+Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. Runtime Host가 설정된 source directory를 주기적으로 import source로 확인하고 새 executable을 검증해 immutable artifact/set으로 보관합니다. Application generation의 identity는 `(application release, adapter set)`이며, 어댑터 변경은 Host나 container 재시작 없이 새 generation을 활성화합니다. Application release update는 현재 adapter set을 이어 쓰고, 기존 녹화는 시작 당시 Engine과 adapter artifact를 lease가 끝날 때까지 유지합니다. 부분 복사를 피하려면 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 최종 이름으로 atomic rename하세요. 설치된 adapter는 신뢰된 로컬 코드로 실행되며 remote Plugin Store는 아직 제공되지 않습니다. 기본 file secret store는 권한이 제한되지만 저장 시 암호화되지 않습니다.
 
 ## 현재 상태
 
-**Milestone 1과 external adapter protocol milestone 완료.**
+**Milestone 1, external adapter protocol, restartless immutable adapter lifecycle 완료.**
 
 React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, 리소스 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, Preview Frame Index, 자동 녹화 Watch를 backend API에 연결합니다. Watch는 지속적인 녹화 의도이고 방송 한 회차마다 별도의 Recording을 만듭니다. `watch` capability가 없는 어댑터에는 자동 녹화 등록을 표시하지 않습니다. 새 설치는 `/setup` wizard에서 관리자를 설정하고 설치 진단을 통과한 뒤 운영을 시작합니다. FFmpeg가 설치된 경우 장면 미리보기 프레임 생성과 별도의 remux export를 제공하며 canonical 녹화 데이터는 변경하지 않습니다.
 
@@ -172,6 +172,7 @@ go vet ./...
 
 - [x] 원본 segment acquisition + restart-safe VOD playback
 - [x] platform-agnostic Core + external Adapter Protocol v1 + Owncast binary
+- [x] restartless immutable adapter lifecycle (Host import, adapter-set generations, recording pinning)
 - [x] resource discovery, configuration inheritance, and challenge/resume foundation
 - [ ] chat timeline
 - [ ] Finalized archive packaging + random-access index

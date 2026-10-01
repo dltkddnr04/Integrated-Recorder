@@ -44,7 +44,14 @@ it does not replace the Runtime Host or container image.
 Build identities are injected into Runtime Host, Control Plane, and Recorder
 Engine through `internal/buildinfo` linker variables. Local development builds
 retain their explicit `dev` identity and cannot install remote updates. The
-current release contains the Owncast `adapter-runtime` artifact, but adapter
-plugins are still discovered from the configured `/adapters` and
-`/external-adapters` directories; a separately supervised, independently
-updatable Adapter Runtime/Plugin Store is not implemented yet.
+release's `adapter-runtime` artifact is the bundled Owncast executable. Generic
+adapter discovery is Host-owned: configured `/adapters` and
+`/external-adapters` directories are import sources, and the Host validates
+and snapshots their executables into immutable content-addressed artifacts and
+adapter sets. The application generation is the pair `(application release,
+adapter set)`, so local adapter additions, updates, and removals activate a
+new generation without restarting the Host or container. Existing Recordings
+remain pinned to their Engine and adapter artifacts until their leases drain.
+This local restartless lifecycle is implemented. A remote Plugin Store,
+remote plugin catalog/download/signature flow, and automatic remote adapter
+updates are separate follow-on work and are not implemented.
