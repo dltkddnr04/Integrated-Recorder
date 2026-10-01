@@ -7,7 +7,7 @@ Recorder source code. The current Go wire implementation is in
 `cmd/adapter-conformance`.
 
 Protocol version: **1**. This document describes the implementation at Core
-commit `29d3a8ddbf9b108cfb42c87c42b67995bdba5288` and is maintained with that
+commit `2df5e407d2a2f0013c8d3034f2b1cb6dc0ec6c36` and is maintained with that
 contract. JSON examples in `protocol/adapter-v1/` are executable golden vectors.
 
 ## Compatibility policy
