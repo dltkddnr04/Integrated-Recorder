@@ -102,6 +102,14 @@ func TestRejectsUnsupportedVersionsMalformedAndOversizedFrames(t *testing.T) {
 	}
 }
 
+func TestParseFrameRejectsInvalidUTF8(t *testing.T) {
+	frame := append([]byte(`{"protocol_version":1,"id":"1","method":"describe","params":{"x":"`), 0xff)
+	frame = append(frame, []byte(`"}}`)...)
+	if _, err := ParseFrame(frame); err == nil || !strings.Contains(err.Error(), "UTF-8") {
+		t.Fatalf("invalid UTF-8 frame error = %v", err)
+	}
+}
+
 func TestRejectsUnterminatedFrameAndResponseWithoutPayload(t *testing.T) {
 	if _, err := ReadRequest(bufio.NewReader(strings.NewReader(`{"protocol_version":1,"id":"1","method":"describe"}`))); err == nil {
 		t.Fatal("expected unterminated frame error")

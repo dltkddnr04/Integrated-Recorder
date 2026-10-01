@@ -1,0 +1,1 @@
+{"protocol_version":1,"id":"6","method":"refresh","params":{"resource":{"resource_type":"channel","resource_id":"demo"},"current":{"type":"hls","manifest_url":"https://media.example.test/expired.m3u8","refresh":{"token":"opaque"}},"state":[]}}

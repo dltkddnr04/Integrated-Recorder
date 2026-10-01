@@ -1,0 +1,1 @@
+{"protocol_version":1,"id":"4","result":{"state":"live","session_ref":"session-opaque-1","title":"A live title","started_at":"2026-09-01T12:00:00Z","media":{"type":"hls","manifest_url":"https://media.example.test/live.m3u8"},"state_mutations":[]}}

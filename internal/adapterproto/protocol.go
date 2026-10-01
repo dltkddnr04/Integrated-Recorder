@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -167,6 +168,9 @@ func WriteNotification(w io.Writer, notification Notification) error {
 func ParseFrame(data []byte) (Frame, error) {
 	if len(data) > MaxFrameBytes {
 		return Frame{}, fmt.Errorf("protocol frame exceeds %d bytes", MaxFrameBytes)
+	}
+	if !utf8.Valid(data) {
+		return Frame{}, errors.New("protocol frame is not valid UTF-8")
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {

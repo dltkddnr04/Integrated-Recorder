@@ -1,0 +1,1 @@
+{"protocol_version":1,"id":"1","result":{"id":"example","name":"Example Adapter","version":"1.0.0","protocol_version":1,"capabilities":["resolve","resolve_workflow","refresh","resource_browse","watch","metadata"],"input_schema":{"fields":[]},"configuration_schema":{"fields":[]},"resource_types":[{"type":"channel"}],"media_types":["hls"]}}

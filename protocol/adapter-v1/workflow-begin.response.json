@@ -1,0 +1,1 @@
+{"protocol_version":1,"id":"8","result":{"state":"configuration_required","workflow_id":"core-generated-opaque-id","challenge":{"schema":{"fields":[{"key":"quality","control":"select","label":"Quality","required":true,"options":[{"value":"source","label":"Source"}]}]}}}}

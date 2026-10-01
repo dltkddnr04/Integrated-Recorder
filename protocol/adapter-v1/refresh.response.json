@@ -1,0 +1,1 @@
+{"protocol_version":1,"id":"6","result":{"media":{"type":"hls","manifest_url":"https://media.example.test/live-2.m3u8","refresh":{"token":"opaque-2"}},"state":[]}}

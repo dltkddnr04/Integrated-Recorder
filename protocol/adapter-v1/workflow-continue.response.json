@@ -1,0 +1,1 @@
+{"protocol_version":1,"id":"9","result":{"state":"resolved","workflow_id":"core-generated-opaque-id","media":{"type":"hls","manifest_url":"https://media.example.test/live.m3u8"},"state_mutations":[]}}
