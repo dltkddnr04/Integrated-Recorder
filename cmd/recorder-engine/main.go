@@ -21,6 +21,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/pluginconfig"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
@@ -71,8 +72,16 @@ func run() error {
 	if err := store.ConfigureIngestOptions(settings.Current().Storage.IngestOptions()); err != nil {
 		return fmt.Errorf("configure storage ingest: %w", err)
 	}
-	if err := configureRuntimeResources(store, os.Getenv); err != nil {
+	runtimeClient, managedRuntime, err := configureRuntimeResourceClient(store, os.Getenv)
+	if err != nil {
 		return fmt.Errorf("configure runtime resource coordinator: %w", err)
+	}
+	var ownerStore *recordingowner.Store
+	if managedRuntime {
+		ownerStore, err = recordingowner.Open(dataDir)
+		if err != nil {
+			return fmt.Errorf("configure canonical recording owner fence: %w", err)
+		}
 	}
 	configStore, secretStore, stateStore, err := pluginconfig.NewTypedFileStoresAndState(dataDir)
 	if err != nil {
@@ -91,12 +100,27 @@ func run() error {
 		return fmt.Errorf("discover adapters: %w", err)
 	}
 	client, validateSource := newAcquisitionClient(25 * time.Second)
-	manager, err := acquire.NewManagerWithMode(store, client, adapters, validateSource, mode)
+	var manager *acquire.Manager
+	if managedRuntime && mode == acquire.RecoverExisting {
+		manager, err = acquire.NewManagerWithFencedRecovery(store, client, adapters, validateSource, ownerStore, ownerStore)
+	} else if managedRuntime {
+		manager, err = acquire.NewManagerWithMode(store, client, adapters, validateSource, mode)
+		if err == nil {
+			err = manager.ConfigureCanonicalCommitFence(ownerStore)
+		}
+	} else if mode == acquire.RecoverExisting {
+		manager, err = acquire.NewManager(store, client, adapters, validateSource)
+	} else {
+		manager, err = acquire.NewManagerWithMode(store, client, adapters, validateSource, mode)
+	}
 	if err != nil {
+		if manager != nil {
+			_ = manager.Close(context.Background())
+		}
 		adapters.Close()
 		return fmt.Errorf("initialize recorder manager: %w", err)
 	}
-	instanceID, err := newInstanceID()
+	instanceID, err := engineInstanceID(os.Getenv)
 	if err != nil {
 		_ = manager.Close(context.Background())
 		adapters.Close()
@@ -107,6 +131,12 @@ func run() error {
 		_ = manager.Close(context.Background())
 		adapters.Close()
 		return err
+	}
+	if managedRuntime {
+		if err := engine.ConfigureRecordingOwnerClient(runtimeClient); err != nil {
+			_ = engine.Close(context.Background())
+			return fmt.Errorf("configure Host recording ownership client: %w", err)
+		}
 	}
 	server, err := runtimeipc.NewServer(socketPath, generationID, token, engine)
 	if err != nil {
@@ -154,8 +184,13 @@ func loadPrivateToken(path, variableName string) ([]byte, error) {
 }
 
 func configureRuntimeResources(store *storage.Store, getenv func(string) string) error {
+	_, _, err := configureRuntimeResourceClient(store, getenv)
+	return err
+}
+
+func configureRuntimeResourceClient(store *storage.Store, getenv func(string) string) (*resources.RuntimeClient, bool, error) {
 	if store == nil || getenv == nil {
-		return errors.New("runtime resource configuration is unavailable")
+		return nil, false, errors.New("runtime resource configuration is unavailable")
 	}
 	socketPath := strings.TrimSpace(getenv("RUNTIME_RESOURCE_SOCKET_PATH"))
 	tokenPath := strings.TrimSpace(getenv("RUNTIME_RESOURCE_TOKEN_FILE"))
@@ -169,26 +204,26 @@ func configureRuntimeResources(store *storage.Store, getenv func(string) string)
 	if present == 0 {
 		// Direct development/compatibility invocation retains the historical
 		// process-local limits. Runtime Host always supplies all three values.
-		return nil
+		return nil, false, nil
 	}
 	if present != 3 {
-		return errors.New("RUNTIME_RESOURCE_SOCKET_PATH, RUNTIME_RESOURCE_TOKEN_FILE, and RUNTIME_RESOURCE_OWNER must be set together")
+		return nil, false, errors.New("RUNTIME_RESOURCE_SOCKET_PATH, RUNTIME_RESOURCE_TOKEN_FILE, and RUNTIME_RESOURCE_OWNER must be set together")
 	}
 	token, err := loadPrivateToken(tokenPath, "RUNTIME_RESOURCE_TOKEN_FILE")
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	client, err := resources.NewRuntimeClient(socketPath, token, ownerID)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	if err := store.ConfigureRuntimeIngestCoordinator(client); err != nil {
-		return err
+		return nil, false, err
 	}
 	if err := store.ConfigureRuntimeStorageTelemetry(runtimeStorageTelemetryBridge{client: client}); err != nil {
-		return err
+		return nil, false, err
 	}
-	return nil
+	return client, true, nil
 }
 
 type runtimeStorageTelemetryBridge struct {
@@ -256,4 +291,19 @@ func newInstanceID() (string, error) {
 		return "", errors.New("engine instance identity unavailable")
 	}
 	return hex.EncodeToString(value[:]), nil
+}
+
+func engineInstanceID(getenv func(string) string) (string, error) {
+	if getenv == nil {
+		return "", errors.New("engine instance identity unavailable")
+	}
+	configured := strings.TrimSpace(getenv("ENGINE_INSTANCE_ID"))
+	if configured == "" {
+		return newInstanceID()
+	}
+	decoded, err := hex.DecodeString(configured)
+	if err != nil || len(decoded) != 16 || strings.ToLower(configured) != configured {
+		return "", errors.New("ENGINE_INSTANCE_ID is invalid")
+	}
+	return configured, nil
 }

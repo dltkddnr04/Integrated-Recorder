@@ -19,6 +19,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/hls"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
@@ -479,22 +480,42 @@ func (m *Manager) observePlaylistAtGeneration(e *entry, playlist hls.MediaPlayli
 		return true, nil
 	}
 	e.mu.Unlock()
-	if err := m.store.SaveRecording(r); err != nil {
+	if err := m.withCanonicalCommit(e, func() error {
+		if err := m.store.SaveRecording(r); err != nil {
+			return err
+		}
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if e.deleted || e.mediaGeneration != generation {
+			return errStaleMediaGeneration
+		}
+		e.recording = r
+		return nil
+	}); err != nil {
+		if errors.Is(err, errStaleMediaGeneration) {
+			return false, nil
+		}
 		return false, errors.New("recording metadata persistence failed")
 	}
-	e.mu.Lock()
-	if e.deleted || e.mediaGeneration != generation {
-		e.mu.Unlock()
-		return false, nil
-	}
-	e.recording = r
-	e.mu.Unlock()
 	return true, nil
 }
 
 func (m *Manager) updateAtMediaGeneration(e *entry, generation uint64, fn func(*domain.Recording) error) (bool, error) {
 	e.persistMu.Lock()
 	defer e.persistMu.Unlock()
+	var updated bool
+	err := m.withCanonicalCommit(e, func() error {
+		var err error
+		updated, err = m.updateAtMediaGenerationWithinAuthorizedCommit(e, generation, fn)
+		return err
+	})
+	return updated, err
+}
+
+// updateAtMediaGenerationWithinAuthorizedCommit is the generation-aware
+// root mutation path for callers that already hold e.persistMu and the Host
+// canonical commit fence.
+func (m *Manager) updateAtMediaGenerationWithinAuthorizedCommit(e *entry, generation uint64, fn func(*domain.Recording) error) (bool, error) {
 	e.mu.Lock()
 	if e.deleted || e.mediaGeneration != generation {
 		e.mu.Unlock()
@@ -588,19 +609,22 @@ func (m *Manager) acquireInitUsing(ctx context.Context, e *entry, source hls.Map
 		return "", fmt.Errorf("init segment download: %w", err)
 	}
 	asset := domain.Segment{ID: id, TrackID: "main", SourceEpoch: epoch, DiscontinuitySequence: discontinuitySequence, SourceURI: source.URI, ByteRange: cloneRange(source.ByteRange), StoragePath: relative, PayloadSize: result.Size, SHA256: result.SHA256, IsInit: true}
-	if err = m.store.SaveSidecar(recordingID, relative, asset); err != nil {
-		return "", err
-	}
-	if err = m.update(e, func(r *domain.Recording) error {
-		t := r.Tracks["main"]
-		for _, old := range t.InitSegments {
-			if old.ID == id {
-				return nil
-			}
+	err = m.withCanonicalMutation(e, func() error {
+		if err := m.store.SaveSidecar(recordingID, relative, asset); err != nil {
+			return err
 		}
-		t.InitSegments = append(t.InitSegments, asset)
-		return nil
-	}); err != nil {
+		return m.updateWithinAuthorizedCommit(e, func(r *domain.Recording) error {
+			t := r.Tracks["main"]
+			for _, old := range t.InitSegments {
+				if old.ID == id {
+					return nil
+				}
+			}
+			t.InitSegments = append(t.InitSegments, asset)
+			return nil
+		})
+	})
+	if err != nil {
 		return "", err
 	}
 	return id, nil
@@ -622,13 +646,23 @@ func (m *Manager) acquireMediaOnce(ctx context.Context, e *entry, source hls.Med
 // the completed payload to the independent storage writer.
 func (m *Manager) acquireMediaBuffered(ctx context.Context, e *entry, source hls.MediaSegment, epoch, ordinal uint64, initID string, media adapterproto.MediaSource, expectedGeneration uint64) (domain.Segment, *storage.IngestPayload, error) {
 	recordingID := recordingID(e)
-	relative := fmt.Sprintf("tracks/main/%020d%s", ordinal, extensionFor(source.URI))
 	payload, err := m.downloadObjectBufferedOnceAtGeneration(ctx, source.URI, source.ByteRange, recordingID, media, e, expectedGeneration)
 	if err != nil {
 		return domain.Segment{}, nil, err
 	}
-	segment := domain.Segment{ID: fmt.Sprintf("seg-%020d", ordinal), TrackID: "main", Sequence: source.Sequence, SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence, ArchiveOrdinal: ordinal, SourceURI: source.URI, Duration: source.Duration, ProgramDateTime: source.ProgramTime, InitSegmentID: initID, ByteRange: cloneRange(source.ByteRange), Discontinuity: source.Discontinuity, StoragePath: relative}
-	return segment, payload, nil
+	return makeArchiveSegment(source, epoch, ordinal, initID, payload.Result()), payload, nil
+}
+
+func makeArchiveSegment(source hls.MediaSegment, epoch, ordinal uint64, initID string, result storage.PayloadResult) domain.Segment {
+	relative := fmt.Sprintf("tracks/main/%020d%s", ordinal, extensionFor(source.URI))
+	return domain.Segment{
+		ID: fmt.Sprintf("seg-%020d", ordinal), TrackID: "main", Sequence: source.Sequence,
+		SourceEpoch: epoch, DiscontinuitySequence: source.DiscontinuitySequence,
+		ArchiveOrdinal: ordinal, SourceURI: source.URI, Duration: source.Duration,
+		ProgramDateTime: source.ProgramTime, InitSegmentID: initID,
+		ByteRange: cloneRange(source.ByteRange), Discontinuity: source.Discontinuity,
+		StoragePath: relative, PayloadSize: result.Size, SHA256: result.SHA256,
+	}
 }
 
 func (m *Manager) downloadObjectBufferedOnceAtGeneration(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID string, media adapterproto.MediaSource, e *entry, expectedGeneration uint64) (*storage.IngestPayload, error) {
@@ -724,6 +758,13 @@ func (m *Manager) downloadObjectAttemptsAtGeneration(ctx context.Context, uri st
 }
 
 func (m *Manager) downloadObjectAttemptsInternal(ctx context.Context, uri string, byteRange *domain.ByteRange, recordingID, relative string, media adapterproto.MediaSource, attempts int, generationEntry *entry, expectedGeneration uint64) (storage.PayloadResult, error) {
+	// This legacy helper streams a network response directly into the canonical
+	// payload path. A fenced Engine must use the scheduler's bounded RAM ingest
+	// callback instead, where network reads finish before the commit fence is
+	// acquired and the payload/sidecar/root publication is one guarded unit.
+	if m.canonicalFenceConfigured() {
+		return storage.PayloadResult{}, ErrDirectPersistRequiresQueue
+	}
 	maxPayloadBytes := m.ingest.Options().MaxPayloadBytes
 	if byteRange != nil && (byteRange.Length == 0 || byteRange.Length > uint64(maxPayloadBytes) || byteRange.Offset > ^uint64(0)-byteRange.Length) {
 		return storage.PayloadResult{}, fmt.Errorf("byte range is invalid or exceeds the %d byte payload limit", maxPayloadBytes)
@@ -817,16 +858,72 @@ func (r *responseBodyReadTracker) Read(p []byte) (int, error) {
 }
 
 func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.MediaSource) {
-	defer close(e.done)
 	defer func() {
 		e.mu.Lock()
 		e.cancel = nil
 		e.mu.Unlock()
 	}()
+	for {
+		paused := m.runWorkerCycle(ctx, e, media)
+		if !paused {
+			return
+		}
+		e.mu.Lock()
+		op := e.handover
+		e.mu.Unlock()
+		if op == nil {
+			// A timed out pause may have been canceled at the boundary after the
+			// scheduler was closed. Start a fresh scheduler under the old owner.
+			media, _ = currentMediaVersion(e)
+			continue
+		}
+		resume := false
+		for !resume {
+			select {
+			case <-op.resume:
+				resume = true
+			case <-op.complete:
+				return
+			case <-ctx.Done():
+				e.mu.Lock()
+				switch op.state {
+				case handoverCompleted:
+					e.mu.Unlock()
+					return
+				case handoverResuming:
+					// ResumeHandover already published a current owner and signal.
+				default:
+					op.state = handoverResuming
+					if e.handover == op {
+						e.handover = nil
+					}
+					op.resumeOnce.Do(func() { close(op.resume) })
+				}
+				e.mu.Unlock()
+				resume = true
+			}
+		}
+		e.mu.Lock()
+		if e.handover == op && op.state == handoverResuming {
+			e.handover = nil
+		}
+		e.mu.Unlock()
+		// ResumeHandover waits for this signal before returning. Publish the
+		// cleared operation first so a caller can safely issue Stop or another
+		// handover as soon as resume completes.
+		op.resumedOnce.Do(func() { close(op.resumed) })
+		media, _ = currentMediaVersion(e)
+	}
+}
+
+// runWorkerCycle runs one fresh scheduler lifetime. A true result means the
+// worker has drained and closed that scheduler for a handover and must remain
+// parked until Manager explicitly resumes or completes it.
+func (m *Manager) runWorkerCycle(ctx context.Context, e *entry, media adapterproto.MediaSource) (paused bool) {
 	scheduler, schedulerErr := newSegmentScheduler(ctx, m, e)
 	if schedulerErr != nil {
 		m.fail(e, schedulerErr)
-		return
+		return false
 	}
 	defer func() {
 		if closeErr := scheduler.close(); closeErr != nil {
@@ -848,20 +945,33 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 			m.setTerminalError(e, err)
 		}
 	}()
-	if _, ok := m.resolver.(MetadataPreparer); ok {
-		metadataCtx, cancelMetadata := context.WithCancel(ctx)
-		metadataDone := make(chan struct{})
-		go func() {
-			defer close(metadataDone)
+	var metadataCancel context.CancelFunc
+	var metadataDone chan struct{}
+	startMetadata := func() {
+		if _, ok := m.resolver.(MetadataPreparer); !ok || metadataCancel != nil {
+			return
+		}
+		metadataCtx, cancel := context.WithCancel(ctx)
+		metadataCancel = cancel
+		metadataDone = make(chan struct{})
+		go func(done chan struct{}) {
+			defer close(done)
 			m.runMetadataMonitor(metadataCtx, e)
-		}()
-		// This defer is registered after scheduler cleanup, so the monitor is
-		// canceled and joined before acquisition shutdown drains the scheduler.
-		defer func() {
-			cancelMetadata()
-			<-metadataDone
-		}()
+		}(metadataDone)
 	}
+	stopMetadata := func() {
+		if metadataCancel == nil {
+			return
+		}
+		metadataCancel()
+		<-metadataDone
+		metadataCancel = nil
+		metadataDone = nil
+	}
+	startMetadata()
+	// This defer is registered after scheduler cleanup, so the monitor is
+	// canceled and joined before acquisition shutdown drains the scheduler.
+	defer stopMetadata()
 
 	selectedURL := media.ManifestURL
 	firstPlaylist := true
@@ -869,6 +979,12 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 	refreshCycles := 0
 	proactiveRefreshes := 0
 	for ctx.Err() == nil {
+		if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopMetadata, startMetadata); paused {
+			return true
+		} else if pauseErr != nil {
+			m.fail(e, pauseErr)
+			return false
+		}
 		media, generation := currentMediaVersion(e)
 		if generation != manifestGeneration {
 			selectedURL = media.ManifestURL
@@ -1088,9 +1204,112 @@ func (m *Manager) runWorker(ctx context.Context, e *entry, media adapterproto.Me
 				}
 			}
 			continue
+		case <-e.handoverWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if paused, pauseErr := m.pauseAtWorkerBoundary(ctx, e, scheduler, stopMetadata, startMetadata); paused {
+				return true
+			} else if pauseErr != nil {
+				m.fail(e, pauseErr)
+				return false
+			}
+			continue
 		case <-timer.C:
 		}
 	}
+	return false
+}
+
+// pauseAtWorkerBoundary runs only on the manifest worker goroutine. That gives
+// the request a precise boundary: the manifest already being handled may
+// finish discovery, but no later manifest is admitted before the scheduler is
+// drained and closed.
+func (m *Manager) pauseAtWorkerBoundary(ctx context.Context, e *entry, scheduler *segmentScheduler, stopMetadata, startMetadata func()) (bool, error) {
+	e.mu.Lock()
+	op := e.handover
+	if op == nil || op.state != handoverRequested {
+		e.mu.Unlock()
+		return false, nil
+	}
+	if op.ctx.Err() != nil {
+		op.state = handoverAborted
+		e.handover = nil
+		e.mu.Unlock()
+		op.resumedOnce.Do(func() { close(op.resumed) })
+		return false, nil
+	}
+	op.state = handoverDraining
+	// Metadata polling can replace the canonical in-memory recording pointer
+	// while it persists a revision. Capture the identity under the same lock
+	// before releasing it for the test barrier and drain operations.
+	recordingID := e.recording.ID
+	e.mu.Unlock()
+	if err := runtimehook.Pause(runtimehook.AfterSourceAdmissionStop, recordingID); err != nil {
+		return false, err
+	}
+
+	// Joining the source metadata monitor before the scheduler drain guarantees
+	// no metadata root/state commit can race the ownership boundary.
+	stopMetadata()
+	if err := runtimehook.Pause(runtimehook.DuringSourceDrain, recordingID); err != nil {
+		return false, err
+	}
+	if err := scheduler.drainForHandover(op.ctx); err != nil {
+		if ctx.Err() == nil && op.ctx.Err() != nil {
+			startMetadata()
+			e.mu.Lock()
+			if e.handover == op {
+				op.state = handoverAborted
+				e.handover = nil
+			}
+			e.mu.Unlock()
+			op.resumedOnce.Do(func() { close(op.resumed) })
+			return false, nil
+		}
+		if ctx.Err() != nil {
+			e.mu.Lock()
+			if e.handover == op {
+				op.state = handoverAborted
+				e.handover = nil
+			}
+			e.mu.Unlock()
+			op.resumedOnce.Do(func() { close(op.resumed) })
+			return false, nil
+		}
+		return false, err
+	}
+	// drain proves that there are no accepted fetches, queued payloads,
+	// snapshots, or metadata commits left. close can therefore join scheduler
+	// goroutines without turning uncommitted tasks into synthetic gaps.
+	if err := scheduler.close(); err != nil {
+		return false, err
+	}
+	e.mu.Lock()
+	if e.handover != op || e.recording == nil || e.recording.State != domain.StateRecording || !sameOwner(e.ownership, op.expected) {
+		e.mu.Unlock()
+		return false, ErrHandoverOwnerMismatch
+	}
+	snapshot, err := makeHandoverSnapshot(e.recording.ID, *e.ownership, e.adapterID, e.media, e.resource)
+	if err != nil {
+		e.mu.Unlock()
+		return false, err
+	}
+	op.snapshot = snapshot
+	op.state = handoverPaused
+	op.pausedOnce.Do(func() { close(op.paused) })
+	if op.ctx.Err() != nil {
+		// The caller timed out at the close boundary. Park only long enough for
+		// the outer worker loop to rebuild its scheduler under the old owner.
+		op.state = handoverResuming
+		e.handover = nil
+		op.resumeOnce.Do(func() { close(op.resume) })
+	}
+	e.mu.Unlock()
+	return true, nil
 }
 
 func (m *Manager) refreshMedia(ctx context.Context, e *entry, current adapterproto.MediaSource) (adapterproto.MediaSource, error) {

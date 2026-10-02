@@ -259,6 +259,10 @@ func TestMetadataFailureIsBestEffortAndMonitorJoinsOnStop(t *testing.T) {
 			t.Fatal("metadata error was not retried with bounded delay")
 		}
 	}
+	// Metadata polling and media acquisition are independent workers. Wait for
+	// the source segment's canonical commit before stopping so this test checks
+	// failure isolation rather than scheduler timing under the race detector.
+	waitForSegmentCount(t, manager, started.ID, 1)
 	terminal, err := manager.Stop(started.ID)
 	if err != nil {
 		t.Fatal(err)

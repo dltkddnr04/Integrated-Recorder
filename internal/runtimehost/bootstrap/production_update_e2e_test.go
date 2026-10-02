@@ -18,7 +18,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,10 +29,12 @@ import (
 	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
@@ -60,6 +64,93 @@ func TestProductionSignedUpdateAcceptanceE2E(t *testing.T) {
 		t.Run(fmt.Sprintf("iteration_%d", iteration), func(t *testing.T) {
 			runProductionUpdateScenario(t, artifacts, fixture, iteration)
 		})
+	}
+}
+
+// TestProductionTargetAdapterRefreshPreflightE2E exercises the target's real
+// adapter refresh and staged-media readiness before the durable owner CAS.
+// The Host, Control, Engine, and adapter are production executables; only the
+// source and signed release feed are deterministic local fixtures.
+func TestProductionTargetAdapterRefreshPreflightE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires production Runtime Host/Control/Engine processes")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("process assertions use Unix process controls")
+	}
+	fixture := newRuntimeUpdateFixture(t)
+	artifacts := buildRuntimeUpdateArtifacts(t, fixture.server.URL)
+	t.Run("target refresh and stages next media before transfer", func(t *testing.T) {
+		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureNone)
+	})
+	t.Run("target refresh failure preserves source owner", func(t *testing.T) {
+		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureRefresh)
+	})
+	t.Run("fresh manifest failure preserves source owner", func(t *testing.T) {
+		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureManifest)
+	})
+	t.Run("candidate transport failure preserves source owner", func(t *testing.T) {
+		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureSegmentTransport)
+	})
+	t.Run("truncated candidate payload preserves source owner", func(t *testing.T) {
+		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureSegmentTruncated)
+	})
+	t.Run("empty candidate payload preserves source owner", func(t *testing.T) {
+		runTargetRefreshPreflightScenario(t, artifacts, fixture, targetPreflightFailureSegmentEmpty)
+	})
+}
+
+type targetPreflightFailure string
+
+const (
+	targetPreflightFailureNone             targetPreflightFailure = ""
+	targetPreflightFailureRefresh          targetPreflightFailure = "refresh"
+	targetPreflightFailureManifest         targetPreflightFailure = "manifest"
+	targetPreflightFailureSegmentTransport targetPreflightFailure = "segment_transport"
+	targetPreflightFailureSegmentTruncated targetPreflightFailure = "segment_truncated"
+	targetPreflightFailureSegmentEmpty     targetPreflightFailure = "segment_empty"
+)
+
+// TestProductionHandoverHostCrashRecoveryE2E hard-kills the real Runtime Host
+// at each durable owner/commit boundary and verifies cold recovery from the
+// same canonical archive. The three security-critical boundaries run three
+// times each; the remaining failpoints run once each as deterministic crash
+// matrix coverage.
+func TestProductionHandoverHostCrashRecoveryE2E(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires building and hard-killing production Runtime Host/Control/Engine processes")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("process cleanup assertions currently use the Unix ps interface")
+	}
+	fixture := newRuntimeUpdateFixture(t)
+	artifacts := buildRuntimeUpdateArtifacts(t, fixture.server.URL)
+	points := []runtimehook.Point{
+		runtimehook.BeforeTargetPrepare,
+		runtimehook.DuringTargetPrepare,
+		runtimehook.AfterTargetReady,
+		runtimehook.AfterSourceAdmissionStop,
+		runtimehook.DuringSourceDrain,
+		runtimehook.AfterSourceDrain,
+		runtimehook.BeforeOwnerCAS,
+		runtimehook.AfterOwnerCAS,
+		runtimehook.BeforeTargetActivation,
+		runtimehook.BeforeTargetFirstCommit,
+		runtimehook.AfterTargetFirstCommit,
+		runtimehook.BeforeSourceRetirement,
+		runtimehook.DuringGenerationLeaseReconcile,
+	}
+	for pointIndex, point := range points {
+		repetitions := 1
+		if point == runtimehook.BeforeOwnerCAS || point == runtimehook.AfterOwnerCAS || point == runtimehook.AfterTargetFirstCommit {
+			repetitions = 3
+		}
+		for iteration := 1; iteration <= repetitions; iteration++ {
+			name := fmt.Sprintf("%02d_%s_run_%d", pointIndex+1, point, iteration)
+			t.Run(name, func(t *testing.T) {
+				runProductionHandoverCrashScenario(t, artifacts, fixture, point, pointIndex*10+iteration)
+			})
+		}
 	}
 }
 
@@ -128,8 +219,8 @@ func buildRuntimeUpdateArtifacts(t *testing.T, fixtureURL string) runtimeUpdateA
 		_ = os.Chmod(filepath.Join(bundleA, "control-plane"), 0600)
 		_ = os.Chmod(filepath.Join(bundleA, "recorder-engine"), 0600)
 	})
-	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "", ldflags(e2eVersionA, e2eCommitA)+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
-	hostB := build(filepath.Join(bin, "runtime-host-b"), "./cmd/runtime-host", "", ldflags(e2eVersionB, e2eCommitB)+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionA, e2eCommitA)+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostB := build(filepath.Join(bin, "runtime-host-b"), "./cmd/runtime-host", "runtime_e2e", ldflags(e2eVersionB, e2eCommitB)+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
 
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -183,7 +274,9 @@ func findRuntimeE2EModuleRoot(t *testing.T) string {
 
 func newRuntimeE2ETempDir(t *testing.T) string {
 	t.Helper()
-	root, err := os.MkdirTemp("/private/tmp", "integrated-recorder-runtime-e2e-")
+	// Keep the path short enough for the Runtime Host's bounded Unix socket
+	// path while retaining a private, symlink-free temporary root.
+	root, err := os.MkdirTemp("/private/tmp", "ir-e2e-")
 	if err != nil {
 		t.Fatalf("create symlink-free runtime E2E directory: %v", err)
 	}
@@ -322,20 +415,30 @@ type runtimeUpdateStream struct {
 	watchRequests    []time.Time
 	refreshStarted   chan time.Time
 	refreshRelease   chan struct{}
+	failNextRefresh  bool
+	failNextManifest bool
+	failNextSegment  targetPreflightFailure
+	blockedSegment   uint64
+	segmentStarted   chan runtimeSegmentRequest
+	segmentRelease   chan struct{}
 }
 
 type runtimeSegmentRequest struct {
 	Token     string
 	At        time.Time
 	Succeeded bool
+	Failure   targetPreflightFailure
 }
 type runtimeManifestRequest struct {
-	Token string
-	At    time.Time
+	Token  string
+	At     time.Time
+	Failed bool
 }
 type runtimeRefreshRequest struct {
-	Token string
-	At    time.Time
+	Token     string
+	At        time.Time
+	Succeeded bool
+	Failed    bool
 }
 
 func newRuntimeUpdateFixture(t *testing.T) *runtimeUpdateFixture {
@@ -393,6 +496,76 @@ func (f *runtimeUpdateFixture) expireAndBlockRefresh(stream string) (<-chan time
 	return started, func() { once.Do(func() { close(release) }) }
 }
 
+func (f *runtimeUpdateFixture) expireAndFailNextRefresh(stream string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	value := f.streams[stream]
+	value.expired = true
+	value.failNextRefresh = true
+}
+
+func (f *runtimeUpdateFixture) failNextManifest(stream string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streams[stream].failNextManifest = true
+}
+
+func (f *runtimeUpdateFixture) failNextCandidate(stream string, failure targetPreflightFailure) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streams[stream].failNextSegment = failure
+}
+
+func (f *runtimeUpdateFixture) blockSegment(stream string, sequence uint64) (<-chan runtimeSegmentRequest, func()) {
+	f.mu.Lock()
+	value := f.streams[stream]
+	value.blockedSegment = sequence
+	value.segmentStarted = make(chan runtimeSegmentRequest, 1)
+	value.segmentRelease = make(chan struct{})
+	started, release := value.segmentStarted, value.segmentRelease
+	f.mu.Unlock()
+	var once sync.Once
+	return started, func() { once.Do(func() { close(release) }) }
+}
+
+func (f *runtimeUpdateFixture) refreshFailureCount(stream string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, request := range f.streams[stream].refreshes {
+		if request.Failed {
+			count++
+		}
+	}
+	return count
+}
+
+func (f *runtimeUpdateFixture) manifestFailureCount(stream string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, request := range f.streams[stream].manifestRequests {
+		if request.Failed {
+			count++
+		}
+	}
+	return count
+}
+
+func (f *runtimeUpdateFixture) candidateFailureCount(stream string, failure targetPreflightFailure) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	count := 0
+	for _, requests := range f.streams[stream].segmentRequests {
+		for _, request := range requests {
+			if request.Failure == failure {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func (f *runtimeUpdateFixture) segmentRequestsFor(stream string) map[uint64][]runtimeSegmentRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -401,6 +574,12 @@ func (f *runtimeUpdateFixture) segmentRequestsFor(stream string) map[uint64][]ru
 		result[sequence] = append([]runtimeSegmentRequest(nil), requests...)
 	}
 	return result
+}
+
+func (f *runtimeUpdateFixture) manifestRequestsFor(stream string) []runtimeManifestRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]runtimeManifestRequest(nil), f.streams[stream].manifestRequests...)
 }
 
 func (f *runtimeUpdateFixture) refreshesFor(stream string) []runtimeRefreshRequest {
@@ -463,7 +642,17 @@ func (f *runtimeUpdateFixture) handleRefresh(w http.ResponseWriter, r *http.Requ
 	started, release := value.refreshStarted, value.refreshRelease
 	at := time.Now().UTC()
 	value.refreshes = append(value.refreshes, runtimeRefreshRequest{Token: token, At: at})
+	requestIndex := len(value.refreshes) - 1
+	failOnce := value.failNextRefresh
+	if failOnce {
+		value.failNextRefresh = false
+		value.refreshes[requestIndex].Failed = true
+	}
 	f.mu.Unlock()
+	if failOnce {
+		http.Error(w, "fixture refresh temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if started != nil {
 		select {
 		case started <- at:
@@ -493,6 +682,9 @@ func (f *runtimeUpdateFixture) handleRefresh(w http.ResponseWriter, r *http.Requ
 		value.expired = false
 	}
 	refreshed := fmt.Sprintf("token-%d", value.tokenGeneration)
+	if requestIndex < len(value.refreshes) {
+		value.refreshes[requestIndex].Succeeded = true
+	}
 	f.mu.Unlock()
 	writeRuntimeJSON(w, map[string]string{"token": refreshed})
 }
@@ -506,10 +698,20 @@ func (f *runtimeUpdateFixture) handleManifest(w http.ResponseWriter, r *http.Req
 		http.NotFound(w, r)
 		return
 	}
+	requestIndex := len(value.manifestRequests)
 	value.manifestRequests = append(value.manifestRequests, runtimeManifestRequest{Token: token, At: time.Now().UTC()})
+	failOnce := value.failNextManifest
+	if failOnce {
+		value.failNextManifest = false
+		value.manifestRequests[requestIndex].Failed = true
+	}
 	valid := token == fmt.Sprintf("token-%d", value.tokenGeneration) && !value.expired
 	latest := value.latest
 	f.mu.Unlock()
+	if failOnce {
+		http.Error(w, "fixture manifest temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if !valid {
 		http.Error(w, "fixture media token expired", http.StatusForbidden)
 		return
@@ -536,17 +738,486 @@ func (f *runtimeUpdateFixture) handleSegment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	valid := token == fmt.Sprintf("token-%d", value.tokenGeneration) && !value.expired && sequence <= value.latest
-	value.segmentRequests[sequence] = append(value.segmentRequests[sequence], runtimeSegmentRequest{Token: token, At: time.Now().UTC(), Succeeded: valid})
+	failure := targetPreflightFailureNone
+	if valid && sequence == 4 && value.failNextSegment != targetPreflightFailureNone {
+		failure = value.failNextSegment
+		value.failNextSegment = targetPreflightFailureNone
+	}
+	requestRecord := runtimeSegmentRequest{Token: token, At: time.Now().UTC(), Succeeded: valid && failure == targetPreflightFailureNone, Failure: failure}
+	value.segmentRequests[sequence] = append(value.segmentRequests[sequence], requestRecord)
+	blocked := sequence == value.blockedSegment && value.segmentRelease != nil
+	started, release := value.segmentStarted, value.segmentRelease
 	f.mu.Unlock()
 	if !valid {
 		http.Error(w, "fixture media token expired", http.StatusForbidden)
 		return
 	}
-	_, _ = io.WriteString(w, runtimeSegmentPayload(stream, sequence))
+	if failure == targetPreflightFailureSegmentTransport {
+		http.Error(w, "fixture candidate segment temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if blocked && failure == targetPreflightFailureNone {
+		if started != nil {
+			select {
+			case started <- requestRecord:
+			default:
+			}
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			http.Error(w, "candidate segment request canceled", http.StatusGatewayTimeout)
+			return
+		case <-time.After(40 * time.Second):
+			http.Error(w, "candidate segment fixture timed out", http.StatusGatewayTimeout)
+			return
+		}
+	}
+	payload := runtimeSegmentPayload(stream, sequence)
+	switch failure {
+	case targetPreflightFailureSegmentTruncated:
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)+16))
+		_, _ = io.WriteString(w, payload[:len(payload)/2])
+		return
+	case targetPreflightFailureSegmentEmpty:
+		w.Header().Set("Content-Length", "0")
+		return
+	}
+	_, _ = io.WriteString(w, payload)
 }
 
 func runtimeSegmentPayload(stream string, sequence uint64) string {
 	return fmt.Sprintf("stream=%s;sequence=%06d;canonical-source-payload", stream, sequence)
+}
+
+func runTargetRefreshPreflightScenario(t *testing.T, artifacts runtimeUpdateArtifacts, fixture *runtimeUpdateFixture, failure targetPreflightFailure) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	dataRoot := newRuntimeE2ETempDir(t)
+	dataDir := filepath.Join(dataRoot, "data")
+	markerDir := filepath.Join(dataRoot, "failpoints")
+	for _, directory := range []string{dataDir, markerDir} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream := "target-preflight-success"
+	if failure != targetPreflightFailureNone {
+		stream = "target-preflight-" + string(failure)
+	}
+	fixture.reset(stream, "Preflight title", "Preflight description", stream+"-session")
+	controlABinary := filepath.Join(artifacts.bundleA, "control-plane")
+	engineABinary := filepath.Join(artifacts.bundleA, "recorder-engine")
+	installedDir := filepath.Join(dataDir, "runtime", "releases", install.ReleaseDirectoryID(e2eVersionB, e2eCommitB))
+	controlBBinary := filepath.Join(installedDir, fmt.Sprintf("%s-%s-%s", release.RoleControlPlane, runtime.GOOS, runtime.GOARCH))
+	engineBBinary := filepath.Join(installedDir, fmt.Sprintf("%s-%s-%s", release.RoleRecorderEngine, runtime.GOOS, runtime.GOARCH))
+	fixtureAdapterBinary := filepath.Join(artifacts.adapterDir, "integrated-recorder-adapter-runtime-update-fixture")
+	listenAddr := reserveRuntimeAddress(t)
+	baseURL := "http://" + listenAddr
+	client := &http.Client{Timeout: 30 * time.Second}
+	command := exec.Command(artifacts.hostA)
+	command.Env = minimalRuntimeE2EEnv([]string{
+		"DATA_DIR=" + dataDir,
+		"ADDR=" + listenAddr,
+		"AUTH_DISABLED=1",
+		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
+		"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
+		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.AfterSourceDrain),
+		"IR_RUNTIME_E2E_MARKER_DIR=" + markerDir,
+	})
+	process := &runtimeHostProcess{command: command, done: make(chan struct{}), diagnosticDir: markerDir}
+	command.Stdout, command.Stderr = &process.output, &process.output
+	if err := command.Start(); err != nil {
+		t.Fatalf("start production Runtime Host: %v", err)
+	}
+	go func() {
+		process.err = command.Wait()
+		close(process.done)
+	}()
+	t.Cleanup(func() {
+		stopRuntimeHostProcess(process)
+		for _, executable := range []string{artifacts.hostA, controlABinary, engineABinary, controlBBinary, engineBBinary, fixtureAdapterBinary} {
+			if err := waitProcessAbsent(t, executable, 10*time.Second); err != nil {
+				t.Errorf("target preflight cleanup left product process running for %s: %v", filepath.Base(executable), err)
+			}
+		}
+		makeRuntimeE2ETreeWritable(dataDir)
+	})
+
+	status := waitRuntimeHostStatus(t, ctx, client, baseURL, process)
+	if status.DefaultEngine == nil || status.DefaultEngine.Version != e2eVersionA {
+		t.Fatalf("release A Engine was not initially default: %+v", status)
+	}
+	recording := createRuntimeRecording(t, client, baseURL, "Pinned refresh preflight", map[string]string{"source_url": artifacts.fixtureURL + "/source/" + stream})
+	leaseA := waitRecordingLease(t, dataDir, recording.ID, 30*time.Second)
+	ownerStore, err := recordingowner.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerA, err := ownerStore.Current(recording.ID)
+	if err != nil || ownerA.EngineGeneration != leaseA.EngineGeneration || ownerA.WorkerInstance != leaseA.WorkerInstance {
+		t.Fatalf("initial owner does not match recording lease: owner=%+v lease=%+v err=%v", ownerA, leaseA, err)
+	}
+	fixture.advance(stream, 3)
+	waitRecordingSequenceCount(t, client, baseURL, recording.ID, 3, 20*time.Second)
+	baseline := getRecording(t, client, baseURL, recording.ID)
+	if baseline.State != domain.StateRecording || len(baseline.Gaps) != 0 || !equalSequenceRange(recordingSequences(baseline), 1, 3) {
+		t.Fatalf("preflight baseline is not a live contiguous archive: state=%s sequences=%v gaps=%+v", baseline.State, recordingSequences(baseline), baseline.Gaps)
+	}
+	verifyRuntimeRecordingSegments(t, dataDir, baseline, stream, 1, 3)
+	rootPath := filepath.Join(dataDir, "recordings", recording.ID, "recording.json")
+	rootBefore := mustReadFile(t, rootPath)
+	registryBefore := readRuntimeGenerationSnapshot(t, dataDir)
+	adapterSetA := registryBefore.Generations[leaseA.EngineGeneration].AdapterSetID
+	if adapterSetA == "" {
+		t.Fatalf("source Engine generation does not pin an immutable adapter set: %+v", registryBefore.Generations[leaseA.EngineGeneration])
+	}
+
+	check, code := getRuntimeJSON[httpapi.Status](t, client, baseURL, http.MethodPost, httpapi.Endpoint+"/check", map[string]any{})
+	if code != http.StatusOK || !check.UpdatesAvailable || check.AvailableRelease == nil || check.AvailableRelease.Version != e2eVersionB || check.VerificationState != "verified" {
+		t.Fatalf("signed release B check failed: code=%d status=%+v", code, check)
+	}
+	stage, code := getRuntimeJSON[httpapi.Status](t, client, baseURL, http.MethodPost, httpapi.Endpoint+"/stage", map[string]any{})
+	if code != http.StatusOK || stage.StagedRelease == nil || stage.StagedRelease.Version != e2eVersionB || stage.VerificationState != "verified" {
+		t.Fatalf("signed release B stage failed: code=%d status=%+v", code, stage)
+	}
+	if err := writeRuntimeHookArm(markerDir, runtimehook.Arm{Point: runtimehook.AfterSourceDrain, RecordingID: recording.ID}); err != nil {
+		t.Fatalf("arm AfterSourceDrain for exact Recording: %v", err)
+	}
+	activation := make(chan productionActivationOutcome, 1)
+	go func() {
+		outcome := productionActivationOutcome{started: time.Now().UTC()}
+		outcome.code, outcome.err = requestRuntimeJSON(client, baseURL, http.MethodPost, httpapi.Endpoint+"/activate", map[string]any{}, &outcome.status)
+		outcome.finished = time.Now().UTC()
+		activation <- outcome
+	}()
+	if err := waitHostHandoverLogEvent(process, "recording handover_source_drained", recording.ID, 1, 45*time.Second); err != nil {
+		t.Fatalf("source did not reach deterministic drained boundary: %v; host=%s", err, process.output.String())
+	}
+	readyMarker := runtimehook.ReadyMarkerPath(markerDir, runtimehook.AfterSourceDrain, recording.ID)
+	if err := waitRuntimeConditionError(10*time.Second, func() bool {
+		info, statErr := os.Lstat(readyMarker)
+		return statErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0600
+	}, "AfterSourceDrain pause"); err != nil {
+		t.Fatalf("Host did not pause after source drain: %v", err)
+	}
+	ownerAtDrain, err := ownerStore.Current(recording.ID)
+	if err != nil || ownerAtDrain != ownerA {
+		t.Fatalf("ownership changed before target preflight started: before=%+v at_drain=%+v err=%v", ownerA, ownerAtDrain, err)
+	}
+	leaseAtDrain := readRuntimeLeases(t, dataDir)[recording.ID]
+	if leaseAtDrain.EngineGeneration != leaseA.EngineGeneration {
+		t.Fatalf("generation lease moved before target readiness: A=%+v now=%+v", leaseA, leaseAtDrain)
+	}
+	mediaAtDrain := snapshotRuntimeCommittedMedia(t, dataDir, recording.ID)
+	fixture.advance(stream, 1) // sequence 4 is the first candidate past the canonical tail
+
+	if failure != targetPreflightFailureNone {
+		switch failure {
+		case targetPreflightFailureRefresh:
+			fixture.expireAndFailNextRefresh(stream)
+		case targetPreflightFailureManifest:
+			fixture.failNextManifest(stream)
+		case targetPreflightFailureSegmentTransport, targetPreflightFailureSegmentTruncated, targetPreflightFailureSegmentEmpty:
+			fixture.failNextCandidate(stream, failure)
+		default:
+			t.Fatalf("unknown target preflight failure mode %q", failure)
+		}
+		// Hold the source's retry of sequence 4 so canonical state can be
+		// compared after target preflight fails but before the source admits it.
+		sourceSegmentStarted, releaseSourceSegment := fixture.blockSegment(stream, 4)
+		t.Cleanup(releaseSourceSegment)
+		if err := writeRuntimeHookRelease(markerDir, runtimehook.AfterSourceDrain, recording.ID); err != nil {
+			t.Fatalf("release exact-recording source drain hook: %v", err)
+		}
+		if err := os.Remove(runtimehook.ArmPath(markerDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("disarm source-drain hook after its single deterministic use: %v", err)
+		}
+		waitFailure := func() error {
+			switch failure {
+			case targetPreflightFailureRefresh:
+				return waitRuntimeConditionError(20*time.Second, func() bool { return fixture.refreshFailureCount(stream) == 1 }, "target's one-shot adapter refresh failure")
+			case targetPreflightFailureManifest:
+				return waitRuntimeConditionError(20*time.Second, func() bool { return fixture.manifestFailureCount(stream) == 1 }, "target's one-shot fresh manifest failure")
+			default:
+				return waitRuntimeConditionError(20*time.Second, func() bool { return fixture.candidateFailureCount(stream, failure) == 1 }, "target's one-shot candidate media failure")
+			}
+		}
+		if err := waitFailure(); err != nil {
+			t.Fatalf("target did not perform injected %s preflight failure: %v; fixture=%s; host=%s", failure, err, fixture.describe(stream), process.output.String())
+		}
+		ownerAfterFailure, err := ownerStore.Current(recording.ID)
+		if err != nil || ownerAfterFailure != ownerA {
+			if failure == targetPreflightFailureSegmentEmpty && err == nil {
+				accepted := waitCanonicalSegmentCount(t, dataDir, recording.ID, 4, 15*time.Second)
+				var segment *domain.Segment
+				if track := accepted.Tracks["main"]; track != nil {
+					for index := range track.Segments {
+						if track.Segments[index].Sequence == 4 {
+							segment = &track.Segments[index]
+							break
+						}
+					}
+				}
+				var payload []byte
+				if segment != nil {
+					store, storeErr := storage.New(dataDir)
+					if storeErr == nil {
+						reader, openErr := store.OpenPayloadReader(recording.ID, segment.StoragePath)
+						if openErr == nil {
+							payload, _ = io.ReadAll(reader)
+							_ = reader.Close()
+						}
+					}
+				}
+				digest := sha256.Sum256(payload)
+				t.Fatalf("production defect: target accepted empty HTTP 200 continuation media before owner CAS: owner_before=%+v owner_after=%+v sequence4=%+v payload_size=%d payload_sha256=%s fixture=%s", ownerA, ownerAfterFailure, segment, len(payload), hex.EncodeToString(digest[:]), fixture.describe(stream))
+			}
+			t.Fatalf("target %s failure changed durable owner before source resumed: before=%+v after=%+v err=%v", failure, ownerA, ownerAfterFailure, err)
+		}
+		select {
+		case request := <-sourceSegmentStarted:
+			sourceToken := "token-0"
+			if failure == targetPreflightFailureRefresh {
+				sourceToken = "token-1"
+			}
+			if request.Token != sourceToken || !request.Succeeded || request.Failure != targetPreflightFailureNone {
+				t.Fatalf("source did not resume with valid media after %s preflight failure: got=%+v want token=%s fixture=%s", failure, request, sourceToken, fixture.describe(stream))
+			}
+		case <-ctx.Done():
+			t.Fatalf("source did not resume to fetch sequence 4 after %s preflight failure: %v", failure, ctx.Err())
+		case <-time.After(30 * time.Second):
+			t.Fatalf("source did not resume to fetch sequence 4 after %s preflight failure; fixture=%s; host=%s", failure, fixture.describe(stream), process.output.String())
+		}
+		if current, ownerErr := ownerStore.Current(recording.ID); ownerErr != nil || current != ownerA {
+			t.Fatalf("source lost ownership before its sequence-4 continuation request after %s failure: owner=%+v err=%v want=%+v", failure, current, ownerErr, ownerA)
+		}
+		if !bytesEqual(mediaAtDrain, snapshotRuntimeCommittedMedia(t, dataDir, recording.ID)) {
+			t.Fatalf("target %s preflight changed committed media segments/payloads before source sequence 4 response was admitted", failure)
+		}
+		releaseSourceSegment()
+		resumed := waitCanonicalSegmentCount(t, dataDir, recording.ID, 4, 30*time.Second)
+		if resumed.State != domain.StateRecording || len(resumed.Gaps) != 0 || !equalSequenceRange(recordingSequences(resumed), 1, 4) {
+			t.Fatalf("source Engine did not resume and capture the newly advanced segment after target %s failed: state=%s sequences=%v gaps=%+v", failure, resumed.State, recordingSequences(resumed), resumed.Gaps)
+		}
+		verifyRuntimeRecordingSegments(t, dataDir, resumed, stream, 1, 4)
+		if failure == targetPreflightFailureRefresh {
+			if err := waitRuntimeConditionError(10*time.Second, func() bool {
+				return len(fixture.refreshesFor(stream)) >= 2 && fixture.refreshesFor(stream)[1].Succeeded
+			}, "source Engine retry of fixture refresh"); err != nil {
+				t.Fatalf("source did not recover the one-shot failed refresh: %v; fixture=%s", err, fixture.describe(stream))
+			}
+			refreshes := fixture.refreshesFor(stream)
+			if len(refreshes) < 2 || !refreshes[0].Failed || refreshes[0].Token != "token-0" || !refreshes[1].Succeeded || refreshes[1].Token != "token-0" {
+				t.Fatalf("expected target failure followed by source recovery against the same pinned token: %+v", refreshes)
+			}
+		} else {
+			requests := fixture.segmentRequestsFor(stream)[4]
+			if failure == targetPreflightFailureManifest {
+				if len(requests) != 1 || requests[0].Failure != targetPreflightFailureNone || !requests[0].Succeeded {
+					t.Fatalf("manifest failure should be followed by one successful source candidate request: %+v", requests)
+				}
+			} else if len(requests) != 2 || requests[0].Failure != failure || requests[0].Succeeded || requests[1].Failure != targetPreflightFailureNone || !requests[1].Succeeded {
+				t.Fatalf("expected target %s candidate failure followed by one successful source request: %+v", failure, requests)
+			}
+		}
+		outcome := waitActivationOutcome(t, activation, 45*time.Second)
+		if outcome.err != nil || outcome.code != http.StatusOK || outcome.status.DefaultEngine == nil || outcome.status.DefaultEngine.Version != e2eVersionB {
+			t.Fatalf("release B activation should remain successful despite this Recording's pre-CAS failure: code=%d status=%+v err=%v host=%s", outcome.code, outcome.status, outcome.err, process.output.String())
+		}
+		t.Logf("production preflight failure proof: Recording=%s failure=%s owner remained %s/%d, source captured sequence 4 without a gap", recording.ID, failure, ownerA.EngineGeneration, ownerA.Epoch)
+		return
+	}
+
+	refreshStarted, releaseRefresh := fixture.expireAndBlockRefresh(stream)
+	t.Cleanup(releaseRefresh)
+	segmentStarted, releaseSegment := fixture.blockSegment(stream, 4)
+	t.Cleanup(releaseSegment)
+	if err := writeRuntimeHookRelease(markerDir, runtimehook.AfterSourceDrain, recording.ID); err != nil {
+		t.Fatalf("release exact-recording source drain hook: %v", err)
+	}
+	if err := os.Remove(runtimehook.ArmPath(markerDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disarm source-drain hook after its single deterministic use: %v", err)
+	}
+	select {
+	case refresh := <-refreshStarted:
+		_ = refresh
+	case <-ctx.Done():
+		t.Fatalf("target did not invoke pinned adapter refresh before transfer: %v", ctx.Err())
+	case <-time.After(20 * time.Second):
+		t.Fatalf("target did not invoke adapter refresh before transfer; fixture=%s; host=%s", fixture.describe(stream), process.output.String())
+	}
+	ownerDuringRefresh, err := ownerStore.Current(recording.ID)
+	if err != nil || ownerDuringRefresh != ownerA {
+		t.Fatalf("owner changed while target's adapter refresh was still blocked: before=%+v during_refresh=%+v err=%v", ownerA, ownerDuringRefresh, err)
+	}
+	if got := readRuntimeLeases(t, dataDir)[recording.ID].EngineGeneration; got != leaseA.EngineGeneration {
+		t.Fatalf("generation lease changed while target refresh was still blocked: got=%s source=%s", got, leaseA.EngineGeneration)
+	}
+	releaseRefresh()
+	select {
+	case candidate := <-segmentStarted:
+		if candidate.Token != "token-1" || !candidate.Succeeded {
+			t.Fatalf("target did not fetch continuation candidate with refreshed source token: %+v", candidate)
+		}
+	case <-ctx.Done():
+		t.Fatalf("target did not fetch next continuation payload before transfer: %v", ctx.Err())
+	case <-time.After(20 * time.Second):
+		t.Fatalf("target did not fetch sequence 4 before ownership transfer; fixture=%s; host=%s", fixture.describe(stream), process.output.String())
+	}
+	manifests := fixture.manifestRequestsFor(stream)
+	if !containsManifestTokenAfter(manifests, "token-1", refreshStartedAt(fixture, stream)) {
+		t.Fatalf("target did not fetch a fresh token-1 manifest after adapter refresh: %+v", manifests)
+	}
+	ownerWhileCandidateBlocked, err := ownerStore.Current(recording.ID)
+	if err != nil || ownerWhileCandidateBlocked != ownerA {
+		t.Fatalf("ownership changed before target candidate payload was released: before=%+v now=%+v err=%v", ownerA, ownerWhileCandidateBlocked, err)
+	}
+	releaseSegment()
+	outcome := waitActivationOutcome(t, activation, 45*time.Second)
+	if outcome.err != nil || outcome.code != http.StatusOK || outcome.status.DefaultEngine == nil || outcome.status.DefaultEngine.Version != e2eVersionB {
+		t.Fatalf("production application activation did not complete after candidate readiness: code=%d status=%+v err=%v host=%s", outcome.code, outcome.status, outcome.err, process.output.String())
+	}
+	leaseB := waitRecordingLeaseGeneration(t, dataDir, recording.ID, outcome.status.DefaultEngine.ID, 20*time.Second, process.output.String, func() string { return fixture.describe(stream) })
+	ownerB, err := ownerStore.Current(recording.ID)
+	if err != nil || ownerB.EngineGeneration != outcome.status.DefaultEngine.ID || ownerB.Epoch <= ownerA.Epoch {
+		t.Fatalf("durable owner did not transfer monotonically to ready target: old=%+v new=%+v active=%+v err=%v; host=%s; fixture=%s", ownerA, ownerB, outcome.status.DefaultEngine, err, process.output.String(), fixture.describe(stream))
+	}
+	registryAfter := readRuntimeGenerationSnapshot(t, dataDir)
+	if registryAfter.Generations[leaseA.EngineGeneration].AdapterSetID != adapterSetA || registryAfter.Generations[leaseB.EngineGeneration].AdapterSetID != adapterSetA {
+		t.Fatalf("handover changed the Recording's pinned immutable adapter set: A=%q B=%q expected=%q", registryAfter.Generations[leaseA.EngineGeneration].AdapterSetID, registryAfter.Generations[leaseB.EngineGeneration].AdapterSetID, adapterSetA)
+	}
+	final := waitCanonicalSegmentCount(t, dataDir, recording.ID, 4, 20*time.Second)
+	if final.ID != recording.ID || final.State != domain.StateRecording || len(final.Gaps) != 0 || !equalSequenceRange(recordingSequences(final), 1, 4) {
+		t.Fatalf("successful target preflight did not continue the same Recording without a gap: id=%s state=%s sequences=%v gaps=%+v", final.ID, final.State, recordingSequences(final), final.Gaps)
+	}
+	verifyRuntimeRecordingSegments(t, dataDir, final, stream, 1, 4)
+	requests := fixture.segmentRequestsFor(stream)
+	if len(requests[4]) != 1 || requests[4][0].Token != "token-1" || !requests[4][0].Succeeded {
+		t.Fatalf("the preflight payload was not committed exactly once from refreshed media: %+v", requests[4])
+	}
+	if bytesEqual(rootBefore, mustReadFile(t, rootPath)) {
+		t.Fatal("canonical root did not advance when the staged target candidate was committed")
+	}
+	t.Logf("production target preflight proof: Recording=%s source=%s/%d target=%s/%d, adapter_set=%s, refresh token-0→token-1, manifest and candidate sequence 4 fetched before owner CAS", recording.ID, ownerA.EngineGeneration, ownerA.Epoch, ownerB.EngineGeneration, ownerB.Epoch, adapterSetA)
+}
+
+func containsManifestTokenAfter(requests []runtimeManifestRequest, token string, after time.Time) bool {
+	for _, request := range requests {
+		if request.Token == token && (after.IsZero() || request.At.After(after)) {
+			return true
+		}
+	}
+	return false
+}
+
+func refreshStartedAt(fixture *runtimeUpdateFixture, stream string) time.Time {
+	requests := fixture.refreshesFor(stream)
+	if len(requests) == 0 {
+		return time.Time{}
+	}
+	return requests[len(requests)-1].At
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read canonical recording root: %v", err)
+	}
+	return data
+}
+
+func snapshotRuntimeCommittedMedia(t *testing.T, dataDir, recordingID string) []byte {
+	t.Helper()
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatalf("open storage for committed media snapshot: %v", err)
+	}
+	recording, err := store.LoadRecordingReadOnly(recordingID)
+	if err != nil || recording == nil {
+		t.Fatalf("load recording for committed media snapshot: recording=%v err=%v", recording != nil, err)
+	}
+	type committedTrack struct {
+		Segments     []domain.Segment `json:"segments"`
+		InitSegments []domain.Segment `json:"init_segments"`
+	}
+	tracks := make(map[string]committedTrack, len(recording.Tracks))
+	for id, track := range recording.Tracks {
+		if track != nil {
+			tracks[id] = committedTrack{Segments: track.Segments, InitSegments: track.InitSegments}
+		}
+	}
+	root := filepath.Join(dataDir, "recordings", recordingID)
+	files := make(map[string]string)
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		// A-side source acquisition is allowed to persist fresh manifest
+		// snapshots while it resumes. Only canonical media segment/init files
+		// are included here, together with their committed root references.
+		if !strings.HasPrefix(filepath.ToSlash(relative), "tracks/") {
+			return nil
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("canonical archive contains nonregular entry %q", filepath.Base(path))
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		digest := sha256.Sum256(data)
+		files[filepath.ToSlash(relative)] = hex.EncodeToString(digest[:])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot canonical archive files: %v", err)
+	}
+	snapshot := struct {
+		ID             string                    `json:"id"`
+		State          domain.RecordingState     `json:"state"`
+		Title          string                    `json:"title"`
+		AdapterID      string                    `json:"adapter_id"`
+		Adapter        *domain.AdapterProvenance `json:"adapter,omitempty"`
+		Resource       *domain.ResourceReference `json:"resource,omitempty"`
+		CreatedAt      time.Time                 `json:"created_at"`
+		StartedAt      time.Time                 `json:"started_at"`
+		StoppedAt      *time.Time                `json:"stopped_at,omitempty"`
+		Tracks         map[string]committedTrack `json:"tracks"`
+		Gaps           []domain.Gap              `json:"gaps,omitempty"`
+		Metadata       []domain.MetadataRevision `json:"metadata_timeline,omitempty"`
+		MetadataCut    bool                      `json:"metadata_timeline_truncated,omitempty"`
+		PayloadDigests map[string]string         `json:"payload_digests"`
+	}{
+		ID: recording.ID, State: recording.State, Title: recording.Title, AdapterID: recording.AdapterID,
+		Adapter: recording.Adapter, Resource: recording.Resource, CreatedAt: recording.CreatedAt,
+		StartedAt: recording.StartedAt, StoppedAt: recording.StoppedAt, Tracks: tracks,
+		Gaps: recording.Gaps, Metadata: recording.MetadataTimeline, MetadataCut: recording.MetadataTimelineTruncated,
+		PayloadDigests: files,
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("encode committed media snapshot: %v", err)
+	}
+	return data
+}
+
+func bytesEqual(left, right []byte) bool {
+	return reflect.DeepEqual(left, right)
 }
 
 func urlQueryEscape(value string) string { return url.QueryEscape(value) }
@@ -557,10 +1228,362 @@ func writeRuntimeJSON(w http.ResponseWriter, value any) {
 }
 
 type runtimeHostProcess struct {
-	command *exec.Cmd
-	done    chan struct{}
-	err     error
-	output  testOutputBuffer
+	command       *exec.Cmd
+	done          chan struct{}
+	err           error
+	output        testOutputBuffer
+	diagnosticDir string
+}
+
+type productionActivationOutcome struct {
+	status   httpapi.Status
+	code     int
+	err      error
+	started  time.Time
+	finished time.Time
+}
+
+func runProductionHandoverCrashScenario(t *testing.T, artifacts runtimeUpdateArtifacts, fixture *runtimeUpdateFixture, point runtimehook.Point, runID int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	dataRoot := newRuntimeE2ETempDir(t)
+	dataDir := filepath.Join(dataRoot, "data")
+	markerDir := filepath.Join(dataRoot, "failpoints")
+	for _, directory := range []string{dataDir, markerDir} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream := fmt.Sprintf("crash-%s-%d", point, runID)
+	fixture.reset(stream, "Before host crash", "Stable description", fmt.Sprintf("session-%d", runID))
+	controlABinary := filepath.Join(artifacts.bundleA, "control-plane")
+	engineABinary := filepath.Join(artifacts.bundleA, "recorder-engine")
+	installedDir := filepath.Join(dataDir, "runtime", "releases", install.ReleaseDirectoryID(e2eVersionB, e2eCommitB))
+	controlBBinary := filepath.Join(installedDir, fmt.Sprintf("%s-%s-%s", release.RoleControlPlane, runtime.GOOS, runtime.GOARCH))
+	engineBBinary := filepath.Join(installedDir, fmt.Sprintf("%s-%s-%s", release.RoleRecorderEngine, runtime.GOOS, runtime.GOARCH))
+	fixtureAdapterBinary := filepath.Join(artifacts.adapterDir, "integrated-recorder-adapter-runtime-update-fixture")
+	listenAddr := reserveRuntimeAddress(t)
+	baseURL := "http://" + listenAddr
+	client := &http.Client{Timeout: 8 * time.Second}
+	tracked := make(map[int]string)
+	var currentHost *runtimeHostProcess
+	trackProducts := func(paths ...string) {
+		for _, path := range paths {
+			for _, pid := range processIDsForBinary(path) {
+				tracked[pid] = path
+			}
+		}
+	}
+	startHost := func(failpoint bool) *runtimeHostProcess {
+		extra := []string{
+			"DATA_DIR=" + dataDir,
+			"ADDR=" + listenAddr,
+			"AUTH_DISABLED=1",
+			"ADAPTER_DIR=" + artifacts.adapterDir,
+			"IR_RELEASE_BUNDLE_DIR=" + artifacts.packageB,
+			"IR_RELEASE_TRUSTED_KEYS_JSON=" + artifacts.publicKeys,
+		}
+		if failpoint {
+			extra = append(extra, "IR_RUNTIME_E2E_FAILPOINT="+string(point), "IR_RUNTIME_E2E_MARKER_DIR="+markerDir)
+		}
+		command := exec.Command(artifacts.hostA)
+		command.Env = minimalRuntimeE2EEnv(extra)
+		process := &runtimeHostProcess{command: command, done: make(chan struct{})}
+		if failpoint {
+			process.diagnosticDir = markerDir
+		}
+		command.Stdout, command.Stderr = &process.output, &process.output
+		if err := command.Start(); err != nil {
+			t.Fatalf("start tagged production Runtime Host: %v", err)
+		}
+		go func() {
+			process.err = command.Wait()
+			close(process.done)
+		}()
+		return process
+	}
+	t.Cleanup(func() {
+		stopRuntimeHostProcess(currentHost)
+		if err := terminateRecordedProcesses(tracked, 10*time.Second); err != nil {
+			t.Errorf("crash acceptance cleanup left a recorded product process running: %v", err)
+		}
+		makeRuntimeE2ETreeWritable(dataDir)
+	})
+
+	currentHost = startHost(true)
+	status := waitRuntimeHostStatus(t, ctx, client, baseURL, currentHost)
+	installationBefore := installation.ReadOnly(dataDir)
+	if installationBefore.State != installation.StateReady || installationBefore.InstallationID == "" || status.ActiveControl == nil || status.ActiveControl.Version != e2eVersionA {
+		t.Fatalf("production release A did not bootstrap ready: install=%+v status=%+v; host=%s", installationBefore, status, currentHost.output.String())
+	}
+	trackProducts(controlABinary, engineABinary)
+	input := map[string]string{"source_url": artifacts.fixtureURL + "/source/" + stream}
+	recording := createRuntimeRecording(t, client, baseURL, "Crash-boundary recording", input)
+	if recording.ID == "" || recording.State != domain.StateRecording {
+		t.Fatalf("production API did not create active Recording: %+v", recording)
+	}
+	leaseA := waitRecordingLease(t, dataDir, recording.ID, 30*time.Second)
+	if leaseA.EngineGeneration != status.DefaultEngine.ID {
+		t.Fatalf("Recording is not pinned to release A: lease=%+v active=%+v", leaseA, status.DefaultEngine)
+	}
+	ownerStore, err := recordingowner.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceOwner, err := ownerStore.Current(recording.ID)
+	if err != nil || sourceOwner.EngineGeneration != leaseA.EngineGeneration || sourceOwner.WorkerInstance != leaseA.WorkerInstance {
+		t.Fatalf("could not capture authoritative source owner: owner=%+v lease=%+v err=%v", sourceOwner, leaseA, err)
+	}
+	if err := writeRuntimeHookArm(markerDir, runtimehook.Arm{Point: point, RecordingID: recording.ID}); err != nil {
+		t.Fatalf("atomically arm exact recording failpoint: %v", err)
+	}
+	fixture.advance(stream, 5)
+	waitRecordingSequenceCount(t, client, baseURL, recording.ID, 5, 25*time.Second)
+	baseline := getRecording(t, client, baseURL, recording.ID)
+	if !equalSequenceRange(recordingSequences(baseline), 1, 5) || len(baseline.Gaps) != 0 {
+		t.Fatalf("pre-crash archive is not contiguous through sequence 5: sequences=%v gaps=%+v", recordingSequences(baseline), baseline.Gaps)
+	}
+	verifyRuntimeRecordingSegments(t, dataDir, baseline, stream, 1, 5)
+	metadataBefore := waitMetadataTimeline(t, ctx, client, baseURL, recording.ID, 1, 35*time.Second)
+	if len(metadataBefore.Items) != 1 || stringValue(metadataBefore.Items[0].Title) != "Before host crash" || stringValue(metadataBefore.Items[0].Description) != "Stable description" {
+		t.Fatalf("metadata baseline is invalid: %+v", metadataBefore.Items)
+	}
+	archiveDir := filepath.Join(dataDir, "recordings", recording.ID)
+	if _, err := os.Stat(archiveDir); err != nil {
+		t.Fatalf("canonical archive directory is missing before update: %v", err)
+	}
+
+	check, code := getRuntimeJSON[httpapi.Status](t, client, baseURL, http.MethodPost, httpapi.Endpoint+"/check", map[string]any{})
+	if code != http.StatusOK || !check.UpdatesAvailable || check.AvailableRelease == nil || check.AvailableRelease.Version != e2eVersionB || check.VerificationState != "verified" {
+		t.Fatalf("production signed check did not verify B: code=%d status=%+v", code, check)
+	}
+	stage, code := getRuntimeJSON[httpapi.Status](t, client, baseURL, http.MethodPost, httpapi.Endpoint+"/stage", map[string]any{})
+	if code != http.StatusOK || stage.StagedRelease == nil || stage.StagedRelease.Version != e2eVersionB || stage.VerificationState != "verified" {
+		t.Fatalf("production signed stage did not install B: code=%d status=%+v", code, stage)
+	}
+	if err := verifyInstalledRuntimeRelease(installedDir, artifacts.manifestB); err != nil {
+		t.Fatalf("staged B release failed production artifact checks: %v", err)
+	}
+
+	activation := make(chan productionActivationOutcome, 1)
+	go func() {
+		outcome := productionActivationOutcome{started: time.Now().UTC()}
+		outcome.code, outcome.err = requestRuntimeJSON(client, baseURL, http.MethodPost, httpapi.Endpoint+"/activate", map[string]any{}, &outcome.status)
+		outcome.finished = time.Now().UTC()
+		activation <- outcome
+	}()
+	activated := waitActivationOutcome(t, activation, 30*time.Second)
+	if activated.err != nil || activated.code != http.StatusOK || activated.status.DefaultEngine == nil || activated.status.DefaultEngine.Version != e2eVersionB || activated.status.ActiveControl == nil || activated.status.ActiveControl.Version != e2eVersionB {
+		t.Fatalf("production API failed to activate B before handover crash: code=%d status=%+v err=%v", activated.code, activated.status, activated.err)
+	}
+	trackProducts(controlABinary, engineABinary, controlBBinary, engineBBinary, fixtureAdapterBinary)
+	if pointNeedsPreparedContinuation(point) {
+		if err := waitHostHandoverLogEvent(currentHost, "recording handover_source_drained", recording.ID, 1, 40*time.Second); err != nil {
+			t.Fatalf("handover did not reach its explicit source-drain boundary for %s: %v; host=%s", point, err, currentHost.output.String())
+		}
+		fixture.advance(stream, 1)
+	}
+	readyPath := runtimehook.ReadyMarkerPath(markerDir, point, recording.ID)
+	if err := waitRuntimeConditionError(45*time.Second, func() bool {
+		info, err := os.Lstat(readyPath)
+		return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0600
+	}, "failpoint marker for "+string(point)); err != nil {
+		t.Fatalf("production boundary %s was not reached: %v; host=%s; fixture=%s", point, err, currentHost.output.String(), fixture.describe(stream))
+	}
+	trackProducts(controlABinary, engineABinary, controlBBinary, engineBBinary, fixtureAdapterBinary)
+
+	expectedOwner, err := ownerStore.Current(recording.ID)
+	if err != nil {
+		t.Fatalf("read durable owner at failpoint %s: %v", point, err)
+	}
+	wantGeneration := leaseA.EngineGeneration
+	if pointAfterOwnerCAS(point) {
+		registryBefore := readRuntimeGenerationSnapshot(t, dataDir)
+		wantGeneration = registryBefore.ActiveGenerationID
+	}
+	if expectedOwner.EngineGeneration != wantGeneration || expectedOwner.Epoch < sourceOwner.Epoch {
+		t.Fatalf("durable owner at %s is inconsistent: owner=%+v expected_generation=%s source_lease=%+v", point, expectedOwner, wantGeneration, leaseA)
+	}
+	if point == runtimehook.AfterTargetFirstCommit {
+		targetEnginePID := processForBinary(engineBBinary)
+		if targetEnginePID == 0 {
+			t.Fatal("target Engine B PID was not live at first canonical commit failpoint")
+		}
+		tracked[targetEnginePID] = engineBBinary
+	}
+	lastBeforeCrash := uint64(5)
+	if point == runtimehook.AfterTargetFirstCommit || point == runtimehook.BeforeSourceRetirement {
+		lastBeforeCrash = 6
+		// BeforeSourceRetirement deliberately freezes the Host after B has
+		// acquired the durable owner but before A has detached its parked entry.
+		// The management router rejects that transient duplicate Engine
+		// inventory instead of guessing an owner, so observe the canonical root
+		// directly while the Host is held at this failpoint.
+		if point == runtimehook.BeforeSourceRetirement {
+			waitCanonicalSegmentCount(t, dataDir, recording.ID, int(lastBeforeCrash), 30*time.Second)
+		} else {
+			waitRecordingSequenceCount(t, client, baseURL, recording.ID, int(lastBeforeCrash), 30*time.Second)
+		}
+	}
+	var preCrashArchive *domain.Recording
+	if point == runtimehook.BeforeSourceRetirement {
+		store, err := storage.New(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		preCrashArchive, err = store.LoadRecordingReadOnly(recording.ID)
+		if err != nil {
+			t.Fatalf("read canonical archive while source retirement is held: %v", err)
+		}
+	} else {
+		preCrashArchive = getRecording(t, client, baseURL, recording.ID)
+	}
+	if !equalSequenceRange(recordingSequences(preCrashArchive), 1, lastBeforeCrash) || len(preCrashArchive.Gaps) != 0 {
+		t.Fatalf("archive at %s has unexpected source sequence/gaps: sequence=%v gaps=%+v", point, recordingSequences(preCrashArchive), preCrashArchive.Gaps)
+	}
+	verifyRuntimeRecordingSegments(t, dataDir, preCrashArchive, stream, 1, lastBeforeCrash)
+	preCrashObjects, err := snapshotRecordingObjects(archiveDir)
+	if err != nil {
+		t.Fatalf("snapshot canonical archive objects at %s: %v", point, err)
+	}
+	var metadataPreCrash []domain.MetadataRevision
+	if point == runtimehook.BeforeSourceRetirement {
+		// The stable management route intentionally fails closed while both
+		// Engine inventories report the handover boundary. The canonical root is
+		// still the authoritative projection to inspect at this exact failpoint.
+		metadataPreCrash = preCrashArchive.MetadataTimeline
+	} else {
+		metadataSnapshot := waitMetadataTimeline(t, ctx, client, baseURL, recording.ID, len(metadataBefore.Items), 10*time.Second)
+		metadataPreCrash = metadataSnapshot.Items
+	}
+	if !reflect.DeepEqual(metadataBefore.Items, metadataPreCrash) {
+		t.Fatalf("metadata changed semantically before crash at %s: before=%+v now=%+v", point, metadataBefore.Items, metadataPreCrash)
+	}
+
+	oldHostPID := currentHost.command.Process.Pid
+	if err := hardKillRuntimeHost(currentHost, 10*time.Second); err != nil {
+		t.Fatalf("SIGKILL production Host at %s: %v", point, err)
+	}
+	if processPIDPresent(oldHostPID) {
+		t.Fatalf("SIGKILLed Runtime Host PID %d remains present", oldHostPID)
+	}
+	currentHost = startHost(false)
+	recovered := waitRuntimeStatus(t, ctx, client, baseURL, func(s httpapi.Status) bool {
+		return s.ActiveControl != nil && s.ActiveControl.Version == e2eVersionB && s.DefaultEngine != nil && s.DefaultEngine.Version == e2eVersionB
+	}, currentHost)
+	trackProducts(controlBBinary, engineBBinary, fixtureAdapterBinary)
+	installationAfter := installation.ReadOnly(dataDir)
+	if installationAfter.State != installation.StateReady || installationAfter.InstallationID != installationBefore.InstallationID {
+		t.Fatalf("Host crash recovery changed durable installation state: before=%+v after=%+v", installationBefore, installationAfter)
+	}
+	if recovered.Host.Version != e2eVersionA || recovered.ActiveControl == nil || recovered.ActiveControl.Version != e2eVersionB || recovered.DefaultEngine == nil || recovered.DefaultEngine.Version != e2eVersionB {
+		t.Fatalf("cold recovery did not reconcile the active B generation: %+v", recovered)
+	}
+	if _, err := os.Stat(archiveDir); err != nil {
+		t.Fatalf("cold recovery changed/removed canonical Recording directory: %v", err)
+	}
+	postCrash := getRecording(t, client, baseURL, recording.ID)
+	if postCrash.ID != recording.ID || postCrash.State != domain.StateInterrupted || len(postCrash.Gaps) != 0 || !equalSequenceRange(recordingSequences(postCrash), 1, lastBeforeCrash) {
+		t.Fatalf("cold recovery must preserve the same archive and make its active state explicitly interrupted: id=%s state=%s seq=%v gaps=%+v", postCrash.ID, postCrash.State, recordingSequences(postCrash), postCrash.Gaps)
+	}
+	verifyRuntimeRecordingSegments(t, dataDir, postCrash, stream, 1, lastBeforeCrash)
+	postCrashObjects, err := snapshotRecordingObjects(archiveDir)
+	if err != nil || !reflect.DeepEqual(preCrashObjects, postCrashObjects) {
+		t.Fatalf("cold recovery rewrote payload/sidecar/manifest objects: err=%v before=%v after=%v", err, preCrashObjects, postCrashObjects)
+	}
+	var metadataAfter []domain.MetadataRevision
+	if point == runtimehook.BeforeSourceRetirement {
+		// The handover fixture intentionally held both Engine inventories at
+		// the same owner transition boundary. The public recording detail omits
+		// the bounded source timeline, so compare the canonical root directly.
+		store, err := storage.New(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterArchive, err := store.LoadRecordingReadOnly(recording.ID)
+		if err != nil {
+			t.Fatalf("read canonical archive after source-retirement crash: %v", err)
+		}
+		metadataAfter = afterArchive.MetadataTimeline
+	} else {
+		metadataSnapshot := waitMetadataTimeline(t, ctx, client, baseURL, recording.ID, len(metadataBefore.Items), 10*time.Second)
+		metadataAfter = metadataSnapshot.Items
+	}
+	if !reflect.DeepEqual(metadataBefore.Items, metadataAfter) {
+		t.Fatalf("cold recovery changed canonical metadata timeline: before=%+v after=%+v", metadataBefore.Items, metadataAfter)
+	}
+	registryAfter := readRuntimeGenerationSnapshot(t, dataDir)
+	if len(registryAfter.Leases) != 0 {
+		t.Fatalf("cold recovery retained stale generation leases: %+v", registryAfter.Leases)
+	}
+	if registryAfter.ActiveGenerationID == "" || registryAfter.Generations[registryAfter.ActiveGenerationID].Version != e2eVersionB {
+		t.Fatalf("cold recovery lost active B generation: %+v", registryAfter)
+	}
+	for _, stale := range []recordingowner.Owner{sourceOwner, expectedOwner} {
+		called := false
+		commitErr := ownerStore.WithCommit(stale, func() error { called = true; return nil })
+		if (!errors.Is(commitErr, recordingowner.ErrNotFound) && !errors.Is(commitErr, recordingowner.ErrStaleOwner)) || called {
+			t.Fatalf("cold recovery accepted stale owner tuple %+v: err=%v callback=%v", stale, commitErr, called)
+		}
+	}
+	ownerRecordPath := filepath.Join(dataDir, "runtime", "recording-owners", recording.ID+".json")
+	ownerRecordBytes, err := os.ReadFile(ownerRecordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ownerHighWater struct {
+		Epoch uint64 `json:"epoch"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(ownerRecordBytes, &ownerHighWater); err != nil || ownerHighWater.Epoch < expectedOwner.Epoch || ownerHighWater.State != "fenced" {
+		t.Fatalf("cold recovery owner tombstone/high-water is invalid: record=%+v err=%v", ownerHighWater, err)
+	}
+
+	if point == runtimehook.BeforeTargetFirstCommit || point == runtimehook.AfterTargetFirstCommit {
+		// Cold recovery has already installed a newer durable owner fence and
+		// explicitly interrupted this archive. Release the real Engine process
+		// only after recovery; the before-commit case has an already-fetched
+		// candidate waiting at the common canonical commit path.
+		rootBeforeRelease, err := os.ReadFile(filepath.Join(archiveDir, "recording.json"))
+		if err != nil {
+			t.Fatalf("read recovered canonical root before releasing Engine: %v", err)
+		}
+		if err := writeRuntimeHookRelease(markerDir, point, recording.ID); err != nil {
+			t.Fatal(err)
+		}
+		if point == runtimehook.BeforeTargetFirstCommit {
+			markerPath := runtimehook.ObservationMarkerPath(markerDir, runtimehook.StaleOwnerCommitRejected, recording.ID)
+			if err := waitRuntimeConditionError(20*time.Second, func() bool {
+				info, statErr := os.Lstat(markerPath)
+				return statErr == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0600 && info.Size() == 0
+			}, "orphan Engine common-fence stale-owner rejection marker"); err != nil {
+				t.Fatalf("released Engine did not prove its staged canonical commit was rejected by the owner fence: %v; child=%s", err, readRuntimeE2EChildDiagnostics(currentHost.diagnosticDir))
+			}
+		}
+		staleCommitCalled := false
+		staleCommitErr := ownerStore.WithCommit(expectedOwner, func() error {
+			staleCommitCalled = true
+			return nil
+		})
+		if (!errors.Is(staleCommitErr, recordingowner.ErrNotFound) && !errors.Is(staleCommitErr, recordingowner.ErrStaleOwner)) || staleCommitCalled {
+			t.Fatalf("released orphan owner token could still reach canonical commit: err=%v callback=%v", staleCommitErr, staleCommitCalled)
+		}
+		afterStaleAttempt := getRecording(t, client, baseURL, recording.ID)
+		if afterStaleAttempt.State != domain.StateInterrupted || !equalSequenceRange(recordingSequences(afterStaleAttempt), 1, lastBeforeCrash) || len(afterStaleAttempt.Gaps) != 0 {
+			t.Fatalf("cold recovery or orphan polling changed the canonical archive after fencing: state=%s sequences=%v gaps=%+v", afterStaleAttempt.State, recordingSequences(afterStaleAttempt), afterStaleAttempt.Gaps)
+		}
+		if after, snapshotErr := snapshotRecordingObjects(archiveDir); snapshotErr != nil || !reflect.DeepEqual(postCrashObjects, after) {
+			t.Fatalf("old fenced Engine rewrote canonical payload/sidecar objects: err=%v before=%v after=%v", snapshotErr, postCrashObjects, after)
+		}
+		rootAfterRelease, err := os.ReadFile(filepath.Join(archiveDir, "recording.json"))
+		if err != nil || !reflect.DeepEqual(rootBeforeRelease, rootAfterRelease) {
+			t.Fatalf("old fenced Engine changed canonical recording root: err=%v", err)
+		}
+	}
+
+	trackProducts(controlABinary, engineABinary, controlBBinary, engineBBinary, fixtureAdapterBinary)
+	t.Logf("production Host crash matrix point=%s Recording=%s owner=%s/%d preCrashSequences=1..%d coldState=%s activeGeneration=%s", point, recording.ID, expectedOwner.EngineGeneration, expectedOwner.Epoch, lastBeforeCrash, postCrash.State, registryAfter.ActiveGenerationID)
 }
 
 func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts, fixture *runtimeUpdateFixture, iteration int) {
@@ -695,12 +1718,42 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	case <-time.After(10 * time.Second):
 		t.Fatal("Engine A did not call the fixture adapter's refresh capability after source expiry")
 	}
-	activateStarted := time.Now().UTC()
-	activateStatus, code := getRuntimeJSON[httpapi.Status](t, client, baseURL, http.MethodPost, httpapi.Endpoint+"/activate", map[string]any{})
-	activateFinished := time.Now().UTC()
+	activationResult := make(chan productionActivationOutcome, 1)
+	go func() {
+		outcome := productionActivationOutcome{started: time.Now().UTC()}
+		outcome.code, outcome.err = requestRuntimeJSON(client, baseURL, http.MethodPost, httpapi.Endpoint+"/activate", map[string]any{}, &outcome.status)
+		outcome.finished = time.Now().UTC()
+		activationResult <- outcome
+	}()
+	activation := waitActivationOutcome(t, activationResult, 30*time.Second)
+	activateStarted, activateFinished := activation.started, activation.finished
+	activateStatus, code := activation.status, activation.code
+	if activation.err != nil {
+		releaseRefresh()
+		t.Fatalf("production activate request failed: %v; host output=%s", activation.err, process.output.String())
+	}
 	if code != http.StatusOK || activateStatus.ActiveControl == nil || activateStatus.ActiveControl.Version != e2eVersionB || activateStatus.ActiveControl.Commit != e2eCommitB || activateStatus.DefaultEngine == nil || activateStatus.DefaultEngine.Version != e2eVersionB || activateStatus.DefaultEngine.Commit != e2eCommitB {
 		releaseRefresh()
 		t.Fatalf("production update API failed to activate B: code=%d status=%+v; host output=%s", code, activateStatus, process.output.String())
+	}
+	// The blocked A refresh makes the first target probe return a safe
+	// refresh-required response. Wait for the Host's structured drain event
+	// before releasing A; this is an explicit lifecycle synchronization point,
+	// not a timing assumption.
+	if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR.ID, 1, 30*time.Second); err != nil {
+		releaseRefresh()
+		runtime := readRuntimeGenerationSnapshot(t, dataDir)
+		ownerStore, ownerErr := recordingowner.Open(dataDir)
+		var owner recordingowner.Owner
+		if ownerErr == nil {
+			owner, ownerErr = ownerStore.Current(recordingR.ID)
+		}
+		var generations []generation.Generation
+		for _, item := range runtime.Generations {
+			generations = append(generations, item)
+		}
+		sort.Slice(generations, func(i, j int) bool { return generations[i].ID < generations[j].ID })
+		t.Fatalf("%v; activation returned code=%d status=%+v at=%s..%s; owner=%+v owner_err=%v generations=%+v leases=%+v; host output=%s", err, code, activateStatus, activateStarted, activateFinished, owner, ownerErr, generations, runtime.Leases, process.output.String())
 	}
 	if refreshAt.After(activateFinished) {
 		releaseRefresh()
@@ -727,23 +1780,74 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 		t.Fatal("Engine A exited while R still held its generation lease")
 	}
 	status = waitRuntimeStatus(t, ctx, client, baseURL, func(s httpapi.Status) bool {
-		return s.ActiveControl != nil && s.ActiveControl.Version == e2eVersionB && hasGeneration(s.DrainingGenerations, e2eVersionA, 1)
+		return s.ActiveControl != nil && s.ActiveControl.Version == e2eVersionB
 	})
-	if !hasGeneration(status.DrainingGenerations, e2eVersionA, 1) {
-		releaseRefresh()
-		t.Fatalf("old generation A is not draining with an R lease: %+v", status.DrainingGenerations)
-	}
 	leaseNow := readRuntimeLeases(t, dataDir)
 	if leaseNow[recordingR.ID].EngineGeneration != leaseA.EngineGeneration {
 		releaseRefresh()
-		t.Fatalf("R changed Engine generation across update: before=%s after=%s", leaseA.EngineGeneration, leaseNow[recordingR.ID].EngineGeneration)
+		t.Fatalf("R changed Engine generation before its blocked source refresh could finish: before=%s after=%s", leaseA.EngineGeneration, leaseNow[recordingR.ID].EngineGeneration)
 	}
-	// Complete the request as soon as the activation proof is established. The
-	// fixture intentionally holds the adapter call across the A→B switch, but
-	// must not outlive the adapter IPC deadline while unrelated B-side setup runs.
+	ownerStoreBeforeFailure, err := recordingowner.Open(dataDir)
+	if err != nil {
+		releaseRefresh()
+		t.Fatal(err)
+	}
+	ownerBeforeTargetFailure, err := ownerStoreBeforeFailure.Current(recordingR.ID)
+	if err != nil {
+		releaseRefresh()
+		t.Fatal(err)
+	}
+	// Freeze the actual B Engine process while R is still blocked in its A-side
+	// refresh. The Host has already requested a source drain based on the typed
+	// preflight result; after A drains, its target request must fail without an
+	// owner transfer, then the source resumes and remains the only writer.
+	if err := syscall.Kill(engineBPID, syscall.SIGSTOP); err != nil {
+		releaseRefresh()
+		t.Fatalf("could not suspend target Engine B for handover failure injection: %v", err)
+	}
+	resumeTargetEngine := func() { _ = syscall.Kill(engineBPID, syscall.SIGCONT) }
+	t.Cleanup(resumeTargetEngine)
+	if refreshes := fixture.refreshesFor(streamR); len(refreshes) != 1 {
+		releaseRefresh()
+		t.Fatalf("target preflight issued a concurrent adapter refresh while Engine A was refreshing: %+v", refreshes)
+	}
 	releaseRefresh()
-	if err := waitRuntimeRecordingSequenceCount(client, baseURL, recordingR.ID, 30, 20*time.Second); err != nil {
-		t.Fatalf("R did not resume capture after adapter refresh: %v; fixture=%s; host=%s", err, fixture.describe(streamR), process.output.String())
+	if err := waitHostHandoverLogEvent(process, "recording handover_source_drained", recordingR.ID, 1, 30*time.Second); err != nil {
+		t.Fatalf("%v; host output=%s", err, process.output.String())
+	}
+	// Publish the exact next object after A has reached the durable drained
+	// boundary. The stopped target forces one pre-CAS failure; the source must
+	// resume and capture this object before a later target retry.
+	fixture.advance(streamR, 1)
+	recordingDuringTargetFailure := waitCanonicalSegmentCount(t, dataDir, recordingR.ID, 31, 30*time.Second)
+	if recordingDuringTargetFailure.State != domain.StateRecording || len(recordingDuringTargetFailure.Gaps) != 0 {
+		t.Fatalf("R did not continue on source Engine A while target Engine B was unavailable: state=%s gaps=%+v; fixture=%s", recordingDuringTargetFailure.State, recordingDuringTargetFailure.Gaps, fixture.describe(streamR))
+	}
+	ownerAfterTargetFailure, err := recordingowner.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableOwnerAfterTargetFailure, err := ownerAfterTargetFailure.Current(recordingR.ID)
+	if err != nil || durableOwnerAfterTargetFailure != ownerBeforeTargetFailure || durableOwnerAfterTargetFailure.EngineGeneration != leaseA.EngineGeneration {
+		t.Fatalf("unavailable target changed durable R ownership: before=%+v after=%+v err=%v; host=%s", ownerBeforeTargetFailure, durableOwnerAfterTargetFailure, err, process.output.String())
+	}
+	resumeTargetEngine()
+	if err := waitHostHandoverLogEvent(process, "recording handover_source_drain_started", recordingR.ID, 2, 30*time.Second); err != nil {
+		t.Fatalf("%v; host output=%s", err, process.output.String())
+	}
+	if err := waitHostHandoverLogEvent(process, "recording handover_source_drained", recordingR.ID, 2, 30*time.Second); err != nil {
+		t.Fatalf("%v; host output=%s", err, process.output.String())
+	}
+	// The latest source object is now the committed tail. Publish the next one
+	// while A is paused so drained target preflight can poll a fresh manifest
+	// and stage it before the Host's durable owner CAS.
+	fixture.advance(streamR, 1)
+	leaseAfterHandover := waitRecordingLeaseGeneration(t, dataDir, recordingR.ID, activateStatus.DefaultEngine.ID, 40*time.Second, process.output.String, func() string { return fixture.describe(streamR) })
+	if leaseAfterHandover.EngineGeneration == leaseA.EngineGeneration {
+		t.Fatalf("eligible R was not handed from Engine A to active Engine B: lease=%+v", leaseAfterHandover)
+	}
+	if err := waitProcessAbsent(t, engineABinary, 30*time.Second); err != nil {
+		t.Fatalf("old Engine A did not retire after R ownership moved to B: %v", err)
 	}
 	refreshes := fixture.refreshesFor(streamR)
 	if len(refreshes) != 1 || refreshes[0].Token != "token-0" || !refreshes[0].At.Before(activateFinished) {
@@ -772,7 +1876,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	fixture.advance(streamS, 2)
 	waitRecordingSequenceCount(t, client, baseURL, recordingS.ID, 2, 15*time.Second)
 
-	fixture.advance(streamR, 30)
+	fixture.advance(streamR, 28)
 	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 60, 20*time.Second)
 	finalR := getRecording(t, client, baseURL, recordingR.ID)
 	if finalR.ID != recordingR.ID || finalR.Title != "Recording R" || finalR.State != domain.StateRecording || len(finalR.Gaps) != 0 {
@@ -814,13 +1918,13 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	}
 
 	status = waitRuntimeStatus(t, ctx, client, baseURL, func(s httpapi.Status) bool {
-		return hasGeneration(s.DrainingGenerations, e2eVersionA, 1)
+		return s.ActiveControl != nil && s.ActiveControl.Version == e2eVersionB
 	})
-	if processForBinary(engineABinary) == 0 {
-		t.Fatal("old Engine A did not remain alive while R still held its lease")
+	if processForBinary(engineABinary) != 0 {
+		t.Fatal("old Engine A remained alive after its final Recording handover lease was released")
 	}
 	currentLeases := readRuntimeLeases(t, dataDir)
-	if currentLeases[recordingR.ID].EngineGeneration != leaseA.EngineGeneration || currentLeases[recordingS.ID].EngineGeneration != leaseS.EngineGeneration || currentLeases[watchRecordingID].EngineGeneration != watchLease.EngineGeneration {
+	if currentLeases[recordingR.ID].EngineGeneration != leaseAfterHandover.EngineGeneration || currentLeases[recordingS.ID].EngineGeneration != leaseS.EngineGeneration || currentLeases[watchRecordingID].EngineGeneration != watchLease.EngineGeneration {
 		t.Fatalf("recording generation pins are inconsistent during overlap: leases=%+v", currentLeases)
 	}
 	if got := len(waitWatchRelationCount(t, client, baseURL, watchID, 1, 5*time.Second)); got != 1 {
@@ -835,7 +1939,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	waitRuntimeRecordingState(t, client, baseURL, recordingR.ID, domain.StateStopped, 20*time.Second)
 	waitLeaseAbsent(t, dataDir, recordingR.ID, 20*time.Second)
 	if err := waitProcessAbsent(t, engineABinary, 30*time.Second); err != nil {
-		t.Fatalf("A Engine was not retired after R's final generation lease reached zero: %v", err)
+		t.Fatalf("A Engine was not already retired after R handover and final lease drain: %v", err)
 	}
 	state := readRuntimeGenerationSnapshot(t, dataDir)
 	if lease, exists := state.Leases[recordingR.ID]; exists {
@@ -876,7 +1980,7 @@ func runProductionUpdateScenario(t *testing.T, artifacts runtimeUpdateArtifacts,
 	if recordingS.State == domain.StateInterrupted || recordingS.ID == recordingR.ID {
 		t.Fatalf("post-update Recording S identity/state is invalid: %+v", recordingS)
 	}
-	t.Logf("production process E2E iteration %d: host pid=%d; Control A pid=%d exited; Engine A pid=%d drained after R; Control B pid=%d; Engine B pid=%d; R %s sequence=1..60 on A; S %s on B; Watch session %s produced %s", iteration, command.Process.Pid, controlAPID, engineAPID, controlBPID, engineBPID, recordingR.ID, recordingS.ID, fmt.Sprintf("session-w-%d", iteration), watchRecordingID)
+	t.Logf("production process E2E iteration %d: host pid=%d; Control A pid=%d exited; Engine A pid=%d handed R to Engine B and retired; Control B pid=%d; Engine B pid=%d; R %s sequence=1..60 on A→B with metadata/refresh continuity; S %s on B; Watch session %s produced %s", iteration, command.Process.Pid, controlAPID, engineAPID, controlBPID, engineBPID, recordingR.ID, recordingS.ID, fmt.Sprintf("session-w-%d", iteration), watchRecordingID)
 }
 
 func verifyInstalledRuntimeRelease(directory string, manifest release.Manifest) error {
@@ -943,7 +2047,8 @@ func waitRuntimeStatus(t *testing.T, ctx context.Context, client *http.Client, b
 		for _, item := range process {
 			select {
 			case <-item.done:
-				t.Fatalf("production Runtime Host exited before update API readiness (err=%v): %s", item.err, item.output.String())
+				diagnostics := readRuntimeE2EChildDiagnostics(item.diagnosticDir)
+				t.Fatalf("production Runtime Host exited before update API readiness (err=%v): %s%s", item.err, item.output.String(), diagnostics)
 			default:
 			}
 		}
@@ -1261,6 +2366,51 @@ func waitRecordingLease(t *testing.T, dataDir, recordingID string, timeout time.
 	return generation.Lease{}
 }
 
+func waitRecordingLeaseGeneration(t *testing.T, dataDir, recordingID, generationID string, timeout time.Duration, hostOutput func() string, fixtureState ...func() string) generation.Lease {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if lease, ok := readRuntimeGenerationSnapshot(t, dataDir).Leases[recordingID]; ok && lease.EngineGeneration == generationID {
+			return lease
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	ownerStore, ownerErr := recordingowner.Open(dataDir)
+	owner, ownerReadErr := ownerStore.Current(recordingID)
+	registry := readRuntimeGenerationSnapshot(t, dataDir)
+	sourceGeneration := registry.Generations[owner.EngineGeneration]
+	targetGeneration := registry.Generations[generationID]
+	lease := registry.Leases[recordingID]
+	diagnostic := "unavailable"
+	if len(fixtureState) > 0 && fixtureState[0] != nil {
+		diagnostic = fixtureState[0]()
+	}
+	t.Fatalf("recording %s did not hand over to generation %s; active=%s staged=%s source=%+v target=%+v lease=%+v durable_owner=%+v owner_errors=%v/%v; fixture=%s; host output=%s", recordingID, generationID, registry.ActiveGenerationID, registry.StagedGenerationID, sourceGeneration, targetGeneration, lease, owner, ownerErr, ownerReadErr, diagnostic, hostOutput())
+	return generation.Lease{}
+}
+
+func waitCanonicalSegmentCount(t *testing.T, dataDir, recordingID string, minimum int, timeout time.Duration) *domain.Recording {
+	t.Helper()
+	store, err := storage.New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		recording, loadErr := store.LoadRecordingReadOnly(recordingID)
+		if loadErr == nil && recording.SegmentCount() >= minimum {
+			return recording
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	recording, err := store.LoadRecordingReadOnly(recordingID)
+	if err != nil {
+		t.Fatalf("read canonical Recording after waiting for %d segments: %v", minimum, err)
+	}
+	t.Fatalf("canonical Recording %s stopped at %d segments, want at least %d", recordingID, recording.SegmentCount(), minimum)
+	return nil
+}
+
 func waitLeaseAbsent(t *testing.T, dataDir, recordingID string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -1363,6 +2513,32 @@ func waitRuntimeConditionError(timeout time.Duration, condition func() bool, wha
 	return fmt.Errorf("timed out waiting for %s", what)
 }
 
+func waitHostHandoverLogEvent(process *runtimeHostProcess, event, recordingID string, occurrence int, timeout time.Duration) error {
+	if err := waitRuntimeConditionError(timeout, func() bool {
+		count := 0
+		for _, line := range strings.Split(process.output.String(), "\n") {
+			if strings.Contains(line, event) && strings.Contains(line, recordingID) {
+				count++
+			}
+		}
+		return count >= occurrence
+	}, fmt.Sprintf("Host event %s for Recording %s occurrence %d", event, recordingID, occurrence)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func waitActivationOutcome(t *testing.T, result <-chan productionActivationOutcome, timeout time.Duration) productionActivationOutcome {
+	t.Helper()
+	select {
+	case outcome := <-result:
+		return outcome
+	case <-time.After(timeout):
+		t.Fatalf("Runtime Host activation API did not return within %s", timeout)
+		return productionActivationOutcome{}
+	}
+}
+
 func reserveRuntimeAddress(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -1411,7 +2587,7 @@ func processForBinary(path string) int {
 	}
 	clean := filepath.Clean(path)
 	for _, process := range processes {
-		if strings.Contains(process.Command, clean) {
+		if commandRunsBinary(process.Command, clean) {
 			return process.PID
 		}
 	}

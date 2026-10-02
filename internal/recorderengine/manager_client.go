@@ -8,6 +8,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
@@ -20,6 +21,14 @@ type ManagerClient struct {
 }
 
 var ErrEngineDraining = errors.New("recorder engine is draining")
+
+var (
+	ErrHandoverIdentity               = errors.New("recorder engine handover identity is invalid")
+	ErrHandoverStaleOwner             = errors.New("recording ownership changed")
+	ErrHandoverOperation              = errors.New("recorder engine handover operation failed")
+	ErrHandoverSourceRefreshRequired  = acquire.ErrHandoverSourceRefreshRequired
+	ErrHandoverSourceBoundaryRequired = acquire.ErrHandoverSourceBoundaryRequired
+)
 
 func NewManagerClient(client *runtimeipc.Client) (*ManagerClient, error) {
 	if client == nil {
@@ -77,6 +86,163 @@ func (m *ManagerClient) ActiveRecordings(ctx context.Context, generationID strin
 	return result.Count, nil
 }
 
+// HandoverSnapshot reads the exact source Engine continuation snapshot. It is
+// an internal Runtime Host primitive; callers must keep the returned media
+// context private and must not log or expose it through public APIs.
+func (m *ManagerClient) HandoverSnapshot(ctx context.Context, recordingID string, expectedOwner recordingowner.Owner) (acquire.HandoverSnapshot, error) {
+	if !validClientOwner(recordingID, expectedOwner) {
+		return acquire.HandoverSnapshot{}, ErrHandoverIdentity
+	}
+	var result HandoverSnapshotResult
+	if err := m.client.Call(ctx, OperationHandoverSnapshot, HandoverOwnerRequest{RecordingID: recordingID, Owner: expectedOwner}, &result); err != nil {
+		return acquire.HandoverSnapshot{}, normalizeHandoverError(err)
+	}
+	if !validHandoverResultIdentity(result.RecordingID, result.GenerationID, result.InstanceID, recordingID, expectedOwner.EngineGeneration, expectedOwner.WorkerInstance) || !validHandoverSnapshot(result.Snapshot, expectedOwner) {
+		return acquire.HandoverSnapshot{}, ErrHandoverIdentity
+	}
+	return result.Snapshot, nil
+}
+
+// PauseForHandover asks the source Engine to reach a safe, drained commit
+// boundary while leaving its Recording and worker recoverable for resume.
+func (m *ManagerClient) PauseForHandover(ctx context.Context, recordingID string, expectedOwner recordingowner.Owner) (acquire.HandoverSnapshot, error) {
+	if !validClientOwner(recordingID, expectedOwner) {
+		return acquire.HandoverSnapshot{}, ErrHandoverIdentity
+	}
+	var result HandoverSnapshotResult
+	if err := m.client.Call(ctx, OperationHandoverPause, HandoverOwnerRequest{RecordingID: recordingID, Owner: expectedOwner}, &result); err != nil {
+		return acquire.HandoverSnapshot{}, normalizeHandoverError(err)
+	}
+	if !validHandoverResultIdentity(result.RecordingID, result.GenerationID, result.InstanceID, recordingID, expectedOwner.EngineGeneration, expectedOwner.WorkerInstance) || !validHandoverSnapshot(result.Snapshot, expectedOwner) {
+		return acquire.HandoverSnapshot{}, ErrHandoverIdentity
+	}
+	return result.Snapshot, nil
+}
+
+// ResumeHandover re-enables the source worker with the Host-issued current
+// owner tuple (which can be newer after an aborted reverse transfer).
+func (m *ManagerClient) ResumeHandover(ctx context.Context, recordingID string, newOwner recordingowner.Owner, snapshot acquire.HandoverSnapshot) error {
+	if !validClientOwner(recordingID, newOwner) || !validHandoverSnapshot(snapshot, snapshot.Owner) || snapshot.RecordingID != recordingID || newOwner.EngineGeneration != snapshot.Owner.EngineGeneration || newOwner.WorkerInstance != snapshot.Owner.WorkerInstance || newOwner.Epoch < snapshot.Owner.Epoch {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	request := HandoverResumeRequest{RecordingID: recordingID, Owner: newOwner, Snapshot: snapshot}
+	if err := m.client.Call(ctx, OperationHandoverResume, request, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	return validateHandoverAck(result, recordingID, newOwner, true)
+}
+
+// CompleteHandover retires a paused source worker only after the Host has
+// activated the target owner. It does not release or transfer Host ownership.
+func (m *ManagerClient) CompleteHandover(ctx context.Context, recordingID string, expectedOldOwner recordingowner.Owner) error {
+	if !validClientOwner(recordingID, expectedOldOwner) {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	if err := m.client.Call(ctx, OperationHandoverComplete, HandoverOwnerRequest{RecordingID: recordingID, Owner: expectedOldOwner}, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	return validateHandoverAck(result, recordingID, expectedOldOwner, true)
+}
+
+// PrepareHandoverTarget asks this exact target Engine to reconstruct a
+// continuation read-only. It receives no canonical write token at this stage.
+func (m *ManagerClient) PrepareHandoverTarget(ctx context.Context, snapshot acquire.HandoverSnapshot, target acquire.HandoverTargetIdentity) error {
+	return m.prepareHandoverTarget(ctx, snapshot, target, false)
+}
+
+// PrepareHandoverTargetAfterSourceDrain is only used by the Runtime Host once
+// the source Engine has stopped admission and drained its accepted writes.
+func (m *ManagerClient) PrepareHandoverTargetAfterSourceDrain(ctx context.Context, snapshot acquire.HandoverSnapshot, target acquire.HandoverTargetIdentity) error {
+	return m.prepareHandoverTarget(ctx, snapshot, target, true)
+}
+
+func (m *ManagerClient) prepareHandoverTarget(ctx context.Context, snapshot acquire.HandoverSnapshot, target acquire.HandoverTargetIdentity, sourceDrained bool) error {
+	if !validHandoverSnapshot(snapshot, snapshot.Owner) || target.EngineGeneration == "" || target.WorkerInstance == "" || snapshot.Owner.EngineGeneration == target.EngineGeneration && snapshot.Owner.WorkerInstance == target.WorkerInstance {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	if err := m.client.Call(ctx, OperationHandoverPrepareTarget, HandoverTargetRequest{Snapshot: snapshot, Target: target, SourceDrained: sourceDrained}, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	if !validHandoverResultIdentity(result.RecordingID, result.GenerationID, result.InstanceID, snapshot.RecordingID, target.EngineGeneration, target.WorkerInstance) || !result.Accepted || result.Owner == nil || *result.Owner != snapshot.Owner {
+		return ErrHandoverIdentity
+	}
+	return nil
+}
+
+// ActivatePreparedHandover passes the exact Host-issued post-transfer token
+// into the Manager. The Manager's canonical fence independently verifies it
+// before starting any writer.
+func (m *ManagerClient) ActivatePreparedHandover(ctx context.Context, owner recordingowner.Owner, target acquire.HandoverTargetIdentity) error {
+	if !validClientOwner(owner.RecordingID, owner) || target.EngineGeneration != owner.EngineGeneration || target.WorkerInstance != owner.WorkerInstance {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	request := HandoverTargetOwnerRequest{RecordingID: owner.RecordingID, Owner: owner, Target: target}
+	if err := m.client.Call(ctx, OperationHandoverActivateTarget, request, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	return validateHandoverAck(result, owner.RecordingID, owner, true)
+}
+
+// DiscardPreparedHandover removes only target-side read-only preparation.
+func (m *ManagerClient) DiscardPreparedHandover(ctx context.Context, recordingID string, target acquire.HandoverTargetIdentity) error {
+	if recordingID == "" || target.EngineGeneration == "" || target.WorkerInstance == "" {
+		return ErrHandoverIdentity
+	}
+	var result HandoverResult
+	request := HandoverTargetDiscardRequest{RecordingID: recordingID, Target: target}
+	if err := m.client.Call(ctx, OperationHandoverDiscardTarget, request, &result); err != nil {
+		return normalizeHandoverError(err)
+	}
+	if !validHandoverResultIdentity(result.RecordingID, result.GenerationID, result.InstanceID, recordingID, target.EngineGeneration, target.WorkerInstance) || !result.Accepted || result.Owner != nil {
+		return ErrHandoverIdentity
+	}
+	return nil
+}
+
+func validClientOwner(recordingID string, owner recordingowner.Owner) bool {
+	return validOwnerIdentity(recordingID, owner)
+}
+
+func validHandoverResultIdentity(gotID, gotGeneration, gotInstance, wantID, wantGeneration, wantInstance string) bool {
+	return gotID == wantID && gotGeneration == wantGeneration && gotInstance == wantInstance
+}
+
+func validateHandoverAck(result HandoverResult, recordingID string, owner recordingowner.Owner, requireOwner bool) error {
+	if !validHandoverResultIdentity(result.RecordingID, result.GenerationID, result.InstanceID, recordingID, owner.EngineGeneration, owner.WorkerInstance) || !result.Accepted {
+		return ErrHandoverIdentity
+	}
+	if requireOwner && (result.Owner == nil || *result.Owner != owner) {
+		return ErrHandoverIdentity
+	}
+	return nil
+}
+
+func normalizeHandoverError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var remote *runtimeipc.RemoteError
+	if !errors.As(err, &remote) {
+		return ErrHandoverOperation
+	}
+	switch remote.Code {
+	case "stale_owner":
+		return ErrHandoverStaleOwner
+	case "source_refresh_required":
+		return ErrHandoverSourceRefreshRequired
+	case "source_boundary_required":
+		return ErrHandoverSourceBoundaryRequired
+	case "invalid_request", "generation_mismatch", "handover_rejected":
+		return ErrHandoverIdentity
+	default:
+		return ErrHandoverOperation
+	}
+}
+
 func (m *ManagerClient) Get(id string) (*domain.Recording, error) {
 	return m.GetContext(context.Background(), id)
 }
@@ -103,6 +269,12 @@ func (m *ManagerClient) Inventory(ctx context.Context) (InventoryResult, error) 
 	for _, item := range inventory.Active {
 		if item.RecordingID == "" || item.State != domain.StateRecording {
 			return InventoryResult{}, errors.New("recorder engine inventory entry is invalid")
+		}
+		if item.Owner != nil && !validOwnerIdentity(item.RecordingID, *item.Owner) {
+			return InventoryResult{}, ErrHandoverIdentity
+		}
+		if item.Owner != nil && (item.Owner.EngineGeneration != inventory.GenerationID || item.Owner.WorkerInstance != inventory.InstanceID) {
+			return InventoryResult{}, ErrHandoverIdentity
 		}
 	}
 	return inventory, nil

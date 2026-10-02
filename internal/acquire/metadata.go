@@ -160,39 +160,51 @@ func (m *Manager) commitMetadataObservation(e *entry, generation uint64, observe
 		}
 		description = cloneMetadataString(result.Metadata.Description)
 	}
-	if changed && !next.MetadataTimelineTruncated {
-		revision := domain.MetadataRevision{
-			ObservedAt: observedAt.UTC(), Title: title, Description: description,
-			SourceUpdatedAt: cloneMetadataTime(result.SourceUpdatedAt),
-		}
-		candidate := append(append([]domain.MetadataRevision(nil), next.MetadataTimeline...), revision)
-		encoded, marshalErr := json.Marshal(candidate)
-		if marshalErr != nil || len(candidate) > streammeta.MaxTimelineRevisions || len(encoded) > streammeta.MaxTimelineBytes {
-			next.MetadataTimelineTruncated = true
-			truncated = true
-		} else {
-			next.MetadataTimeline = candidate
-		}
-		if err := domain.ValidateMetadataTimeline(next.MetadataTimeline); err != nil {
-			return false, false, errors.New("recording metadata timeline is invalid")
-		}
-		if err := m.store.SaveRecording(next); err != nil {
-			return false, false, errors.New("recording metadata persistence failed")
-		}
-		e.mu.Lock()
-		if e.deleted || e.mediaGeneration != generation || e.recording.State != domain.StateRecording {
+	active = true
+	var adapterStateCommitFailed bool
+	if err := m.withCanonicalCommit(e, func() error {
+		if changed && !next.MetadataTimelineTruncated {
+			revision := domain.MetadataRevision{
+				ObservedAt: observedAt.UTC(), Title: title, Description: description,
+				SourceUpdatedAt: cloneMetadataTime(result.SourceUpdatedAt),
+			}
+			candidate := append(append([]domain.MetadataRevision(nil), next.MetadataTimeline...), revision)
+			encoded, marshalErr := json.Marshal(candidate)
+			if marshalErr != nil || len(candidate) > streammeta.MaxTimelineRevisions || len(encoded) > streammeta.MaxTimelineBytes {
+				next.MetadataTimelineTruncated = true
+				truncated = true
+			} else {
+				next.MetadataTimeline = candidate
+			}
+			if err := domain.ValidateMetadataTimeline(next.MetadataTimeline); err != nil {
+				return errors.New("recording metadata timeline is invalid")
+			}
+			if err := m.store.SaveRecording(next); err != nil {
+				return errors.New("recording metadata persistence failed")
+			}
+			e.mu.Lock()
+			if e.deleted || e.mediaGeneration != generation || e.recording.State != domain.StateRecording {
+				e.mu.Unlock()
+				active = false
+				return nil
+			}
+			e.recording = next
 			e.mu.Unlock()
-			return false, false, nil
 		}
-		e.recording = next
-		e.mu.Unlock()
-	}
-	if commit != nil {
-		if err := commit(); err != nil {
-			return true, truncated, errors.New("adapter metadata state could not be saved")
+		if commit != nil {
+			if err := commit(); err != nil {
+				adapterStateCommitFailed = true
+				return errors.New("adapter metadata state could not be saved")
+			}
 		}
+		return nil
+	}); err != nil {
+		if adapterStateCommitFailed {
+			return true, truncated, err
+		}
+		return false, false, err
 	}
-	return true, truncated, nil
+	return active, truncated, nil
 }
 
 func cloneMetadataString(value *string) *string {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 )
 
@@ -102,7 +103,7 @@ func buildRuntimeAdapterLifecycleArtifacts(t *testing.T, fixtureURL string) runt
 		}
 	})
 	copyRuntimeArtifact(t, owncast, filepath.Join(adapterDir, "integrated-recorder-adapter-owncast"), 0555)
-	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "", ldflags+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
+	hostA := build(filepath.Join(bin, "runtime-host-a"), "./cmd/runtime-host", "runtime_e2e", ldflags+" -X github.com/dltkddnr04/integrated-recorder/internal/runtimehost/bootstrap.defaultBundleDir="+bundleA)
 	return runtimeAdapterLifecycleArtifacts{
 		root: root, fixtureURL: fixtureURL, bundleA: bundleA, hostA: hostA, adapterDir: adapterDir,
 	}
@@ -135,8 +136,11 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	atomicInstallAdapter(t, artifacts.adapterDir, "integrated-recorder-adapter-"+runtimeE2EAdapterID, originalAdapter)
 	dataRoot := newRuntimeE2ETempDir(t)
 	dataDir := filepath.Join(dataRoot, "data")
-	if err := os.Mkdir(dataDir, 0700); err != nil {
-		t.Fatal(err)
+	markerDir := filepath.Join(dataRoot, "failpoints")
+	for _, directory := range []string{dataDir, markerDir} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() { makeRuntimeE2ETreeWritable(dataDir) })
 	streamR := fmt.Sprintf("hot-r-%d", iteration)
@@ -153,6 +157,8 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 		"ADDR=" + listenAddr,
 		"AUTH_DISABLED=1",
 		"ADAPTER_DIR=" + artifacts.adapterDir,
+		"IR_RUNTIME_E2E_FAILPOINT=" + string(runtimehook.AfterSourceDrain),
+		"IR_RUNTIME_E2E_MARKER_DIR=" + markerDir,
 	})
 	process := &runtimeHostProcess{command: command, done: make(chan struct{})}
 	command.Stdout, command.Stderr = &process.output, &process.output
@@ -266,6 +272,13 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 
 	// Removal drops the adapter from new work while S remains attached to the
 	// old Engine/set which admitted it.
+	// The removal set is exactly R's original adapter set and is therefore a
+	// valid handover target. Advance one new source object only after the
+	// deterministic drained boundary, so the source cannot race ahead and
+	// consume the continuation payload before the target stages it.
+	if err := writeRuntimeHookArm(markerDir, runtimehook.Arm{Point: runtimehook.AfterSourceDrain, RecordingID: recordingR.ID}); err != nil {
+		t.Fatalf("arm source-drained boundary for R: %v", err)
+	}
 	if err := os.Remove(addedPath); err != nil {
 		t.Fatal(err)
 	}
@@ -279,19 +292,52 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	}
 	fixture.advance(streamS, 4)
 	waitRecordingSequenceCount(t, client, baseURL, recordingS.ID, 8, 20*time.Second)
+	readyPath := runtimehook.ReadyMarkerPath(markerDir, runtimehook.AfterSourceDrain, recordingR.ID)
+	if err := waitRuntimeConditionError(30*time.Second, func() bool {
+		info, statErr := os.Lstat(readyPath)
+		return statErr == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0600
+	}, "source-drained handover boundary for adapter removal"); err != nil {
+		t.Fatalf("R did not reach a drained handover boundary before continuation publication: %v; host=%s", err, process.output.String())
+	}
+	fixture.advance(streamR, 1)
+	if err := writeRuntimeHookRelease(markerDir, runtimehook.AfterSourceDrain, recordingR.ID); err != nil {
+		t.Fatalf("release drained source after publishing its next segment: %v", err)
+	}
+	if err := os.Remove(runtimehook.ArmPath(markerDir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disarm source-drained boundary: %v", err)
+	}
+	leaseR = waitRecordingLeaseGeneration(t, dataDir, recordingR.ID, removedGeneration, updateOperationTimeout+10*time.Second, process.output.String)
 
 	// Replace the original adapter identity with a new implementation. The new
 	// default sees v2, while R's Engine retains its v1 artifact and set.
 	atomicInstallAdapter(t, artifacts.adapterDir, filepath.Base(fixtureV1Path), upgradedAdapter)
 	status = waitForAdapterGeneration(t, ctx, client, baseURL, removedGeneration, runtimeE2EAdapterID, "0.2.0", true)
 	upgradedGeneration := status.DefaultEngine.ID
+	removedRegistry := readRuntimeGenerationSnapshot(t, dataDir)
+	if removedRegistry.Generations[removedGeneration].AdapterSetID != initialSetID {
+		t.Fatalf("removal generation did not restore R's original immutable adapter set: initial=%s removed=%+v", initialSetID, removedRegistry.Generations[removedGeneration])
+	}
+	// R has already moved to the same-set removal generation before v2 became
+	// active; adding or upgrading a different set remains ineligible under this
+	// conservative policy.
+	if err := waitRuntimeConditionError(20*time.Second, func() bool {
+		state := readRuntimeGenerationSnapshot(t, dataDir)
+		_, retained := state.Generations[initialGeneration]
+		return !retained && !runtimePIDExists(engineAPID)
+	}, "initial Engine retirement after exact-same-set handover"); err != nil {
+		t.Fatalf("original generation stayed alive after R moved to the same adapter set: %v", err)
+	}
+	recordingREnginePID := waitEngineOwningAdapter(t, hostPID, engineABinary, immutableV1, 15*time.Second)
+	if recordingREnginePID == engineAPID {
+		t.Fatalf("R still uses the original Engine after same-set handover: initial=%d current=%d", engineAPID, recordingREnginePID)
+	}
 	currentR := getRecording(t, client, baseURL, recordingR.ID)
 	if currentR.State != domain.StateRecording || currentR.ID != recordingR.ID || len(currentR.Gaps) != 0 {
 		t.Fatalf("adapter update interrupted R or created a gap: %+v", currentR)
 	}
 	leaseR = readRuntimeLeases(t, dataDir)[recordingR.ID]
-	if leaseR.EngineGeneration != initialGeneration {
-		t.Fatalf("adapter update migrated R from v1 generation: %+v", leaseR)
+	if leaseR.EngineGeneration != removedGeneration {
+		t.Fatalf("adapter update moved R away from its v1 adapter-set generation: %+v", leaseR)
 	}
 	inputT := map[string]string{"source_url": artifacts.fixtureURL + "/source/" + streamT}
 	recordingT := createRuntimeRecording(t, client, baseURL, "Pinned to upgraded adapter", inputT)
@@ -305,7 +351,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	// Kill the v1 adapter process under the old Engine. R's next refresh must
 	// lazily start the binary from the old immutable set, not the mutable source
 	// now containing v2.
-	v1AdapterPID := waitDirectChildForBinary(t, engineAPID, immutableV1, 10*time.Second)
+	v1AdapterPID := waitDirectChildForBinary(t, recordingREnginePID, immutableV1, 10*time.Second)
 	adapterProcess, err := os.FindProcess(v1AdapterPID)
 	if err != nil {
 		t.Fatalf("find v1 adapter child process: %v", err)
@@ -318,7 +364,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	}
 	refreshStarted, releaseRefresh := fixture.expireAndBlockRefresh(streamR)
 	t.Cleanup(releaseRefresh)
-	fixture.advance(streamR, 5)
+	fixture.advance(streamR, 4)
 	select {
 	case <-refreshStarted:
 	case <-ctx.Done():
@@ -328,7 +374,7 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	}
 	releaseRefresh()
 	waitRecordingSequenceCount(t, client, baseURL, recordingR.ID, 15, 20*time.Second)
-	waitDirectChildForBinary(t, engineAPID, immutableV1, 10*time.Second)
+	waitDirectChildForBinary(t, recordingREnginePID, immutableV1, 10*time.Second)
 	fixture.setMetadata(streamR, "After adapter update", "Still on v1 adapter")
 	metadataAfter := waitMetadataTimeline(t, ctx, client, baseURL, recordingR.ID, 2, 45*time.Second)
 	if len(metadataAfter.Items) != 2 || stringValue(metadataAfter.Items[1].Title) != "After adapter update" {
@@ -358,16 +404,16 @@ func runProductionAdapterLifecycleScenario(t *testing.T, artifacts runtimeAdapte
 	// brief interval after the last lease is removed but before retirement runs.
 	err = waitRuntimeConditionError(20*time.Second, func() bool {
 		state := readRuntimeGenerationSnapshot(t, dataDir)
-		_, retained := state.Generations[initialGeneration]
-		return !retained && !runtimePIDExists(engineAPID)
-	}, "original Engine retirement after its final Recording lease drained")
+		retired, retained := state.Generations[removedGeneration]
+		return retained && retired.EngineDormant && !runtimePIDExists(recordingREnginePID)
+	}, "v1-set Engine process retirement after its final Recording lease drained")
 	if err != nil {
 		state := readRuntimeGenerationSnapshot(t, dataDir)
-		t.Fatalf("original Engine did not retire after its last lease drained: %v; generation=%+v", err, state.Generations[initialGeneration])
+		t.Fatalf("v1-set Engine process did not retire after its last lease drained: %v; generation=%+v", err, state.Generations[removedGeneration])
 	}
 	state := readRuntimeGenerationSnapshot(t, dataDir)
-	if _, exists := state.Generations[initialGeneration]; exists {
-		t.Fatalf("original generation was not retired after its last lease drained: %+v", state.Generations[initialGeneration])
+	if generationState, exists := state.Generations[removedGeneration]; !exists || !generationState.EngineDormant {
+		t.Fatalf("rollback-referenced v1-set generation was not retained with its Engine dormant: %+v", generationState)
 	}
 	if state.PreviousGenerationID != removedGeneration {
 		t.Fatalf("expected removal generation to remain the rollback target, got previous=%s want=%s", state.PreviousGenerationID, removedGeneration)
@@ -529,6 +575,31 @@ func waitDirectChildForBinary(t *testing.T, parentPID int, binary string, timeou
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("no child process for %s under PID %d", filepath.Base(binary), parentPID)
+	return 0
+}
+
+func waitEngineOwningAdapter(t *testing.T, hostPID int, engineBinary, adapterBinary string, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	enginePath := filepath.Clean(engineBinary)
+	adapterPath := filepath.Clean(adapterBinary)
+	for time.Now().Before(deadline) {
+		processes, err := runtimeProcessTable()
+		if err == nil {
+			for _, engine := range processes {
+				if engine.Parent != hostPID || !strings.Contains(engine.Command, enginePath) {
+					continue
+				}
+				for _, child := range processes {
+					if child.Parent == engine.PID && strings.Contains(child.Command, adapterPath) {
+						return engine.PID
+					}
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("no Runtime Host Engine process owns adapter process %s", filepath.Base(adapterBinary))
 	return 0
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
 	"github.com/dltkddnr04/integrated-recorder/internal/hls"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
@@ -55,6 +56,9 @@ type segmentTask struct {
 	state              segmentTaskState
 	timerToken         uint64
 	retryCancel        context.CancelFunc
+	preloaded          bool
+	stagedInitPayload  *storage.IngestPayload
+	stagedMediaPayload *storage.IngestPayload
 }
 
 type initFlight struct {
@@ -117,6 +121,40 @@ func newSegmentScheduler(parent context.Context, manager *Manager, e *entry) (*s
 		changed: make(chan struct{}), tasks: make(map[segmentTaskKey]*segmentTask),
 		init: make(map[string]*initFlight), next: next, epochMarkers: make(map[uint64]epochMarker), manifestWake: make(chan struct{}, 1),
 	}
+	// A prepared handover candidate is admitted before scheduler workers start,
+	// so normal discovery observes one existing task instead of allocating a
+	// second ordinal or fetching the same source object again.
+	e.mu.Lock()
+	if candidate := e.handoverCandidate; candidate != nil {
+		fingerprint, fingerprintErr := handoverRootFingerprint(e.recording)
+		if fingerprintErr != nil || fingerprint != candidate.rootFingerprint || candidate.ordinal != s.next || candidate.mediaPayload == nil {
+			e.mu.Unlock()
+			cancel()
+			return nil, ErrHandoverUnavailable
+		}
+		track := e.recording.Tracks["main"]
+		if track == nil || candidate.epoch < track.SourceEpoch || candidate.epoch-track.SourceEpoch > 1 || candidate.ordinal == 0 || candidate.ordinal == ^uint64(0) {
+			e.mu.Unlock()
+			cancel()
+			return nil, ErrHandoverUnavailable
+		}
+		key := segmentTaskKey{epoch: candidate.epoch, sequence: candidate.source.Sequence}
+		if _, exists := s.tasks[key]; exists {
+			e.mu.Unlock()
+			cancel()
+			return nil, ErrHandoverConflict
+		}
+		task := &segmentTask{
+			key: key, source: cloneHandoverMediaSegment(candidate.source), ordinal: candidate.ordinal,
+			available: true, observed: true, observedGeneration: 0, state: segmentTaskQueued,
+			preloaded: true, stagedInitPayload: candidate.initPayload, stagedMediaPayload: candidate.mediaPayload,
+		}
+		s.tasks[key] = task
+		s.ready = append(s.ready, task)
+		s.next++
+		e.handoverCandidate = nil
+	}
+	e.mu.Unlock()
 	s.mu.Lock()
 	for worker := 0; worker < minSegmentWorkers; worker++ {
 		s.spawnLocked(false)
@@ -178,7 +216,9 @@ func (s *segmentScheduler) discoverAtGeneration(ctx context.Context, epoch uint6
 					s.mu.Unlock()
 					break
 				}
-				existing.source = source // preserve latest signed fetch URI for a later retry
+				if !existing.preloaded || existing.stagedMediaPayload == nil {
+					existing.source = source // preserve latest signed fetch URI for a later retry
+				}
 				existing.available = true
 				existing.observed = true
 				existing.observedGeneration = generation
@@ -273,24 +313,30 @@ func (s *segmentScheduler) queueSnapshot(generation uint64, trackID, source stri
 
 		s.commitMu.Lock()
 		defer s.commitMu.Unlock()
-		snapshot, err := s.manager.store.SaveSnapshot(id, trackID, source, data, at)
-		if err != nil {
-			return storage.PayloadResult{}, err
-		}
-		updated, err := s.manager.updateAtMediaGeneration(s.e, generation, func(r *domain.Recording) error {
-			for _, existing := range r.Snapshots {
-				if existing.StoragePath == snapshot.StoragePath {
-					if after != nil {
-						return after(r)
+		var snapshot domain.ManifestSnapshot
+		var updated bool
+		err := s.manager.withCanonicalMutation(s.e, func() error {
+			var err error
+			snapshot, err = s.manager.store.SaveSnapshot(id, trackID, source, data, at)
+			if err != nil {
+				return err
+			}
+			updated, err = s.manager.updateAtMediaGenerationWithinAuthorizedCommit(s.e, generation, func(r *domain.Recording) error {
+				for _, existing := range r.Snapshots {
+					if existing.StoragePath == snapshot.StoragePath {
+						if after != nil {
+							return after(r)
+						}
+						return nil
 					}
-					return nil
 				}
-			}
-			r.Snapshots = append(r.Snapshots, snapshot)
-			if after != nil {
-				return after(r)
-			}
-			return nil
+				r.Snapshots = append(r.Snapshots, snapshot)
+				if after != nil {
+					return after(r)
+				}
+				return nil
+			})
+			return err
 		})
 		if err != nil {
 			return storage.PayloadResult{}, err
@@ -346,22 +392,22 @@ func (s *segmentScheduler) queueRecordingCommit() error {
 		if s.manager.storageMetadataWriteHook != nil {
 			s.manager.storageMetadataWriteHook()
 		}
-		s.e.persistMu.Lock()
-		defer s.e.persistMu.Unlock()
-		s.e.mu.Lock()
-		if s.e.deleted {
+		return s.manager.withCanonicalMutation(s.e, func() error {
+			s.e.mu.Lock()
+			if s.e.deleted {
+				s.e.mu.Unlock()
+				return errors.New("recording was deleted")
+			}
+			current := clone(s.e.recording)
 			s.e.mu.Unlock()
-			return errors.New("recording was deleted")
-		}
-		current := clone(s.e.recording)
-		s.e.mu.Unlock()
-		if current == nil {
-			return errors.New("recording state could not be copied")
-		}
-		if err := s.manager.store.SaveRecording(current); err != nil {
-			return errors.New("recording metadata persistence failed")
-		}
-		return nil
+			if current == nil {
+				return errors.New("recording state could not be copied")
+			}
+			if err := s.manager.store.SaveRecording(current); err != nil {
+				return errors.New("recording metadata persistence failed")
+			}
+			return nil
+		})
 	}, func(commitErr error) {
 		defer s.wg.Done()
 		s.mu.Lock()
@@ -469,6 +515,12 @@ func (s *segmentScheduler) observeAtGeneration(epoch uint64, playlist hls.MediaP
 	ending := s.ending
 	for key, task := range s.tasks {
 		if key.epoch > epoch {
+			continue
+		}
+		// A preflighted payload is already locally available even if the live
+		// window advances before the target's first normal manifest poll.
+		if task.preloaded {
+			task.available = true
 			continue
 		}
 		available := key.epoch == epoch && present[key.sequence] && !gaps[key.sequence]
@@ -843,13 +895,32 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 	}
 	epoch, ordinal := task.key.epoch, task.ordinal
 	refreshCycles := task.refreshCycles
+	var err error
+	preloaded := task.preloaded
+	stagedInit := task.stagedInitPayload
+	stagedMedia := task.stagedMediaPayload
+	task.stagedInitPayload = nil
+	task.stagedMediaPayload = nil
 	s.e.mu.Unlock()
 	s.mu.Unlock()
+	defer func() {
+		if stagedInit != nil {
+			stagedInit.Release()
+		}
+		if stagedMedia != nil {
+			stagedMedia.Release()
+		}
+	}()
 	initID := ""
 	var initDependency *initFlight
 	if source.Init != nil {
 		var err error
-		initID, initDependency, err = s.acquireInit(source, epoch, media, generation)
+		if stagedInit != nil {
+			initID, initDependency, err = s.acquireInitWithPayload(source, epoch, media, generation, stagedInit)
+			stagedInit = nil // acquireInitWithPayload consumes/releases the payload
+		} else {
+			initID, initDependency, err = s.acquireInit(source, epoch, media, generation)
+		}
 		if err != nil {
 			if errors.Is(err, storage.ErrIngestClosed) {
 				// Shutdown rejected a completed init payload before queue admission.
@@ -863,12 +934,20 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 			return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 		}
 	}
-	segment, payload, err := s.manager.acquireMediaBuffered(s.ctx, s.e, source, epoch, ordinal, initID, media, generation)
-	if err != nil {
-		if errors.Is(err, errStaleMediaGeneration) {
-			return s.awaitCurrentGeneration(task)
+	var segment domain.Segment
+	var payload *storage.IngestPayload
+	if preloaded && stagedMedia != nil {
+		segment = makeArchiveSegment(source, epoch, ordinal, initID, stagedMedia.Result())
+		payload = stagedMedia
+		stagedMedia = nil // Submit owns it after successful admission below
+	} else {
+		segment, payload, err = s.manager.acquireMediaBuffered(s.ctx, s.e, source, epoch, ordinal, initID, media, generation)
+		if err != nil {
+			if errors.Is(err, errStaleMediaGeneration) {
+				return s.awaitCurrentGeneration(task)
+			}
+			return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 		}
-		return s.handleFetchFailure(task, media, generation, refreshCycles, err)
 	}
 	result := payload.Result()
 	segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
@@ -909,6 +988,10 @@ func (s *segmentScheduler) acquire(task *segmentTask) error {
 		}
 		return fmt.Errorf("%w: persistence queue unavailable", errStorageCommit)
 	}
+	// IngestService now owns payload and will release its reservation after the
+	// canonical commit callback. Prevent the local deferred cleanup from racing
+	// that ownership transfer.
+	payload = nil
 	s.mu.Lock()
 	if s.tasks[task.key] == task {
 		task.state = segmentTaskPersisting
@@ -948,100 +1031,132 @@ func (s *segmentScheduler) persistSegment(segment domain.Segment, initDependency
 			return storage.PayloadResult{}, err
 		}
 	}
+	s.e.mu.Lock()
+	firstHandoverCommit := s.e.handoverFirstCommitPending && !s.e.handoverFirstCommitStarted
+	if firstHandoverCommit {
+		s.e.handoverFirstCommitStarted = true
+	}
+	recordingIDValue := s.e.recording.ID
+	s.e.mu.Unlock()
+	if firstHandoverCommit {
+		if err := runtimehook.Pause(runtimehook.BeforeTargetFirstCommit, recordingIDValue); err != nil {
+			return storage.PayloadResult{}, err
+		}
+	}
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
-	result, err := s.manager.store.SavePayload(recordingID(s.e), segment.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
-	if err != nil {
-		return storage.PayloadResult{}, err
-	}
-	segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
-	sourceDiscontinuity := segment.Discontinuity
-	root := s.recordingSnapshot()
-	var previousUpdate *domain.Segment
+	var result storage.PayloadResult
 	var plannedMarker *epochMarker
-	if segment.SourceEpoch > 0 {
-		marker, exists := s.epochMarkers[segment.SourceEpoch]
-		if !exists {
-			track := root.Tracks["main"]
-			if track != nil {
-				for i := range track.Segments {
-					candidate := track.Segments[i]
-					if candidate.SourceEpoch == segment.SourceEpoch && (marker.ordinal == 0 || candidate.ArchiveOrdinal < marker.ordinal) {
-						marker = epochMarker{ordinal: candidate.ArchiveOrdinal, sourceDiscontinuity: candidate.Discontinuity}
-						exists = true
+	err := s.manager.withCanonicalMutation(s.e, func() error {
+		var err error
+		result, err = s.manager.store.SavePayload(recordingID(s.e), segment.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
+		if err != nil {
+			return err
+		}
+		segment.PayloadSize, segment.SHA256 = result.Size, result.SHA256
+		sourceDiscontinuity := segment.Discontinuity
+		root := s.recordingSnapshot()
+		var previousUpdate *domain.Segment
+		if segment.SourceEpoch > 0 {
+			marker, exists := s.epochMarkers[segment.SourceEpoch]
+			if !exists {
+				track := root.Tracks["main"]
+				if track != nil {
+					for i := range track.Segments {
+						candidate := track.Segments[i]
+						if candidate.SourceEpoch == segment.SourceEpoch && (marker.ordinal == 0 || candidate.ArchiveOrdinal < marker.ordinal) {
+							marker = epochMarker{ordinal: candidate.ArchiveOrdinal, sourceDiscontinuity: candidate.Discontinuity}
+							exists = true
+						}
 					}
 				}
 			}
+			if !exists || segment.ArchiveOrdinal < marker.ordinal {
+				if exists {
+					track := root.Tracks["main"]
+					for i := range track.Segments {
+						candidate := track.Segments[i]
+						if candidate.SourceEpoch == segment.SourceEpoch && candidate.ArchiveOrdinal == marker.ordinal {
+							candidate.Discontinuity = marker.sourceDiscontinuity
+							previousUpdate = &candidate
+							break
+						}
+					}
+				}
+				segment.Discontinuity = true
+				planned := epochMarker{ordinal: segment.ArchiveOrdinal, sourceDiscontinuity: sourceDiscontinuity}
+				plannedMarker = &planned
+			} else if plannedMarker == nil {
+				planned := marker
+				plannedMarker = &planned
+			}
 		}
-		if !exists || segment.ArchiveOrdinal < marker.ordinal {
-			if exists {
-				track := root.Tracks["main"]
-				for i := range track.Segments {
-					candidate := track.Segments[i]
-					if candidate.SourceEpoch == segment.SourceEpoch && candidate.ArchiveOrdinal == marker.ordinal {
-						candidate.Discontinuity = marker.sourceDiscontinuity
-						previousUpdate = &candidate
+		// Sidecars, including a moved synthetic epoch marker, are durable before
+		// the root metadata references their final projection.
+		if err = s.manager.store.SaveSidecar(recordingID(s.e), segment.StoragePath, segment); err != nil {
+			return err
+		}
+		if previousUpdate != nil {
+			if err = s.manager.store.SaveSidecar(recordingID(s.e), previousUpdate.StoragePath, *previousUpdate); err != nil {
+				return err
+			}
+		}
+		return s.manager.updateWithinAuthorizedCommit(s.e, func(r *domain.Recording) error {
+			t := r.Tracks["main"]
+			for _, existing := range t.Segments {
+				if existing.SourceEpoch == segment.SourceEpoch && existing.Sequence == segment.Sequence {
+					return nil
+				}
+			}
+			if previousUpdate != nil {
+				for i := range t.Segments {
+					if t.Segments[i].ID == previousUpdate.ID {
+						t.Segments[i].Discontinuity = previousUpdate.Discontinuity
 						break
 					}
 				}
 			}
-			segment.Discontinuity = true
-			planned := epochMarker{ordinal: segment.ArchiveOrdinal, sourceDiscontinuity: sourceDiscontinuity}
-			plannedMarker = &planned
-		} else if plannedMarker == nil {
-			planned := marker
-			plannedMarker = &planned
-		}
-	}
-	// Sidecars, including a moved synthetic epoch marker, are durable before
-	// the root metadata references their final projection.
-	if err = s.manager.store.SaveSidecar(recordingID(s.e), segment.StoragePath, segment); err != nil {
-		return storage.PayloadResult{}, err
-	}
-	if previousUpdate != nil {
-		if err = s.manager.store.SaveSidecar(recordingID(s.e), previousUpdate.StoragePath, *previousUpdate); err != nil {
-			return storage.PayloadResult{}, err
-		}
-	}
-	if err = s.manager.update(s.e, func(r *domain.Recording) error {
-		t := r.Tracks["main"]
-		for _, existing := range t.Segments {
-			if existing.SourceEpoch == segment.SourceEpoch && existing.Sequence == segment.Sequence {
-				return nil
-			}
-		}
-		if previousUpdate != nil {
-			for i := range t.Segments {
-				if t.Segments[i].ID == previousUpdate.ID {
-					t.Segments[i].Discontinuity = previousUpdate.Discontinuity
-					break
+			t.Segments = append(t.Segments, segment)
+			sort.Slice(t.Segments, func(i, j int) bool {
+				if t.Segments[i].ArchiveOrdinal != t.Segments[j].ArchiveOrdinal {
+					return t.Segments[i].ArchiveOrdinal < t.Segments[j].ArchiveOrdinal
 				}
+				if t.Segments[i].SourceEpoch != t.Segments[j].SourceEpoch {
+					return t.Segments[i].SourceEpoch < t.Segments[j].SourceEpoch
+				}
+				return t.Segments[i].Sequence < t.Segments[j].Sequence
+			})
+			if segment.ArchiveOrdinal >= t.NextArchiveOrdinal {
+				if segment.ArchiveOrdinal == ^uint64(0) {
+					return errors.New("archive ordinal overflow")
+				}
+				t.NextArchiveOrdinal = segment.ArchiveOrdinal + 1
 			}
-		}
-		t.Segments = append(t.Segments, segment)
-		sort.Slice(t.Segments, func(i, j int) bool {
-			if t.Segments[i].ArchiveOrdinal != t.Segments[j].ArchiveOrdinal {
-				return t.Segments[i].ArchiveOrdinal < t.Segments[j].ArchiveOrdinal
+			t.PendingSegments = removePending(t.PendingSegments, segment.SourceEpoch, segment.Sequence)
+			if segment.SourceEpoch == 0 {
+				t.PendingSequences = removeSequence(t.PendingSequences, segment.Sequence)
 			}
-			if t.Segments[i].SourceEpoch != t.Segments[j].SourceEpoch {
-				return t.Segments[i].SourceEpoch < t.Segments[j].SourceEpoch
-			}
-			return t.Segments[i].Sequence < t.Segments[j].Sequence
+			r.LastError = ""
+			return nil
 		})
-		if segment.ArchiveOrdinal >= t.NextArchiveOrdinal {
-			if segment.ArchiveOrdinal == ^uint64(0) {
-				return errors.New("archive ordinal overflow")
-			}
-			t.NextArchiveOrdinal = segment.ArchiveOrdinal + 1
+	})
+	if err != nil {
+		if firstHandoverCommit {
+			s.e.mu.Lock()
+			s.e.handoverFirstCommitStarted = false
+			s.e.mu.Unlock()
 		}
-		t.PendingSegments = removePending(t.PendingSegments, segment.SourceEpoch, segment.Sequence)
-		if segment.SourceEpoch == 0 {
-			t.PendingSequences = removeSequence(t.PendingSequences, segment.Sequence)
-		}
-		r.LastError = ""
-		return nil
-	}); err != nil {
 		return storage.PayloadResult{}, err
+	}
+	if firstHandoverCommit {
+		s.e.mu.Lock()
+		s.e.handoverFirstCommitPending = false
+		s.e.mu.Unlock()
+		// withCanonicalMutation released the cross-process owner lock, after the
+		// complete payload → sidecar → recording root publication.
+		if err := runtimehook.Pause(runtimehook.AfterTargetFirstCommit, recordingIDValue); err != nil {
+			return result, err
+		}
 	}
 	if plannedMarker != nil && segment.SourceEpoch > 0 {
 		s.epochMarkers[segment.SourceEpoch] = *plannedMarker
@@ -1120,16 +1235,29 @@ func (s *segmentScheduler) markRefreshing(task *segmentTask) bool {
 }
 
 func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64) (string, *initFlight, error) {
+	return s.acquireInitUsingPayload(segment, epoch, media, generation, nil)
+}
+
+func (s *segmentScheduler) acquireInitWithPayload(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64, payload *storage.IngestPayload) (string, *initFlight, error) {
+	return s.acquireInitUsingPayload(segment, epoch, media, generation, payload)
+}
+
+func (s *segmentScheduler) acquireInitUsingPayload(segment hls.MediaSegment, epoch uint64, media adapterproto.MediaSource, generation uint64, stagedPayload *storage.IngestPayload) (string, *initFlight, error) {
 	source := *segment.Init
+	id := initSegmentID(source, epoch, segment.DiscontinuitySequence)
 	key := initIdentity(source, epoch, segment.DiscontinuitySequence)
-	digest := sha256.Sum256([]byte(key))
-	id := "init-" + hex.EncodeToString(digest[:8])
 	if initExists(s.recordingSnapshot(), id) {
+		if stagedPayload != nil {
+			stagedPayload.Release()
+		}
 		return id, nil, nil
 	}
 	s.mu.Lock()
 	if flight := s.init[key]; flight != nil {
 		s.mu.Unlock()
+		if stagedPayload != nil {
+			stagedPayload.Release()
+		}
 		select {
 		case <-s.ctx.Done():
 			return "", nil, s.ctx.Err()
@@ -1145,10 +1273,14 @@ func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, m
 	s.mu.Unlock()
 
 	recording := s.recordingSnapshot()
-	payload, err := s.manager.downloadObjectBufferedOnceAtGeneration(s.ctx, source.URI, source.ByteRange, recording.ID, media, s.e, generation)
-	if err != nil {
-		s.resolveInitQueueError(key, flight, err)
-		return "", nil, err
+	payload := stagedPayload
+	var err error
+	if payload == nil {
+		payload, err = s.manager.downloadObjectBufferedOnceAtGeneration(s.ctx, source.URI, source.ByteRange, recording.ID, media, s.e, generation)
+		if err != nil {
+			s.resolveInitQueueError(key, flight, err)
+			return "", nil, err
+		}
 	}
 	asset := domain.Segment{ID: id, TrackID: "main", SourceEpoch: epoch, DiscontinuitySequence: segment.DiscontinuitySequence, SourceURI: source.URI, ByteRange: cloneRange(source.ByteRange), StoragePath: "tracks/main/" + id + extensionFor(source.URI), PayloadSize: payload.Result().Size, SHA256: payload.Result().SHA256, IsInit: true}
 	s.wg.Add(1)
@@ -1163,24 +1295,29 @@ func (s *segmentScheduler) acquireInit(segment hls.MediaSegment, epoch uint64, m
 		}
 		s.commitMu.Lock()
 		defer s.commitMu.Unlock()
-		result, persistErr := s.manager.store.SavePayload(recording.ID, asset.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
-		if persistErr != nil {
-			return storage.PayloadResult{}, persistErr
-		}
-		asset.PayloadSize, asset.SHA256 = result.Size, result.SHA256
-		if persistErr = s.manager.store.SaveSidecar(recording.ID, asset.StoragePath, asset); persistErr != nil {
-			return storage.PayloadResult{}, persistErr
-		}
-		if persistErr = s.manager.update(s.e, func(r *domain.Recording) error {
-			track := r.Tracks["main"]
-			for _, previous := range track.InitSegments {
-				if previous.ID == id {
-					return nil
-				}
+		var result storage.PayloadResult
+		persistErr := s.manager.withCanonicalMutation(s.e, func() error {
+			var err error
+			result, err = s.manager.store.SavePayload(recording.ID, asset.StoragePath, bytes.NewReader(data), s.manager.ingest.Options().MaxPayloadBytes)
+			if err != nil {
+				return err
 			}
-			track.InitSegments = append(track.InitSegments, asset)
-			return nil
-		}); persistErr != nil {
+			asset.PayloadSize, asset.SHA256 = result.Size, result.SHA256
+			if err = s.manager.store.SaveSidecar(recording.ID, asset.StoragePath, asset); err != nil {
+				return err
+			}
+			return s.manager.updateWithinAuthorizedCommit(s.e, func(r *domain.Recording) error {
+				track := r.Tracks["main"]
+				for _, previous := range track.InitSegments {
+					if previous.ID == id {
+						return nil
+					}
+				}
+				track.InitSegments = append(track.InitSegments, asset)
+				return nil
+			})
+		})
+		if persistErr != nil {
 			return storage.PayloadResult{}, persistErr
 		}
 		return result, nil
@@ -1244,6 +1381,11 @@ func initIdentity(source hls.Map, epoch, discontinuity uint64) string {
 	return key
 }
 
+func initSegmentID(source hls.Map, epoch, discontinuity uint64) string {
+	digest := sha256.Sum256([]byte(initIdentity(source, epoch, discontinuity)))
+	return "init-" + hex.EncodeToString(digest[:8])
+}
+
 func (s *segmentScheduler) failure() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1299,6 +1441,20 @@ func (s *segmentScheduler) drain(ctx context.Context) error {
 	}
 }
 
+// drainForHandover is called only after the manifest worker has stopped
+// admitting manifests. It uses the same task accounting as normal drain; a
+// timeout leaves the scheduler open so the source worker can resume without
+// converting queued work into gaps.
+func (s *segmentScheduler) drainForHandover(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("segment scheduler is closed")
+	}
+	s.mu.Unlock()
+	return s.drain(ctx)
+}
+
 // drainEndList drains only while ENDLIST still belongs to this media source
 // generation. A concurrent refresh reopens admission and lets the poll loop
 // fetch a manifest from the new source instead of finalizing the recording.
@@ -1343,14 +1499,26 @@ func (s *segmentScheduler) close() error {
 	s.cancel()
 	s.wg.Wait()
 	var pending []segmentTaskKey
+	var staged []*storage.IngestPayload
 	s.mu.Lock()
-	for key := range s.tasks {
+	for key, task := range s.tasks {
 		pending = append(pending, key)
+		if task.stagedInitPayload != nil {
+			staged = append(staged, task.stagedInitPayload)
+			task.stagedInitPayload = nil
+		}
+		if task.stagedMediaPayload != nil {
+			staged = append(staged, task.stagedMediaPayload)
+			task.stagedMediaPayload = nil
+		}
 	}
 	s.tasks = make(map[segmentTaskKey]*segmentTask)
 	s.ready = nil
 	s.signalLocked()
 	s.mu.Unlock()
+	for _, payload := range staged {
+		payload.Release()
+	}
 	for _, key := range pending {
 		if s.manager.hasSequence(s.e, key.epoch, key.sequence) {
 			continue

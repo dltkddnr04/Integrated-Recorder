@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -288,6 +289,70 @@ func TestRegistryLeaseValidationAndDuplicateRejection(t *testing.T) {
 	}
 }
 
+func TestTransferRecordingMovesOnlyTheExactLeaseToTheActiveEngine(t *testing.T) {
+	r := openActivated(t, generationOne)
+	startedAt := time.Now().UTC().Truncate(time.Second)
+	oldLease := Lease{RecordingID: recordingOne, EngineGeneration: generationOne, WorkerInstance: workerOne, StartedAt: startedAt}
+	if err := r.PinRecording(oldLease); err != nil {
+		t.Fatal(err)
+	}
+	stageReady(t, r, generationTwo)
+	if err := r.Activate(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+
+	target := Lease{RecordingID: recordingOne, EngineGeneration: generationTwo, WorkerInstance: workerTwo, StartedAt: startedAt}
+	stale := oldLease
+	stale.WorkerInstance = workerThree
+	if err := r.TransferRecording(stale, target); !errors.Is(err, ErrLeaseMismatch) {
+		t.Fatalf("transfer with stale source lease=%v, want ErrLeaseMismatch", err)
+	}
+	if got := r.Snapshot().Leases[recordingOne]; !sameLease(got, oldLease) {
+		t.Fatalf("stale transfer changed lease: %+v", got)
+	}
+	if err := r.TransferRecording(oldLease, target); err != nil {
+		t.Fatalf("transfer exact source lease: %v", err)
+	}
+	if got := r.Snapshot().Leases[recordingOne]; !sameLease(got, target) {
+		t.Fatalf("transferred lease=%+v, want %+v", got, target)
+	}
+	if err := r.Retire(generationOne); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("source generation retired while rollback-protected: %v", err)
+	}
+}
+
+func TestTransferRecordingRejectsNonActiveTargetAndStartedAtChange(t *testing.T) {
+	r := openActivated(t, generationOne)
+	startedAt := time.Now().UTC()
+	oldLease := Lease{RecordingID: recordingOne, EngineGeneration: generationOne, WorkerInstance: workerOne, StartedAt: startedAt}
+	if err := r.PinRecording(oldLease); err != nil {
+		t.Fatal(err)
+	}
+	stageReady(t, r, generationTwo)
+	nonActive := Lease{RecordingID: recordingOne, EngineGeneration: generationTwo, WorkerInstance: workerTwo, StartedAt: startedAt}
+	if err := r.TransferRecording(oldLease, nonActive); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("transfer to non-active target=%v, want ErrInvalidTransition", err)
+	}
+	if got := r.Snapshot().Leases[recordingOne]; !sameLease(got, oldLease) {
+		t.Fatalf("rejected target changed lease: %+v", got)
+	}
+
+	if err := r.Activate(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	changedStart := nonActive
+	changedStart.StartedAt = startedAt.Add(time.Second)
+	if err := r.TransferRecording(oldLease, changedStart); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("transfer changing Recording start=%v, want ErrInvalidState", err)
+	}
+}
+
 func TestRegistryPersistenceFailureDoesNotPublishMemory(t *testing.T) {
 	dir := t.TempDir()
 	r, err := Open(filepath.Join(dir, "registry.json"))
@@ -531,6 +596,254 @@ func TestReconcileInventoriesPersistenceFailureDoesNotPublish(t *testing.T) {
 	}
 }
 
+func TestClearLeasesAtomicallyPersistsEmptyProjectionAndIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime", "registry.json")
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageReady(t, r, generationOne)
+	if err := r.Activate(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, id := range []string{recordingOne, recordingTwo} {
+		if err := r.PinRecording(Lease{RecordingID: id, EngineGeneration: generationOne, WorkerInstance: workerOne, StartedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.ClearLeases(); err != nil {
+		t.Fatalf("ClearLeases(): %v", err)
+	}
+	if got := r.Snapshot().Leases; len(got) != 0 {
+		t.Fatalf("ClearLeases left partial lease projection: %+v", got)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.Snapshot().Leases; len(got) != 0 {
+		t.Fatalf("durable lease projection after clear: %+v", got)
+	}
+	if err := r.ClearLeases(); err != nil {
+		t.Fatalf("repeated ClearLeases(): %v", err)
+	}
+	if got := r.Snapshot().Leases; got == nil || len(got) != 0 {
+		t.Fatalf("repeated clear did not retain an empty initialized map: %#v", got)
+	}
+}
+
+func TestClearLeasesRetainsAllGenerationLifecycleState(t *testing.T) {
+	r := openActivated(t, generationOne)
+	if err := r.PinRecording(Lease{RecordingID: recordingOne, EngineGeneration: generationOne, WorkerInstance: workerOne, StartedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	before := r.Snapshot()
+	if err := r.ClearLeases(); err != nil {
+		t.Fatal(err)
+	}
+	after := r.Snapshot()
+	if after.ActiveGenerationID != before.ActiveGenerationID || len(after.Generations) != len(before.Generations) {
+		t.Fatalf("ClearLeases changed generation lifecycle state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestClearLeasesPersistenceFailureDoesNotPublishPartialState(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Open(filepath.Join(dir, "registry.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageReady(t, r, generationOne)
+	if err := r.Activate(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	lease := Lease{RecordingID: recordingOne, EngineGeneration: generationOne, WorkerInstance: workerOne, StartedAt: time.Now().UTC()}
+	if err := r.PinRecording(lease); err != nil {
+		t.Fatal(err)
+	}
+	before := r.Snapshot()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r.path = filepath.Join(blocker, "registry.json")
+	if err := r.ClearLeases(); err == nil {
+		t.Fatal("ClearLeases() succeeded with an invalid persistence path")
+	}
+	if got := r.Snapshot(); !sameLease(got.Leases[recordingOne], before.Leases[recordingOne]) || len(got.Leases) != 1 {
+		t.Fatalf("failed clear published partial in-memory state: before=%+v after=%+v", before.Leases, got.Leases)
+	}
+}
+
+func TestReconcileColdStartAtomicallyClearsLeasesAndDormantsNonActiveDrainingGenerations(t *testing.T) {
+	r := coldStartReconciliationRegistry(t)
+	before := r.Snapshot()
+	if before.ActiveGenerationID != generationFour || before.PreviousGenerationID != generationThree || before.ActivationPreviousGenerationID != generationTwo {
+		t.Fatalf("fixture did not retain active and rollback generations: %+v", before)
+	}
+	if before.Generations[generationOne].State != StateDraining || generationOne == before.PreviousGenerationID || generationOne == before.ActivationPreviousGenerationID {
+		t.Fatalf("fixture lacks an unpointed draining generation: %+v", before.Generations[generationOne])
+	}
+	if len(before.Leases) != 3 {
+		t.Fatalf("fixture leases = %d, want 3", len(before.Leases))
+	}
+
+	if err := r.ReconcileColdStart(generationFour); err != nil {
+		t.Fatalf("ReconcileColdStart(): %v", err)
+	}
+	after := r.Snapshot()
+	expected := cloneSnapshot(before)
+	expected.Leases = make(map[string]Lease)
+	for id, item := range expected.Generations {
+		if id != generationFour && item.State == StateDraining {
+			item.EngineDormant = true
+			expected.Generations[id] = item
+		}
+	}
+	if !reflect.DeepEqual(after, expected) {
+		t.Fatalf("cold reconciliation did not atomically apply only lease and dormant projection changes:\n got: %+v\nwant: %+v", after, expected)
+	}
+	if after.Generations[generationFour].EngineDormant {
+		t.Fatal("active generation was marked dormant")
+	}
+	if after.Generations[generationOne].State != StateDraining || after.Generations[generationTwo].State != StateDraining || after.Generations[generationThree].State != StateDraining {
+		t.Fatalf("cold reconciliation changed generation lifecycle state: %+v", after.Generations)
+	}
+
+	reopened, err := Open(r.path)
+	if err != nil {
+		t.Fatalf("reopen reconciled registry: %v", err)
+	}
+	if got := reopened.Snapshot(); !reflect.DeepEqual(got, after) {
+		t.Fatalf("cold reconciliation was not durable:\n got: %+v\nwant: %+v", got, after)
+	}
+}
+
+func TestReconcileColdStartRejectsInvalidOrNonActiveGenerationWithoutMutation(t *testing.T) {
+	r := openActivated(t, generationOne)
+	stageReady(t, r, generationTwo)
+	if err := r.Activate(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{
+		{name: "empty", id: ""},
+		{name: "malformed", id: "../active"},
+		{name: "unknown", id: generationThree},
+		{name: "non-active draining", id: generationOne},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := r.Snapshot()
+			if err := r.ReconcileColdStart(tc.id); err == nil {
+				t.Fatalf("ReconcileColdStart(%q) unexpectedly succeeded", tc.id)
+			}
+			if got := r.Snapshot(); !reflect.DeepEqual(got, before) {
+				t.Fatalf("rejected cold reconciliation mutated registry:\n got: %+v\nwant: %+v", got, before)
+			}
+		})
+	}
+
+	withoutActive, err := Open(filepath.Join(t.TempDir(), "registry.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := withoutActive.Snapshot()
+	if err := withoutActive.ReconcileColdStart(generationOne); err == nil {
+		t.Fatal("cold reconciliation without an active generation succeeded")
+	}
+	if got := withoutActive.Snapshot(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("missing-active rejection mutated registry: before=%+v after=%+v", before, got)
+	}
+}
+
+func TestReconcileColdStartIsIdempotent(t *testing.T) {
+	r := coldStartReconciliationRegistry(t)
+	if err := r.ReconcileColdStart(generationFour); err != nil {
+		t.Fatal(err)
+	}
+	first := r.Snapshot()
+	if err := r.ReconcileColdStart(generationFour); err != nil {
+		t.Fatalf("repeat ReconcileColdStart(): %v", err)
+	}
+	if got := r.Snapshot(); !reflect.DeepEqual(got, first) {
+		t.Fatalf("repeat cold reconciliation changed state:\n got: %+v\nwant: %+v", got, first)
+	}
+}
+
+func TestReconcileColdStartPersistenceFailureDoesNotPublishPartialState(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Open(filepath.Join(dir, "registry.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageReady(t, r, generationOne)
+	if err := r.Activate(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	stageReady(t, r, generationTwo)
+	if err := r.Activate(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PinRecording(Lease{RecordingID: recordingOne, EngineGeneration: generationTwo, WorkerInstance: workerTwo, StartedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	before := r.Snapshot()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r.path = filepath.Join(blocker, "registry.json")
+	if err := r.ReconcileColdStart(generationTwo); err == nil {
+		t.Fatal("ReconcileColdStart() succeeded with an invalid persistence path")
+	}
+	if got := r.Snapshot(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("failed cold reconciliation published partial state:\n got: %+v\nwant: %+v", got, before)
+	}
+}
+
+func coldStartReconciliationRegistry(t *testing.T) *Registry {
+	t.Helper()
+	r, err := Open(filepath.Join(t.TempDir(), "registry.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{generationOne, generationTwo, generationThree} {
+		stageReady(t, r, id)
+		if err := r.Activate(id); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.FinalizeActivation(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stageReady(t, r, generationFour)
+	if err := r.Activate(generationFour); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := r.ReconcileInventories([]EngineInventory{
+		{Confirmed: true, EngineGeneration: generationOne, WorkerInstance: workerOne, ObservedAt: now, Recordings: []InventoryRecording{{RecordingID: recordingOne, StartedAt: now.Add(-time.Minute)}}},
+		{Confirmed: true, EngineGeneration: generationTwo, WorkerInstance: workerTwo, ObservedAt: now, Recordings: []InventoryRecording{{RecordingID: recordingTwo, StartedAt: now.Add(-time.Minute)}}},
+		{Confirmed: true, EngineGeneration: generationThree, WorkerInstance: workerThree, ObservedAt: now, Recordings: []InventoryRecording{{RecordingID: recordingThree, StartedAt: now.Add(-time.Minute)}}},
+		{Confirmed: true, EngineGeneration: generationFour, WorkerInstance: workerFour, ObservedAt: now},
+	}); err != nil {
+		t.Fatalf("create cold-start inventory lease fixture: %v", err)
+	}
+	return r
+}
+
 func openActivated(t *testing.T, id string) *Registry {
 	t.Helper()
 	r, err := Open(filepath.Join(t.TempDir(), "registry.json"))
@@ -569,10 +882,12 @@ const (
 	generationOne   = "11111111111111111111111111111111"
 	generationTwo   = "22222222222222222222222222222222"
 	generationThree = "33333333333333333333333333333333"
+	generationFour  = "44444444444444444444444444444444"
 	recordingOne    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	recordingTwo    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	recordingThree  = "cccccccccccccccccccccccccccccccc"
 	workerOne       = "dddddddddddddddddddddddddddddddd"
 	workerTwo       = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	workerThree     = "ffffffffffffffffffffffffffffffff"
+	workerFour      = "00000000000000000000000000000000"
 )

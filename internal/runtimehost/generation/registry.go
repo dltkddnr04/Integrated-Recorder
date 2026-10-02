@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 )
 
 const (
@@ -76,9 +78,11 @@ type Generation struct {
 	AdapterSetID string    `json:"adapter_set_id,omitempty"`
 	InstalledAt  time.Time `json:"installed_at"`
 	State        State     `json:"state"`
-	// EngineDormant records that the Host deliberately stopped this Engine
-	// after confirming it had no active Recording leases. The immutable release
-	// remains installed and can be restarted if this generation is rolled back.
+	// EngineDormant records that this generation has no active Host-authorized
+	// Engine attachment. After cold recovery, an orphan OS process may still be
+	// alive; it is not an authorized writer unless it is reattached by the Host.
+	// The immutable release remains installed and can be restarted if this
+	// generation is rolled back.
 	EngineDormant            bool               `json:"engine_dormant,omitempty"`
 	ControlProtocol          int                `json:"control_protocol"`
 	EngineProtocol           int                `json:"engine_protocol"`
@@ -86,8 +90,11 @@ type Generation struct {
 	ArchiveWriteEpoch        int                `json:"archive_write_epoch"`
 }
 
-// Lease pins one Recording to the engine generation that started it. Worker
-// identity is host runtime metadata, not canonical archive provenance.
+// Lease is the Runtime Host's retirement reference to the Engine generation
+// currently serving one active Recording. A fenced handover may move the
+// lease after canonical-writer ownership transfers; StartedAt remains the
+// immutable original Recording start time. Worker identity is runtime
+// metadata, not canonical archive provenance.
 type Lease struct {
 	RecordingID      string    `json:"recording_id"`
 	EngineGeneration string    `json:"engine_generation"`
@@ -415,6 +422,88 @@ func (r *Registry) PinRecording(lease Lease) error {
 	})
 }
 
+// TransferRecording moves the retirement lease for one Recording to the
+// currently active Engine after the Host has durably transferred the
+// Recording's canonical-writer ownership fence. The generation lease is a
+// retirement projection; it is deliberately updated separately from the
+// owner fence, which remains authoritative for archive writes.
+//
+// The archive's start time is immutable across a transfer, and an exact
+// expected lease is required so a stale completion cannot move a newer lease.
+func (r *Registry) TransferRecording(expected, target Lease) error {
+	if err := validateLease(expected); err != nil {
+		return err
+	}
+	if err := validateLease(target); err != nil {
+		return err
+	}
+	if expected.RecordingID != target.RecordingID || !expected.StartedAt.Equal(target.StartedAt) || sameLease(expected, target) {
+		return invalid("recording lease transfer is invalid")
+	}
+	return r.change(func(next *Snapshot) error {
+		current, ok := next.Leases[expected.RecordingID]
+		if !ok {
+			return ErrLeaseNotFound
+		}
+		if !sameLease(current, expected) {
+			return ErrLeaseMismatch
+		}
+		source, sourceExists := next.Generations[expected.EngineGeneration]
+		if !sourceExists || source.EngineDormant || (source.State != StateActive && source.State != StateDraining && source.State != StateFailed) {
+			return transition("recording source generation cannot transfer its lease")
+		}
+		destination, destinationExists := next.Generations[target.EngineGeneration]
+		if !destinationExists || target.EngineGeneration != next.ActiveGenerationID || destination.State != StateActive || destination.EngineDormant {
+			return transition("recording target generation is not the active Engine")
+		}
+		if err := runtimehook.Pause(runtimehook.DuringGenerationLeaseReconcile, expected.RecordingID); err != nil {
+			return err
+		}
+		next.Leases[target.RecordingID] = target
+		return nil
+	})
+}
+
+// RollbackRecordingTransfer restores a Recording lease to its previous,
+// deliberately-draining Engine after the active target has been fenced. It is
+// narrower than TransferRecording: the current owner must be in the active
+// generation and the destination must be the non-dormant draining generation.
+func (r *Registry) RollbackRecordingTransfer(expected, target Lease) error {
+	if err := validateLease(expected); err != nil {
+		return err
+	}
+	if err := validateLease(target); err != nil {
+		return err
+	}
+	if expected.RecordingID != target.RecordingID || !expected.StartedAt.Equal(target.StartedAt) || sameLease(expected, target) {
+		return invalid("recording lease rollback is invalid")
+	}
+	return r.change(func(next *Snapshot) error {
+		current, ok := next.Leases[expected.RecordingID]
+		if !ok {
+			return ErrLeaseNotFound
+		}
+		if !sameLease(current, expected) {
+			return ErrLeaseMismatch
+		}
+		source, sourceExists := next.Generations[expected.EngineGeneration]
+		if !sourceExists || source.EngineDormant || source.State != StateActive || next.ActiveGenerationID != expected.EngineGeneration {
+			return transition("recording rollback source is not the active Engine")
+		}
+		destination, destinationExists := next.Generations[target.EngineGeneration]
+		if !destinationExists || destination.EngineDormant || destination.State != StateDraining || target.EngineGeneration == next.ActiveGenerationID {
+			return transition("recording rollback destination is not a live draining Engine")
+		}
+		next.Leases[target.RecordingID] = target
+		return nil
+	})
+}
+
+func sameLease(a, b Lease) bool {
+	return a.RecordingID == b.RecordingID && a.EngineGeneration == b.EngineGeneration &&
+		a.WorkerInstance == b.WorkerInstance && a.StartedAt.Equal(b.StartedAt)
+}
+
 // ReleaseRecording releases a matching recording lease. The expected
 // generation is required so stale completion messages cannot release a newer
 // lease for the same recording identifier.
@@ -431,6 +520,74 @@ func (r *Registry) ReleaseRecording(recordingID, expectedGeneration string) erro
 			return ErrLeaseMismatch
 		}
 		delete(next.Leases, recordingID)
+		return nil
+	})
+}
+
+// ReleaseRecordingOwner releases only the lease for the complete Engine owner
+// tuple. Recording owner callbacks may race with a process restart in the same
+// generation, so generation identity alone is insufficient for fencing.
+func (r *Registry) ReleaseRecordingOwner(recordingID, expectedGeneration, expectedInstance string) error {
+	if !validID(recordingID) || !validID(expectedGeneration) || !validID(expectedInstance) {
+		return invalid("recording or engine owner identity is invalid")
+	}
+	return r.change(func(next *Snapshot) error {
+		lease, ok := next.Leases[recordingID]
+		if !ok {
+			return ErrLeaseNotFound
+		}
+		if lease.EngineGeneration != expectedGeneration || lease.WorkerInstance != expectedInstance {
+			return ErrLeaseMismatch
+		}
+		delete(next.Leases, recordingID)
+		return nil
+	})
+}
+
+// ClearLeases atomically replaces the durable lease projection with an empty
+// set. It is reserved for cold Host recovery after the startup Engine has
+// completed owner-fenced archive recovery; callers must not use it while live
+// Engines may still own Recordings. Repeating the operation is safe.
+func (r *Registry) ClearLeases() error {
+	return r.change(func(next *Snapshot) error {
+		next.Leases = make(map[string]Lease)
+		return nil
+	})
+}
+
+// ReconcileColdStart atomically rebuilds the cold Host's lease projection and
+// attachment state after the active Engine has completed owner-fenced archive
+// recovery. Only activeGenerationID may have an authorized Engine attachment
+// at that point. Other draining generations remain installed and retain their
+// rollback pointers, but are marked dormant so lease reconciliation does not
+// expect inventory from orphan processes that this Host did not reattach.
+// EngineDormant does not assert that those OS processes were terminated.
+//
+// This operation is idempotent and does not retire or remove immutable
+// generation records. It must only be called after the active Engine has
+// passed authenticated readiness and fenced recovery has completed.
+func (r *Registry) ReconcileColdStart(activeGenerationID string) error {
+	if !validID(activeGenerationID) {
+		return invalid("active generation identifier is invalid")
+	}
+	return r.change(func(next *Snapshot) error {
+		active, ok := next.Generations[activeGenerationID]
+		if !ok {
+			return ErrGenerationNotFound
+		}
+		if next.ActiveGenerationID != activeGenerationID || active.State != StateActive {
+			return transition("cold recovery generation is not active")
+		}
+
+		// Publish lease clearing and dormant attachment state together. The
+		// source snapshot remains in memory unless this complete state is durable.
+		next.Leases = make(map[string]Lease)
+		for id, generation := range next.Generations {
+			if id != activeGenerationID && generation.State == StateDraining {
+				generation.EngineDormant = true
+				next.Generations[id] = generation
+			}
+		}
 		return nil
 	})
 }

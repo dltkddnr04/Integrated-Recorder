@@ -17,24 +17,32 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/domain"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
 )
 
 const (
-	OperationReady          = "ready"
-	OperationHeartbeat      = "heartbeat"
-	OperationStartResolved  = "start_resolved"
-	OperationBeginDrain     = "begin_drain"
-	OperationActiveCount    = "active_recordings"
-	OperationGet            = "get"
-	OperationList           = "list"
-	OperationStop           = "stop"
-	OperationDelete         = "delete"
-	OperationDeleteTerminal = "delete_terminal_archive"
-	OperationInventory      = "inventory"
-	DefaultListLimit        = 2000
-	MaximumListLimit        = 10000
+	OperationReady                  = "ready"
+	OperationHeartbeat              = "heartbeat"
+	OperationStartResolved          = "start_resolved"
+	OperationBeginDrain             = "begin_drain"
+	OperationActiveCount            = "active_recordings"
+	OperationGet                    = "get"
+	OperationList                   = "list"
+	OperationStop                   = "stop"
+	OperationDelete                 = "delete"
+	OperationDeleteTerminal         = "delete_terminal_archive"
+	OperationInventory              = "inventory"
+	OperationHandoverSnapshot       = "handover_snapshot"
+	OperationHandoverPause          = "handover_pause"
+	OperationHandoverResume         = "handover_resume"
+	OperationHandoverComplete       = "handover_complete"
+	OperationHandoverPrepareTarget  = "handover_prepare_target"
+	OperationHandoverActivateTarget = "handover_activate_target"
+	OperationHandoverDiscardTarget  = "handover_discard_target"
+	DefaultListLimit                = 2000
+	MaximumListLimit                = 10000
 )
 
 type StartResolvedRequest struct {
@@ -48,6 +56,55 @@ type StartResolvedRequest struct {
 
 type RecordingIDRequest struct {
 	RecordingID string `json:"recording_id"`
+}
+
+// HandoverOwnerRequest is accepted only from the Runtime Host over the
+// authenticated Engine IPC transport. Owner is a fencing token, not a request
+// to transfer ownership.
+type HandoverOwnerRequest struct {
+	RecordingID string               `json:"recording_id"`
+	Owner       recordingowner.Owner `json:"owner"`
+}
+
+type HandoverResumeRequest struct {
+	RecordingID string                   `json:"recording_id"`
+	Owner       recordingowner.Owner     `json:"owner"`
+	Snapshot    acquire.HandoverSnapshot `json:"snapshot"`
+}
+
+type HandoverTargetRequest struct {
+	Snapshot      acquire.HandoverSnapshot       `json:"snapshot"`
+	Target        acquire.HandoverTargetIdentity `json:"target"`
+	SourceDrained bool                           `json:"source_drained,omitempty"`
+}
+
+type HandoverTargetOwnerRequest struct {
+	RecordingID string                         `json:"recording_id"`
+	Owner       recordingowner.Owner           `json:"owner"`
+	Target      acquire.HandoverTargetIdentity `json:"target"`
+}
+
+type HandoverTargetDiscardRequest struct {
+	RecordingID string                         `json:"recording_id"`
+	Target      acquire.HandoverTargetIdentity `json:"target"`
+}
+
+// HandoverSnapshotResult and HandoverResult deliberately expose only the
+// requested internal recording snapshot/owner tuple. They are never routed
+// through public HTTP APIs or logs.
+type HandoverSnapshotResult struct {
+	RecordingID  string                   `json:"recording_id"`
+	GenerationID string                   `json:"generation_id"`
+	InstanceID   string                   `json:"instance_id"`
+	Snapshot     acquire.HandoverSnapshot `json:"snapshot"`
+}
+
+type HandoverResult struct {
+	RecordingID  string                `json:"recording_id"`
+	GenerationID string                `json:"generation_id"`
+	InstanceID   string                `json:"instance_id"`
+	Owner        *recordingowner.Owner `json:"owner,omitempty"`
+	Accepted     bool                  `json:"accepted"`
 }
 
 type GenerationRequest struct {
@@ -77,6 +134,7 @@ type ActiveRecording struct {
 	RecordingID string                `json:"recording_id"`
 	State       domain.RecordingState `json:"state"`
 	StartedAt   time.Time             `json:"started_at"`
+	Owner       *recordingowner.Owner `json:"owner,omitempty"`
 }
 
 type InventoryResult struct {
@@ -110,7 +168,20 @@ type Engine struct {
 	ready            bool
 	closed           bool
 	adapterCloseOnce sync.Once
+	ownerClient      recordingOwnerClient
+	ownerMu          sync.Mutex
+	owners           map[string]recordingowner.Owner
+	releasedOwners   map[recordingowner.Owner]struct{}
+	releasedOrder    []recordingowner.Owner
+	startSeen        bool
 }
+
+type recordingOwnerClient interface {
+	ClaimRecording(context.Context, string) (recordingowner.Owner, error)
+	ReleaseRecording(context.Context, recordingowner.Owner) error
+}
+
+const maxReleasedOwnerHistory = 4096
 
 func New(manager *acquire.Manager, adapters *adapterhost.Host, generationID, instanceID string) (*Engine, error) {
 	if manager == nil || adapters == nil {
@@ -119,8 +190,35 @@ func New(manager *acquire.Manager, adapters *adapterhost.Host, generationID, ins
 	if generationID == "" || instanceID == "" {
 		return nil, errors.New("engine generation and instance identities are required")
 	}
-	e := &Engine{manager: manager, adapters: adapters, generation: generationID, instance: instanceID, startedAt: time.Now().UTC(), ready: true}
+	e := &Engine{
+		manager: manager, adapters: adapters, generation: generationID, instance: instanceID,
+		startedAt: time.Now().UTC(), ready: true,
+		owners: make(map[string]recordingowner.Owner), releasedOwners: make(map[recordingowner.Owner]struct{}),
+	}
 	return e, nil
+}
+
+// ConfigureRecordingOwnerClient enables Host-authorized managed starts. It is
+// called before the Engine IPC server begins serving requests. With no client,
+// direct development/test Engine invocation keeps the historical behavior.
+func (e *Engine) ConfigureRecordingOwnerClient(client recordingOwnerClient) error {
+	if e == nil || client == nil {
+		return errors.New("recording owner client is required")
+	}
+	e.admissionMu.Lock()
+	defer e.admissionMu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.startSeen || e.ownerClient != nil || e.closed {
+		return errors.New("recording owner client must be configured before Engine starts")
+	}
+	if err := e.manager.ConfigureTerminalOwnerRelease(func(owner acquire.OwnershipToken) error {
+		return e.releaseOwner(context.Background(), owner)
+	}); err != nil {
+		return err
+	}
+	e.ownerClient = client
+	return nil
 }
 
 // RuntimeInstanceID is returned in the transport envelope so a Control Plane
@@ -192,6 +290,25 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 		if e.draining {
 			return nil, publicError("engine_draining", "recorder engine is draining and cannot start recordings")
 		}
+		e.mu.Lock()
+		e.startSeen = true
+		ownerClient := e.ownerClient
+		e.mu.Unlock()
+		if ownerClient != nil {
+			owner, err := ownerClient.ClaimRecording(ctx, request.RecordingID)
+			if err != nil {
+				return nil, publicError("recording_owner_unavailable", "Host could not authorize recording ownership")
+			}
+			e.ownerMu.Lock()
+			e.owners[owner.RecordingID] = owner
+			e.ownerMu.Unlock()
+			result, err := e.manager.StartResolvedWithIDOwned(ctx, owner, owner.RecordingID, request.AdapterID, request.Media, request.Resource, request.Title, request.Provenance)
+			if err != nil {
+				_ = e.releaseOwner(context.Background(), owner)
+				return nil, publicError("start_failed", "recording could not be started")
+			}
+			return result, nil
+		}
 		if request.RecordingID == "" {
 			result, err := e.manager.StartResolved(ctx, request.AdapterID, request.Media, request.Resource, request.Title, request.Provenance)
 			if err != nil {
@@ -243,9 +360,19 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 			return nil, publicError("invalid_request", "recording identity is invalid")
 		}
 		result, err := e.manager.StopContext(ctx, request.RecordingID)
+		if result != nil && result.State != domain.StateRecording {
+			if owner, ok := e.currentOwner(request.RecordingID); ok {
+				if releaseErr := e.releaseOwner(ctx, owner); releaseErr != nil {
+					return nil, publicError("stop_failed", "recording ownership could not be released")
+				}
+			}
+		}
 		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, publicError("not_owned", "recording is not owned by this engine")
+			}
+			if errors.Is(err, acquire.ErrHandoverConflict) {
+				return nil, publicError("handover_in_progress", "recording ownership is being transferred")
 			}
 			return nil, publicError("stop_failed", "recording could not be stopped")
 		}
@@ -292,13 +419,259 @@ func (e *Engine) Handle(ctx context.Context, operation string, payload json.RawM
 		active := make([]ActiveRecording, 0, len(rows))
 		for _, row := range rows {
 			if row.State == domain.StateRecording {
-				active = append(active, ActiveRecording{RecordingID: row.ID, State: row.State, StartedAt: row.StartedAt})
+				var owner *recordingowner.Owner
+				if current, ok := e.currentOwner(row.ID); ok {
+					copy := current
+					owner = &copy
+				}
+				active = append(active, ActiveRecording{RecordingID: row.ID, State: row.State, StartedAt: row.StartedAt, Owner: owner})
 			}
 		}
 		return InventoryResult{GenerationID: e.generation, InstanceID: e.instance, Ready: ready, Active: active}, nil
+	case OperationHandoverSnapshot:
+		var request HandoverOwnerRequest
+		if err := decodePayload(payload, &request); err != nil || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) {
+			return nil, publicError("invalid_request", "recording ownership identity is invalid")
+		}
+		var snapshot acquire.HandoverSnapshot
+		if !e.hasCurrentOwner(request.Owner) {
+			return nil, publicError("stale_owner", "recording ownership changed")
+		}
+		snapshot, err := e.manager.HandoverSnapshot(request.RecordingID)
+		if err != nil {
+			return nil, handoverPublicError(err)
+		}
+		if !validHandoverSnapshot(snapshot, request.Owner) {
+			return nil, publicError("handover_rejected", "recording continuation snapshot is invalid")
+		}
+		return HandoverSnapshotResult{RecordingID: request.RecordingID, GenerationID: e.generation, InstanceID: e.instance, Snapshot: snapshot}, nil
+	case OperationHandoverPause:
+		var request HandoverOwnerRequest
+		if err := decodePayload(payload, &request); err != nil || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) {
+			return nil, publicError("invalid_request", "recording ownership identity is invalid")
+		}
+		var snapshot acquire.HandoverSnapshot
+		if !e.hasCurrentOwner(request.Owner) {
+			return nil, publicError("stale_owner", "recording ownership changed")
+		}
+		snapshot, err := e.manager.PauseForHandover(ctx, request.RecordingID, request.Owner)
+		if err != nil {
+			return nil, handoverPublicError(err)
+		}
+		if !validHandoverSnapshot(snapshot, request.Owner) {
+			return nil, publicError("handover_rejected", "recording continuation snapshot is invalid")
+		}
+		return HandoverSnapshotResult{RecordingID: request.RecordingID, GenerationID: e.generation, InstanceID: e.instance, Snapshot: snapshot}, nil
+	case OperationHandoverResume:
+		var request HandoverResumeRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) || !validHandoverSnapshot(request.Snapshot, request.Snapshot.Owner) || request.Snapshot.RecordingID != request.RecordingID || request.Owner.EngineGeneration != request.Snapshot.Owner.EngineGeneration || request.Owner.WorkerInstance != request.Snapshot.Owner.WorkerInstance || request.Owner.Epoch < request.Snapshot.Owner.Epoch {
+			return nil, publicError("invalid_request", "recording continuation identity is invalid")
+		}
+		var owner recordingowner.Owner
+		e.ownerMu.Lock()
+		current, currentOK := e.owners[request.RecordingID]
+		if request.Snapshot.Owner.RecordingID != request.RecordingID || !currentOK || current != request.Snapshot.Owner {
+			e.ownerMu.Unlock()
+			return nil, publicError("stale_owner", "recording ownership changed")
+		}
+		err := e.manager.ResumeHandover(request.RecordingID, request.Owner, request.Snapshot)
+		if err == nil {
+			e.owners[request.RecordingID] = request.Owner
+			owner = request.Owner
+		}
+		e.ownerMu.Unlock()
+		if err != nil {
+			return nil, handoverPublicError(err)
+		}
+		return handoverAck(request.RecordingID, e, &owner), nil
+	case OperationHandoverComplete:
+		var request HandoverOwnerRequest
+		if err := decodePayload(payload, &request); err != nil || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) {
+			return nil, publicError("invalid_request", "recording ownership identity is invalid")
+		}
+		if !e.hasCurrentOwner(request.Owner) {
+			return nil, publicError("stale_owner", "recording ownership changed")
+		}
+		err := e.manager.CompleteHandover(request.RecordingID, request.Owner)
+		if err == nil {
+			e.ownerMu.Lock()
+			if current, ok := e.owners[request.RecordingID]; !ok || current != request.Owner {
+				err = recordingowner.ErrStaleOwner
+			} else {
+				delete(e.owners, request.RecordingID)
+			}
+			e.ownerMu.Unlock()
+		}
+		if err != nil {
+			return nil, handoverPublicError(err)
+		}
+		return handoverAck(request.RecordingID, e, &request.Owner), nil
+	case OperationHandoverPrepareTarget:
+		var request HandoverTargetRequest
+		if err := decodePayload(payload, &request); err != nil || !e.validTargetIdentity(request.Target) || !validHandoverSnapshot(request.Snapshot, request.Snapshot.Owner) || (request.Snapshot.Owner.EngineGeneration == e.generation && request.Snapshot.Owner.WorkerInstance == e.instance) {
+			return nil, publicError("invalid_request", "target continuation request is invalid")
+		}
+		if _, owned := e.currentOwner(request.Snapshot.RecordingID); owned {
+			return nil, publicError("handover_rejected", "target engine already owns this recording")
+		}
+		if err := e.manager.PrepareHandoverTargetWithSourceState(ctx, request.Snapshot, request.Target, request.SourceDrained); err != nil {
+			return nil, handoverPublicError(err)
+		}
+		return handoverAck(request.Snapshot.RecordingID, e, &request.Snapshot.Owner), nil
+	case OperationHandoverActivateTarget:
+		var request HandoverTargetOwnerRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" || !e.validTargetIdentity(request.Target) || !e.validOwnerForThisEngine(request.RecordingID, request.Owner) || request.Owner.EngineGeneration != request.Target.EngineGeneration || request.Owner.WorkerInstance != request.Target.WorkerInstance {
+			return nil, publicError("invalid_request", "target ownership identity is invalid")
+		}
+		e.ownerMu.Lock()
+		if _, exists := e.owners[request.RecordingID]; exists {
+			e.ownerMu.Unlock()
+			return nil, publicError("handover_rejected", "target engine already owns this recording")
+		}
+		if err := e.manager.ActivatePreparedHandover(request.Owner); err != nil {
+			e.ownerMu.Unlock()
+			return nil, handoverPublicError(err)
+		}
+		e.owners[request.RecordingID] = request.Owner
+		e.ownerMu.Unlock()
+		return handoverAck(request.RecordingID, e, &request.Owner), nil
+	case OperationHandoverDiscardTarget:
+		var request HandoverTargetDiscardRequest
+		if err := decodePayload(payload, &request); err != nil || request.RecordingID == "" || !e.validTargetIdentity(request.Target) {
+			return nil, publicError("invalid_request", "target continuation identity is invalid")
+		}
+		if _, owned := e.currentOwner(request.RecordingID); owned {
+			return nil, publicError("handover_rejected", "an active target recording cannot be discarded")
+		}
+		if err := e.manager.DiscardPreparedHandover(request.RecordingID); err != nil {
+			return nil, handoverPublicError(err)
+		}
+		return handoverAck(request.RecordingID, e, nil), nil
 	default:
 		return nil, publicError("unsupported_operation", "runtime operation is not supported")
 	}
+}
+
+func (e *Engine) currentOwner(recordingID string) (recordingowner.Owner, bool) {
+	e.ownerMu.Lock()
+	defer e.ownerMu.Unlock()
+	owner, ok := e.owners[recordingID]
+	return owner, ok
+}
+
+// validOwnerForThisEngine checks the complete exact fencing tuple expected by
+// this process. Epoch is intentionally not compared to an internal counter:
+// the Host-owned token is authoritative and the acquire commit fence performs
+// the durable current-owner check.
+func (e *Engine) validOwnerForThisEngine(recordingID string, owner recordingowner.Owner) bool {
+	return validOwnerIdentity(recordingID, owner) && owner.EngineGeneration == e.generation && owner.WorkerInstance == e.instance
+}
+
+func (e *Engine) validTargetIdentity(target acquire.HandoverTargetIdentity) bool {
+	return target.EngineGeneration == e.generation && target.WorkerInstance == e.instance && target.EngineGeneration != "" && target.WorkerInstance != ""
+}
+
+func (e *Engine) hasCurrentOwner(expected recordingowner.Owner) bool {
+	e.ownerMu.Lock()
+	defer e.ownerMu.Unlock()
+	current, ok := e.owners[expected.RecordingID]
+	return ok && current == expected
+}
+
+func validOwnerIdentity(recordingID string, owner recordingowner.Owner) bool {
+	if recordingID == "" || owner.RecordingID != recordingID || owner.Epoch == 0 || len(recordingID) != 32 {
+		return false
+	}
+	for _, c := range recordingID {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return validHostIdentity(owner.EngineGeneration) && validHostIdentity(owner.WorkerInstance)
+}
+
+func validHostIdentity(value string) bool {
+	if len(value) == 32 || len(value) == 64 {
+		for _, c := range value {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+		return true
+	}
+	if len(value) != 36 {
+		return false
+	}
+	for i, c := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validHandoverSnapshot(snapshot acquire.HandoverSnapshot, expected recordingowner.Owner) bool {
+	if !validOwnerIdentity(snapshot.RecordingID, snapshot.Owner) || snapshot.Owner != expected || !adapterproto.IsValidIdentifier(snapshot.AdapterID) {
+		return false
+	}
+	if adapterproto.ValidateMediaSource(snapshot.Media, []string{"hls"}) != nil || adapterproto.ValidateResourceRef(snapshot.Resource) != nil {
+		return false
+	}
+	return true
+}
+
+func handoverAck(recordingID string, e *Engine, owner *recordingowner.Owner) HandoverResult {
+	return HandoverResult{RecordingID: recordingID, GenerationID: e.generation, InstanceID: e.instance, Owner: owner, Accepted: true}
+}
+
+func handoverPublicError(err error) error {
+	if errors.Is(err, recordingowner.ErrStaleOwner) {
+		return publicError("stale_owner", "recording ownership changed")
+	}
+	if errors.Is(err, acquire.ErrHandoverSourceRefreshRequired) {
+		return publicError("source_refresh_required", "source must be drained before refreshing continuation")
+	}
+	if errors.Is(err, acquire.ErrHandoverSourceBoundaryRequired) {
+		return publicError("source_boundary_required", "source must be drained before waiting for continuation media")
+	}
+	return publicError("handover_failed", "recording handover operation failed")
+}
+
+func (e *Engine) releaseOwner(ctx context.Context, owner recordingowner.Owner) error {
+	e.ownerMu.Lock()
+	defer e.ownerMu.Unlock()
+	if current, ok := e.owners[owner.RecordingID]; ok && current != owner {
+		return recordingowner.ErrStaleOwner
+	}
+	if _, released := e.releasedOwners[owner]; released {
+		return nil
+	}
+	if e.ownerClient == nil {
+		return errors.New("recording owner client is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	releaseCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := e.ownerClient.ReleaseRecording(releaseCtx, owner); err != nil {
+		return err
+	}
+	delete(e.owners, owner.RecordingID)
+	e.releasedOwners[owner] = struct{}{}
+	e.releasedOrder = append(e.releasedOrder, owner)
+	if len(e.releasedOrder) > maxReleasedOwnerHistory {
+		oldest := e.releasedOrder[0]
+		e.releasedOrder = e.releasedOrder[1:]
+		delete(e.releasedOwners, oldest)
+	}
+	return nil
 }
 
 func (e *Engine) activeRecordingCount(ctx context.Context) (int, error) {

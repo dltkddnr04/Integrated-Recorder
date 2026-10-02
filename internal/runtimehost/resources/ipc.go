@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 )
 
@@ -27,6 +28,8 @@ const (
 	operationSnapshot           = "resource_snapshot"
 	operationReportTelemetry    = "resource_report_telemetry"
 	operationTelemetrySnapshot  = "resource_telemetry_snapshot"
+	operationClaimRecording     = "resource_claim_recording"
+	operationReleaseRecording   = "resource_release_recording"
 )
 
 var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -35,7 +38,8 @@ var recordingIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
 // usage. Owner-wide lease cleanup remains an in-process Host operation that is
 // permitted only after the supervisor confirms child process death.
 type IPCHandler struct {
-	coordinator *Coordinator
+	coordinator    *Coordinator
+	ownerAuthority *RecordingOwnerAuthority
 }
 
 func NewIPCHandler(coordinator *Coordinator) (*IPCHandler, error) {
@@ -43,6 +47,13 @@ func NewIPCHandler(coordinator *Coordinator) (*IPCHandler, error) {
 		return nil, errors.New("runtime resource coordinator is required")
 	}
 	return &IPCHandler{coordinator: coordinator}, nil
+}
+
+func NewIPCHandlerWithRecordingOwners(coordinator *Coordinator, authority *RecordingOwnerAuthority) (*IPCHandler, error) {
+	if coordinator == nil || authority == nil {
+		return nil, errors.New("runtime resource coordinator and recording owner authority are required")
+	}
+	return &IPCHandler{coordinator: coordinator, ownerAuthority: authority}, nil
 }
 
 func (h *IPCHandler) Handle(ctx context.Context, operation string, payload json.RawMessage) (any, error) {
@@ -123,6 +134,31 @@ func (h *IPCHandler) Handle(ctx context.Context, operation string, payload json.
 			return nil, resourceIPCError("invalid_request", "telemetry snapshot request must be empty")
 		}
 		return h.coordinator.TelemetrySnapshot(), nil
+	case operationClaimRecording:
+		if h.ownerAuthority == nil {
+			return nil, resourceIPCError("recording_owner_unavailable", "recording ownership is unavailable")
+		}
+		var request recordingOwnerClaimRequest
+		if err := decodeResourceRequest(payload, &request); err != nil || validateIDs(request.OwnerID) != nil || (request.RecordingID != "" && !validRecordingID(request.RecordingID)) {
+			return nil, resourceIPCError("invalid_request", "recording owner request is invalid")
+		}
+		owner, err := h.ownerAuthority.Claim(request.OwnerID, request.RecordingID)
+		if err != nil {
+			return nil, ownerIPCError(err)
+		}
+		return owner, nil
+	case operationReleaseRecording:
+		if h.ownerAuthority == nil {
+			return nil, resourceIPCError("recording_owner_unavailable", "recording ownership is unavailable")
+		}
+		var request recordingOwnerReleaseRequest
+		if err := decodeResourceRequest(payload, &request); err != nil || validateIDs(request.OwnerID) != nil {
+			return nil, resourceIPCError("invalid_request", "recording owner release request is invalid")
+		}
+		if err := h.ownerAuthority.Release(request.OwnerID, request.Owner); err != nil {
+			return nil, ownerIPCError(err)
+		}
+		return emptyResult{}, nil
 	default:
 		return nil, resourceIPCError("unsupported_operation", "runtime resource operation is unsupported")
 	}
@@ -140,11 +176,29 @@ func NewIPCServer(socketPath string, token []byte, coordinator *Coordinator) (*r
 	return runtimeipc.NewServer(socketPath, IPCIdentity, token, handler)
 }
 
+func NewIPCServerWithRecordingOwners(socketPath string, token []byte, coordinator *Coordinator, authority *RecordingOwnerAuthority) (*runtimeipc.Server, error) {
+	handler, err := NewIPCHandlerWithRecordingOwners(coordinator, authority)
+	if err != nil {
+		return nil, err
+	}
+	return runtimeipc.NewServer(socketPath, IPCIdentity, token, handler)
+}
+
 type reservationRequest struct {
 	OwnerID       string `json:"owner_id"`
 	RecordingID   string `json:"recording_id"`
 	ReservationID string `json:"reservation_id"`
 	DesiredBytes  int64  `json:"desired_bytes"`
+}
+
+type recordingOwnerClaimRequest struct {
+	OwnerID     string `json:"owner_id"`
+	RecordingID string `json:"recording_id,omitempty"`
+}
+
+type recordingOwnerReleaseRequest struct {
+	OwnerID string               `json:"owner_id"`
+	Owner   recordingowner.Owner `json:"owner"`
 }
 
 type reservationReleaseRequest struct {
@@ -253,6 +307,31 @@ func (c *RuntimeClient) AcquireWriter(ctx context.Context, leaseID string) error
 	return c.wait(ctx, operationAcquireWriter, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID})
 }
 
+// ClaimRecording asks the Host to authorize one canonical Recording writer.
+// An empty ID lets the Host allocate the Recording ID. The process owner ID is
+// bound at RuntimeClient construction and cannot be chosen by the caller.
+func (c *RuntimeClient) ClaimRecording(ctx context.Context, recordingID string) (recordingowner.Owner, error) {
+	if recordingID != "" && !validRecordingID(recordingID) {
+		return recordingowner.Owner{}, errors.New("recording identity is invalid")
+	}
+	var owner recordingowner.Owner
+	if err := c.call(ctx, operationClaimRecording, recordingOwnerClaimRequest{OwnerID: c.ownerID, RecordingID: recordingID}, &owner); err != nil {
+		return recordingowner.Owner{}, err
+	}
+	if !validRecordingID(owner.RecordingID) || owner.EngineGeneration == "" || owner.WorkerInstance == "" || owner.Epoch == 0 || (recordingID != "" && owner.RecordingID != recordingID) {
+		return recordingowner.Owner{}, errors.New("recording owner response is invalid")
+	}
+	return owner, nil
+}
+
+// ReleaseRecording releases only the exact Host-issued owner tuple.
+func (c *RuntimeClient) ReleaseRecording(ctx context.Context, owner recordingowner.Owner) error {
+	if !validRecordingID(owner.RecordingID) || owner.EngineGeneration == "" || owner.WorkerInstance == "" || owner.Epoch == 0 {
+		return errors.New("recording owner identity is invalid")
+	}
+	return c.call(ctx, operationReleaseRecording, recordingOwnerReleaseRequest{OwnerID: c.ownerID, Owner: owner}, nil)
+}
+
 func (c *RuntimeClient) ReleaseWriter(ctx context.Context, leaseID string) error {
 	return c.call(ctx, operationReleaseWriter, leaseRequest{OwnerID: c.ownerID, LeaseID: leaseID}, nil)
 }
@@ -320,4 +399,6 @@ var _ interface {
 	ReportTelemetry(context.Context, uint64, uint64, uint64) error
 	ReportProcessTelemetry(context.Context, uint64, uint64, uint64, int64, float64) error
 	TelemetrySnapshot(context.Context) (TelemetrySnapshot, error)
+	ClaimRecording(context.Context, string) (recordingowner.Owner, error)
+	ReleaseRecording(context.Context, recordingowner.Owner) error
 } = (*RuntimeClient)(nil)

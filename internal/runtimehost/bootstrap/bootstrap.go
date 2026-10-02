@@ -26,11 +26,13 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
@@ -201,10 +203,22 @@ func Run(ctx context.Context, config Config) error {
 	defer listener.Close()
 
 	ipcDir := filepath.Join(config.DataDir, "runtime", "ipc")
+	hostBootID, err := newGenerationID()
+	if err != nil {
+		return errors.New("Runtime Host boot identity could not be created")
+	}
 	stateDir := filepath.Join(config.DataDir, "runtime", "state")
 	registry, err := generation.Open(filepath.Join(stateDir, "generations.json"))
 	if err != nil {
 		return fmt.Errorf("open generation registry: %w", err)
+	}
+	ownerStore, err := recordingowner.Open(config.DataDir)
+	if err != nil {
+		return fmt.Errorf("open recording owner store: %w", err)
+	}
+	ownerAuthority, err := resources.NewRecordingOwnerAuthority(ownerStore, registry)
+	if err != nil {
+		return fmt.Errorf("initialize recording owner authority: %w", err)
 	}
 	settings, err := systemsettings.Open(config.DataDir)
 	if err != nil {
@@ -223,15 +237,14 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	resourceSocket := filepath.Join(ipcDir, "r.sock")
-	resourceTokenPath := filepath.Join(ipcDir, "r.token")
-	if err := validateSocketPath(resourceSocket); err != nil {
+	resourceSocket, resourceTokenPath, err := resourceIPCPaths(ipcDir, hostBootID)
+	if err != nil {
 		return err
 	}
 	if err := writeAtomicPrivate(resourceTokenPath, resourceToken); err != nil {
 		return errors.New("runtime resource credential could not be secured")
 	}
-	resourceServer, err := resources.NewIPCServer(resourceSocket, resourceToken, coordinator)
+	resourceServer, err := resources.NewIPCServerWithRecordingOwners(resourceSocket, resourceToken, coordinator, ownerAuthority)
 	if err != nil {
 		return fmt.Errorf("create runtime resource IPC service: %w", err)
 	}
@@ -251,7 +264,15 @@ func Run(ctx context.Context, config Config) error {
 	lifecycle := newControlLifecycle()
 	sup, err := supervisor.New(supervisor.Options{
 		Launcher: launcher, Readiness: readiness, ControlLifecycle: lifecycle,
-		OnProcessExit:   func(spec supervisor.ProcessSpec, _ error) { releaseProcessResources(coordinator, spec) },
+		OnProcessExit: func(spec supervisor.ProcessSpec, _ error) {
+			releaseProcessResources(coordinator, spec)
+			if spec.Role == supervisor.RoleEngine {
+				_ = ownerAuthority.UnregisterEngine(
+					childEnvValue(spec.Env, "RUNTIME_RESOURCE_OWNER"), spec.GenerationID,
+					childEnvValue(spec.Env, "ENGINE_INSTANCE_ID"),
+				)
+			}
+		},
 		ShutdownTimeout: config.ShutdownTimeout, CleanupTimeout: 3 * time.Second,
 	})
 	if err != nil {
@@ -315,17 +336,11 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	engineSocket := filepath.Join(ipcDir, "e-"+generationID[:12]+".sock")
-	engineTokenPath := filepath.Join(ipcDir, "e-"+generationID[:12]+".token")
-	controlSocket := filepath.Join(ipcDir, "c-"+generationID[:12]+".sock")
-	controlTokenPath := filepath.Join(ipcDir, "c-"+generationID[:12]+".token")
+	engineSocket, engineTokenPath, controlSocket, controlTokenPath, err := generationIPCPaths(ipcDir, generationID, hostBootID)
+	if err != nil {
+		return err
+	}
 	catalogPath := filepath.Join(ipcDir, "engines.json")
-	if err := validateSocketPath(engineSocket); err != nil {
-		return err
-	}
-	if err := validateSocketPath(controlSocket); err != nil {
-		return err
-	}
 	for path, token := range map[string][]byte{engineTokenPath: engineToken, controlTokenPath: controlToken} {
 		if err := writeAtomicPrivate(path, token); err != nil {
 			return errors.New("generation IPC credential could not be secured")
@@ -335,6 +350,10 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
+	engineInstanceID, err := newGenerationID()
+	if err != nil {
+		return errors.New("Recorder Engine instance identity could not be created")
+	}
 	resourceEnv := []string{
 		"RUNTIME_RESOURCE_SOCKET_PATH=" + resourceSocket,
 		"RUNTIME_RESOURCE_TOKEN_FILE=" + resourceTokenPath,
@@ -342,14 +361,17 @@ func Run(ctx context.Context, config Config) error {
 	}
 	commonEnv := commonChildEnv(config, adapterSet.Directory)
 	engineRecoveryMode := initialEngineRecoveryMode(installState.Snapshot().State)
+	engineEnv := append(append(append([]string(nil), commonEnv...), resourceEnv...),
+		"ENGINE_SOCKET_PATH="+engineSocket,
+		"ENGINE_GENERATION_ID="+generationID,
+		"ENGINE_INSTANCE_ID="+engineInstanceID,
+		"ENGINE_RECOVERY_MODE="+engineRecoveryMode,
+		"ENGINE_IPC_TOKEN_FILE="+engineTokenPath)
+	engineEnv = append(engineEnv, runtimehook.ChildEnvironment()...)
 	engineSpec := supervisor.ProcessSpec{
 		GenerationID: generationID, Role: supervisor.RoleEngine,
 		Executable: selected.enginePath, Dir: selected.directory,
-		Env: append(append(append([]string(nil), commonEnv...), resourceEnv...),
-			"ENGINE_SOCKET_PATH="+engineSocket,
-			"ENGINE_GENERATION_ID="+generationID,
-			"ENGINE_RECOVERY_MODE="+engineRecoveryMode,
-			"ENGINE_IPC_TOKEN_FILE="+engineTokenPath),
+		Env: engineEnv,
 	}
 	readiness.register(generationID, supervisor.RoleEngine, engineSocket, engineTokenPath)
 	if needsRegistryStage {
@@ -372,6 +394,12 @@ func Run(ctx context.Context, config Config) error {
 	engineReady, err := readiness.engineIdentity(generationID)
 	if err != nil {
 		return fmt.Errorf("confirm Recorder Engine identity: %w", err)
+	}
+	if engineReady.InstanceID != engineInstanceID {
+		return errors.New("Recorder Engine readiness instance does not match Host launch identity")
+	}
+	if err := ownerAuthority.RegisterEngine(ownerID, generationID, engineReady.InstanceID); err != nil {
+		return fmt.Errorf("register Recorder Engine recording authority: %w", err)
 	}
 	drain := newEngineDrain()
 	if err := drain.register(generationID, engineSocket, engineTokenPath, engineReady.InstanceID); err != nil {
@@ -432,37 +460,32 @@ func Run(ctx context.Context, config Config) error {
 			_ = registry.Fail(generationID)
 			return fmt.Errorf("mark bundled generation ready: %w", err)
 		}
-	}
-	if err := sup.ActivateControl(startCtx, generationID); err != nil {
-		if needsRegistryStage {
-			_ = registry.Fail(generationID)
-		}
-		return fmt.Errorf("activate bundled Control Plane: %w", err)
-	}
-	if needsRegistryStage {
+		// Persist the candidate as the durable active generation while its
+		// Control process is still passive. Cold recovery can then reconcile all
+		// leases against this one authorized Engine generation before any
+		// background producer is enabled.
 		if err := registry.Activate(generationID); err != nil {
+			_ = registry.Fail(generationID)
 			return fmt.Errorf("persist bundled generation activation: %w", err)
 		}
+	}
+	if err := reconcileColdGenerationState(registry, engineRecoveryMode, generationID, true); err != nil {
+		return errors.New("recording generation leases could not be reconciled after cold recovery")
+	}
+	if err := sup.ActivateControl(startCtx, generationID); err != nil {
+		return fmt.Errorf("activate bundled Control Plane: %w", err)
 	}
 	if registry.Snapshot().ActivationPreviousGenerationID != "" {
 		if err := registry.FinalizeActivation(generationID); err != nil {
 			return fmt.Errorf("finalize recovered generation activation: %w", err)
 		}
 	}
-	// Engine recovery has made any pre-shutdown recordings terminal. Their
-	// leases belonged to processes that cannot survive a Runtime Host restart.
-	// Clear those stale host leases only after readiness proved the recovered
-	// Engine is serving the archive.
-	for recordingID, lease := range registry.Snapshot().Leases {
-		_ = registry.ReleaseRecording(recordingID, lease.EngineGeneration)
-	}
-
 	installer, err := install.NewInstaller(filepath.Join(config.DataDir, "runtime"), config.TrustedReleaseKeys, currentHostCompatibility())
 	if err != nil {
 		return fmt.Errorf("initialize immutable release installer: %w", err)
 	}
 	initialEngine := engineAttachment{
-		generationID: generationID, releaseDir: selected.directory, adapterSetID: adapterSet.ID, socketPath: engineSocket,
+		generationID: generationID, resourceOwnerID: ownerID, releaseDir: selected.directory, adapterSetID: adapterSet.ID, socketPath: engineSocket,
 		tokenPath: engineTokenPath, instanceID: engineReady.InstanceID, manifest: selected.manifest,
 	}
 	updates, err := newUpdateController(updateControllerOptions{
@@ -470,7 +493,7 @@ func Run(ctx context.Context, config Config) error {
 		Registry: registry, AdapterCatalog: adapterCatalog, Installation: installState,
 		Supervisor: sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
 		EngineDetacher: lifecycle,
-		Coordinator:    coordinator, Installer: installer, TrustedKeys: config.TrustedReleaseKeys,
+		Coordinator:    coordinator, OwnerAuthority: ownerAuthority, Installer: installer, TrustedKeys: config.TrustedReleaseKeys,
 		Compatibility: currentHostCompatibility(), SourceFactory: configuredReleaseSourceFactory(config, selected.appBuild),
 		Engines: []engineAttachment{initialEngine}, ActiveControlID: generationID,
 		ResourceSocket: resourceSocket, ResourceTokenPath: resourceTokenPath,
@@ -500,7 +523,10 @@ func Run(ctx context.Context, config Config) error {
 			case <-leaseCtx.Done():
 				return
 			case <-ticker.C:
-				callCtx, cancel := context.WithTimeout(leaseCtx, 15*time.Second)
+				// A lease pass may perform a bounded recording handover. Use the
+				// same operation budget as update activation so a slow but healthy
+				// source drain is not canceled and retried forever at 15 seconds.
+				callCtx, cancel := context.WithTimeout(leaseCtx, updateOperationTimeout)
 				_ = updates.ReconcileLeases(callCtx)
 				cancel()
 			}
@@ -588,6 +614,60 @@ func initialEngineRecoveryMode(state installation.State) string {
 		return "recover"
 	}
 	return "fresh"
+}
+
+type coldGenerationReconciler interface {
+	ReconcileColdStart(activeGenerationID string) error
+}
+
+// reconcileColdGenerationState is intentionally called only after the startup
+// Engine has passed its authenticated readiness check. In recover mode that
+// readiness follows WithFencedRecovery and mutating LoadAll, so clearing the
+// durable lease projection and detaching unreattached generations cannot
+// retire an archive that is still being recovered. Fresh setup startup does
+// not have authority to reconcile existing leases.
+func reconcileColdGenerationState(registry coldGenerationReconciler, recoveryMode, activeGenerationID string, engineReady bool) error {
+	if recoveryMode != "recover" {
+		return nil
+	}
+	if !engineReady || registry == nil || !generationPattern.MatchString(activeGenerationID) {
+		return errors.New("cold recovery has not completed")
+	}
+	return registry.ReconcileColdStart(activeGenerationID)
+}
+
+func resourceIPCPaths(ipcDir, hostBootID string) (socketPath, tokenPath string, err error) {
+	if !filepath.IsAbs(ipcDir) || filepath.Clean(ipcDir) != ipcDir || !generationPattern.MatchString(hostBootID) {
+		return "", "", errors.New("Runtime Host IPC identity is invalid")
+	}
+	// Keep the Unix socket basename well within platform limits even when the
+	// operator's DATA_DIR path is long. The suffix remains a 64-bit prefix of
+	// the fresh CSPRNG boot identity; credential filenames use the full ID.
+	bootSuffix := hostBootID[:16]
+	socketPath = filepath.Join(ipcDir, "r-"+bootSuffix+".sock")
+	tokenPath = filepath.Join(ipcDir, "r-"+hostBootID+".token")
+	if err := validateSocketPath(socketPath); err != nil || !filepath.IsAbs(tokenPath) || filepath.Clean(tokenPath) != tokenPath {
+		return "", "", errors.New("Runtime Host IPC path is invalid")
+	}
+	return socketPath, tokenPath, nil
+}
+
+func generationIPCPaths(ipcDir, generationID, hostBootID string) (engineSocket, engineToken, controlSocket, controlToken string, err error) {
+	if !filepath.IsAbs(ipcDir) || filepath.Clean(ipcDir) != ipcDir || !generationPattern.MatchString(generationID) || !generationPattern.MatchString(hostBootID) {
+		return "", "", "", "", errors.New("generation IPC identity is invalid")
+	}
+	bootSuffix := "-" + hostBootID[:16]
+	prefix := generationID[:12]
+	engineSocket = filepath.Join(ipcDir, "e-"+prefix+bootSuffix+".sock")
+	engineToken = filepath.Join(ipcDir, "e-"+prefix+bootSuffix+".token")
+	controlSocket = filepath.Join(ipcDir, "c-"+prefix+bootSuffix+".sock")
+	controlToken = filepath.Join(ipcDir, "c-"+prefix+bootSuffix+".token")
+	if validateSocketPath(engineSocket) != nil || validateSocketPath(controlSocket) != nil ||
+		!filepath.IsAbs(engineToken) || filepath.Clean(engineToken) != engineToken ||
+		!filepath.IsAbs(controlToken) || filepath.Clean(controlToken) != controlToken {
+		return "", "", "", "", errors.New("generation IPC path is invalid")
+	}
+	return engineSocket, engineToken, controlSocket, controlToken, nil
 }
 
 // releaseEngineResources is retained as a narrow helper for older package

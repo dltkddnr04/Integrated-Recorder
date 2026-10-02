@@ -36,7 +36,7 @@ func main() {
 
 func serve(input io.Reader, output io.Writer) error {
 	reader := bufio.NewReaderSize(input, 32<<10)
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 12 * time.Second}
 	for {
 		request, err := adapterproto.ReadRequest(reader)
 		if errors.Is(err, io.EOF) {
@@ -210,7 +210,7 @@ func mediaParts(raw string) (string, string, string, error) {
 }
 
 func getJSON(client *http.Client, endpoint string, target any) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {

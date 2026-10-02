@@ -50,10 +50,19 @@ func (ExecLauncher) Start(ctx context.Context, spec ProcessSpec) (Child, error) 
 	// capture unbounded output or relay it to Runtime Host logs.
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
+	childOutput, closeChildOutput, err := runtimeE2EChildOutput(spec)
+	if err != nil {
+		return nil, err
+	}
+	if childOutput != nil {
+		cmd.Stdout = childOutput
+		cmd.Stderr = childOutput
+	}
 	if err := cmd.Start(); err != nil {
+		closeChildOutput()
 		return nil, errors.New("runtime child process could not be started")
 	}
-	child := &execChild{cmd: cmd, done: make(chan struct{}), stopGate: make(chan struct{}, 1)}
+	child := &execChild{cmd: cmd, done: make(chan struct{}), stopGate: make(chan struct{}, 1), closeOutput: closeChildOutput}
 	go child.wait()
 	return child, nil
 }
@@ -139,16 +148,20 @@ func childEnvironment(overrides []string) ([]string, error) {
 }
 
 type execChild struct {
-	cmd      *exec.Cmd
-	done     chan struct{}
-	stopGate chan struct{}
-	once     sync.Once
-	mu       sync.RWMutex
-	err      error
+	cmd         *exec.Cmd
+	done        chan struct{}
+	stopGate    chan struct{}
+	closeOutput func()
+	once        sync.Once
+	mu          sync.RWMutex
+	err         error
 }
 
 func (c *execChild) wait() {
 	err := c.cmd.Wait()
+	if c.closeOutput != nil {
+		c.closeOutput()
+	}
 	c.mu.Lock()
 	c.err = err
 	c.mu.Unlock()

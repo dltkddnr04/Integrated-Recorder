@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -12,15 +14,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dltkddnr04/integrated-recorder/internal/acquire"
 	"github.com/dltkddnr04/integrated-recorder/internal/buildinfo"
 	"github.com/dltkddnr04/integrated-recorder/internal/controlplane"
 	"github.com/dltkddnr04/integrated-recorder/internal/recorderengine"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehook"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/generation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/leases"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
@@ -74,13 +79,14 @@ type EngineDetacher interface {
 // engineAttachment is private Host runtime state. Paths and tokens in this
 // value are never projected through the update API.
 type engineAttachment struct {
-	generationID string
-	releaseDir   string
-	adapterSetID string
-	socketPath   string
-	tokenPath    string
-	instanceID   string
-	manifest     *release.Manifest
+	generationID    string
+	resourceOwnerID string
+	releaseDir      string
+	adapterSetID    string
+	socketPath      string
+	tokenPath       string
+	instanceID      string
+	manifest        *release.Manifest
 }
 
 type updateControllerOptions struct {
@@ -96,6 +102,7 @@ type updateControllerOptions struct {
 	Drain             engineDrainRegistrar
 	EngineDetacher    EngineDetacher
 	Coordinator       *resources.Coordinator
+	OwnerAuthority    *resources.RecordingOwnerAuthority
 	Installer         *install.Installer
 	TrustedKeys       map[string]ed25519.PublicKey
 	Compatibility     release.HostCompatibility
@@ -123,6 +130,7 @@ type updateController struct {
 	drain             engineDrainRegistrar
 	engineDetacher    EngineDetacher
 	coordinator       *resources.Coordinator
+	ownerAuthority    *resources.RecordingOwnerAuthority
 	installer         *install.Installer
 	trustedKeys       map[string]ed25519.PublicKey
 	compatibility     release.HostCompatibility
@@ -207,7 +215,8 @@ func newUpdateController(options updateControllerOptions) (*updateController, er
 		registry: options.Registry, adapterCatalog: options.AdapterCatalog, installation: options.Installation,
 		supervisor: options.Supervisor, readiness: options.Readiness,
 		lifecycle: options.Lifecycle, drain: options.Drain, engineDetacher: options.EngineDetacher, coordinator: options.Coordinator,
-		installer: options.Installer, trustedKeys: keys, compatibility: options.Compatibility,
+		ownerAuthority: options.OwnerAuthority,
+		installer:      options.Installer, trustedKeys: keys, compatibility: options.Compatibility,
 		sourceFactory: options.SourceFactory, resourceSocket: options.ResourceSocket,
 		catalogWriter:     options.CatalogWriter,
 		resourceTokenPath: options.ResourceTokenPath, operationTimeout: options.OperationTimeout,
@@ -712,8 +721,12 @@ func (c *updateController) ReconcileLeases(ctx context.Context) error {
 	attachments := c.EngineAttachments()
 	sup := c.supervisor.Snapshot()
 	ready := make(map[string]bool, len(sup.Generations))
+	processStates := make(map[string]supervisor.ProcessState, len(sup.Generations))
+	processIDs := make([]string, 0, len(sup.Generations))
 	for _, process := range sup.Generations {
 		ready[process.ID] = process.Engine.State == supervisor.ProcessReady
+		processStates[process.ID] = process.Engine.State
+		processIDs = append(processIDs, process.ID)
 	}
 	eligible := make(map[string]engineAttachment)
 	for _, attachment := range attachments {
@@ -726,7 +739,11 @@ func (c *updateController) ReconcileLeases(ctx context.Context) error {
 		source = leases.InventorySourceFunc(func(ctx context.Context, engine generation.Generation) (generation.EngineInventory, error) {
 			attachment, ok := eligible[engine.ID]
 			if !ok {
-				return generation.EngineInventory{}, errors.New("engine inventory endpoint is unavailable")
+				attachmentIDs := make([]string, 0, len(attachments))
+				for _, item := range attachments {
+					attachmentIDs = append(attachmentIDs, item.generationID)
+				}
+				return generation.EngineInventory{}, fmt.Errorf("engine inventory endpoint is unavailable (generation=%s process_state=%s process_ids=%v attachment_ids=%v)", engine.ID, processStates[engine.ID], processIDs, attachmentIDs)
 			}
 			secret, err := controlplane.LoadPrivateIPCSecret(attachment.tokenPath)
 			if err != nil {
@@ -746,19 +763,340 @@ func (c *updateController) ReconcileLeases(ctx context.Context) error {
 			}
 			result := generation.EngineInventory{Confirmed: true, EngineGeneration: engine.ID, WorkerInstance: inventory.InstanceID, ObservedAt: time.Now().UTC(), Recordings: make([]generation.InventoryRecording, 0, len(inventory.Active))}
 			for _, active := range inventory.Active {
+				if c.ownerAuthority != nil {
+					if active.Owner == nil {
+						return generation.EngineInventory{}, errors.New("engine inventory omitted recording owner")
+					}
+					if !c.ownerAuthority.MatchesDurableOwner(*active.Owner) {
+						// A parked source can remain visible briefly after the Host has
+						// transferred its durable owner. Do not let stale inventory
+						// move the retirement lease back to that source.
+						leaseState := c.registry.Snapshot().Leases[active.RecordingID]
+						if leaseState.EngineGeneration != "" && leaseState.EngineGeneration != engine.ID && active.Owner.EngineGeneration == engine.ID {
+							// A lost response to the source-detach IPC is retried here.
+							// CompleteHandover is accepted only for a parked stale worker;
+							// the Engine independently checks the durable owner fence.
+							_ = manager.CompleteHandover(ctx, active.RecordingID, *active.Owner)
+						}
+						continue
+					}
+				}
 				result.Recordings = append(result.Recordings, generation.InventoryRecording{RecordingID: active.RecordingID, StartedAt: active.StartedAt})
 			}
 			return result, nil
 		})
 	}
-	reconciler, err := leases.New(c.registry, source)
+	reconcile := func(protected []generation.Lease) error {
+		protectedByGeneration := make(map[string][]generation.Lease)
+		for _, lease := range protected {
+			protectedByGeneration[lease.EngineGeneration] = append(protectedByGeneration[lease.EngineGeneration], lease)
+		}
+		protectedSource := leases.InventorySourceFunc(func(ctx context.Context, engine generation.Generation) (generation.EngineInventory, error) {
+			inventory, err := source.Inventory(ctx, engine)
+			if err != nil {
+				return generation.EngineInventory{}, err
+			}
+			seen := make(map[string]struct{}, len(inventory.Recordings))
+			for _, item := range inventory.Recordings {
+				seen[item.RecordingID] = struct{}{}
+			}
+			for _, lease := range protectedByGeneration[engine.ID] {
+				if lease.WorkerInstance != inventory.WorkerInstance {
+					continue
+				}
+				if _, present := seen[lease.RecordingID]; present {
+					continue
+				}
+				inventory.Recordings = append(inventory.Recordings, generation.InventoryRecording{RecordingID: lease.RecordingID, StartedAt: lease.StartedAt})
+			}
+			return inventory, nil
+		})
+		reconciler, err := leases.New(c.registry, protectedSource)
+		if err != nil {
+			return err
+		}
+		return reconciler.RunOnce(ctx)
+	}
+	if c.ownerAuthority != nil {
+		if err := c.ownerAuthority.WithProtectedLeases(reconcile); err != nil {
+			return err
+		}
+	} else if err := reconcile(nil); err != nil {
+		return err
+	}
+	// Application activation and per-Recording handover are separate failure
+	// domains. Try at most one eligible Recording per inventory pass; a failed
+	// target leaves the source Engine as owner and does not roll back the active
+	// application generation.
+	if err := c.handoverOneDrainingRecording(ctx, eligible); err != nil {
+		slog.Warn("active recording handover failed; source ownership retained when provable",
+			"stage", "orchestration", "code", "handover_failed")
+	}
+	return c.retireSafeGenerations(ctx)
+}
+
+// handoverOneDrainingRecording transfers at most one Recording from a draining
+// Engine to the active Engine during a reconciliation pass. Adapter Protocol
+// v1 has no compatibility declaration for changing an adapter binary while a
+// Recording is live, so the immutable adapter-set identity must be identical.
+func (c *updateController) handoverOneDrainingRecording(ctx context.Context, ready map[string]engineAttachment) error {
+	if c.ownerAuthority == nil || ctx == nil {
+		return nil
+	}
+	registryState := c.registry.Snapshot()
+	targetID := registryState.ActiveGenerationID
+	target, ok := ready[targetID]
+	if !ok || targetID == "" || target.adapterSetID == "" {
+		return nil
+	}
+	targetGeneration, ok := registryState.Generations[targetID]
+	if !ok || targetGeneration.State != generation.StateActive {
+		return nil
+	}
+
+	sourceIDs := make([]string, 0, len(registryState.Generations))
+	for id, sourceGeneration := range registryState.Generations {
+		if id == targetID || sourceGeneration.State != generation.StateDraining || sourceGeneration.AdapterSetID == "" || sourceGeneration.AdapterSetID != targetGeneration.AdapterSetID {
+			continue
+		}
+		if _, live := ready[id]; live {
+			sourceIDs = append(sourceIDs, id)
+		}
+	}
+	sort.Strings(sourceIDs)
+	for _, sourceID := range sourceIDs {
+		leases := make([]generation.Lease, 0)
+		for _, lease := range registryState.Leases {
+			if lease.EngineGeneration == sourceID {
+				leases = append(leases, lease)
+			}
+		}
+		sort.Slice(leases, func(i, j int) bool { return leases[i].RecordingID < leases[j].RecordingID })
+		for _, lease := range leases {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			owner, err := c.ownerAuthority.CurrentOwner(lease.RecordingID)
+			if err != nil || owner.EngineGeneration != sourceID || owner.WorkerInstance != lease.WorkerInstance {
+				continue
+			}
+			source := ready[sourceID]
+			if err := c.handoverRecording(ctx, source, target, lease, owner); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+func (c *updateController) handoverRecording(ctx context.Context, source, target engineAttachment, lease generation.Lease, owner recordingowner.Owner) error {
+	started := time.Now()
+	stage := "inventory"
+	defer func() {
+		// Error details can contain adapter-controlled strings, so this event
+		// records only bounded identities and a stable safe code.
+		if stage != "complete" && stage != "aborted" {
+			slog.Warn("recording handover_failed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "stage", stage, "code", "handover_failed", "duration_ms", time.Since(started).Milliseconds())
+		}
+	}()
+	sourceManager, err := c.engineManagerClient(source)
 	if err != nil {
 		return err
 	}
-	if err := reconciler.RunOnce(ctx); err != nil {
+	targetManager, err := c.engineManagerClient(target)
+	if err != nil {
 		return err
 	}
-	return c.retireSafeGenerations(ctx)
+	sourceInventory, err := sourceManager.Inventory(ctx)
+	if err != nil || sourceInventory.GenerationID != source.generationID || sourceInventory.InstanceID != source.instanceID || !inventoryHasOwner(sourceInventory, lease.RecordingID, owner) {
+		return errors.New("source Engine ownership inventory could not be confirmed")
+	}
+	targetInventory, err := targetManager.Inventory(ctx)
+	if err != nil || targetInventory.GenerationID != target.generationID || targetInventory.InstanceID != target.instanceID || inventoryHasRecording(targetInventory, lease.RecordingID) {
+		return errors.New("target Engine readiness inventory could not be confirmed")
+	}
+
+	snapshot, err := sourceManager.HandoverSnapshot(ctx, lease.RecordingID, owner)
+	if err != nil || snapshot.Owner != owner || snapshot.RecordingID != lease.RecordingID {
+		return errors.New("source Engine continuation snapshot could not be confirmed")
+	}
+	targetIdentity := acquire.HandoverTargetIdentity{EngineGeneration: target.generationID, WorkerInstance: target.instanceID}
+	stage = "prepare_target"
+	slog.Info("recording handover_prepare_started", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch)
+	if err := runtimehook.Pause(runtimehook.BeforeTargetPrepare, lease.RecordingID); err != nil {
+		return errors.New("target preparation failpoint failed")
+	}
+	paused := false
+	committed := false
+	pausedSnapshot := snapshot
+	defer func() {
+		if !committed {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = targetManager.DiscardPreparedHandover(cleanupCtx, lease.RecordingID, targetIdentity)
+			if paused {
+				current, currentErr := c.ownerAuthority.CurrentOwner(lease.RecordingID)
+				if currentErr == nil && current.EngineGeneration == source.generationID && current.WorkerInstance == source.instanceID {
+					_ = sourceManager.ResumeHandover(cleanupCtx, lease.RecordingID, current, pausedSnapshot)
+				}
+			}
+		}
+	}()
+
+	drainSource := func() (acquire.HandoverSnapshot, error) {
+		drainStarted := time.Now()
+		slog.Info("recording handover_source_drain_started", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "stage", "source_drain")
+		pauseCtx, cancelPause := context.WithTimeout(ctx, c.operationTimeout)
+		defer cancelPause()
+		finalSnapshot, pauseErr := sourceManager.PauseForHandover(pauseCtx, lease.RecordingID, owner)
+		if pauseErr != nil || finalSnapshot.Owner != owner {
+			return acquire.HandoverSnapshot{}, errors.New("source Engine could not reach a drained handover boundary")
+		}
+		paused = true
+		pausedSnapshot = finalSnapshot
+		slog.Info("recording handover_source_drained", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "stage", "source_drain", "duration_ms", time.Since(drainStarted).Milliseconds())
+		if err := runtimehook.Pause(runtimehook.AfterSourceDrain, lease.RecordingID); err != nil {
+			return acquire.HandoverSnapshot{}, errors.New("source drain failpoint failed")
+		}
+		return finalSnapshot, nil
+	}
+	preparedErr := targetManager.PrepareHandoverTarget(ctx, snapshot, targetIdentity)
+	var finalSnapshot acquire.HandoverSnapshot
+	if errors.Is(preparedErr, acquire.ErrHandoverSourceRefreshRequired) || errors.Is(preparedErr, acquire.ErrHandoverSourceBoundaryRequired) {
+		// Adapter Protocol v1 does not guarantee refresh idempotence, and a live
+		// manifest at the already-committed tail cannot prove continuation. Drain
+		// the source first, then repeat the complete target readiness proof.
+		stage = "source_drain"
+		finalSnapshot, err = drainSource()
+		if err != nil {
+			return err
+		}
+		stage = "prepare_drained_target"
+		if err := targetManager.DiscardPreparedHandover(ctx, lease.RecordingID, targetIdentity); err != nil {
+			return err
+		}
+		if err := targetManager.PrepareHandoverTargetAfterSourceDrain(ctx, finalSnapshot, targetIdentity); err != nil {
+			return err
+		}
+	} else {
+		if preparedErr != nil {
+			return preparedErr
+		}
+		// Keep the usual optimistic path: the target prepares while the source
+		// remains live. Then drain, discard the stale speculative payload and
+		// prove continuation again from the final canonical boundary.
+		stage = "source_drain"
+		finalSnapshot, err = drainSource()
+		if err != nil {
+			return err
+		}
+		stage = "prepare_drained_target"
+		if err := targetManager.DiscardPreparedHandover(ctx, lease.RecordingID, targetIdentity); err != nil {
+			return err
+		}
+		if err := targetManager.PrepareHandoverTargetAfterSourceDrain(ctx, finalSnapshot, targetIdentity); err != nil {
+			return err
+		}
+	}
+	stage = "commit_owner"
+	slog.Info("recording handover_target_ready", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", owner.Epoch, "duration_ms", time.Since(started).Milliseconds())
+	if err := runtimehook.Pause(runtimehook.AfterTargetReady, lease.RecordingID); err != nil {
+		return errors.New("target readiness failpoint failed")
+	}
+	if err := runtimehook.Pause(runtimehook.BeforeOwnerCAS, lease.RecordingID); err != nil {
+		return errors.New("owner transfer failpoint failed")
+	}
+
+	targetOwner, transferErr := c.ownerAuthority.Transfer(owner, target.resourceOwnerID)
+	if transferErr != nil {
+		// Transfer can report a projection failure after the durable owner file
+		// changed. The in-memory Host authority is consulted before any source
+		// resume; a stale token is never reused.
+		current, currentErr := c.ownerAuthority.CurrentOwner(lease.RecordingID)
+		if currentErr == nil && current.EngineGeneration == source.generationID && current.WorkerInstance == source.instanceID {
+			if current != owner {
+				owner = current
+			}
+		}
+		return transferErr
+	}
+	committed = true
+	if err := runtimehook.Pause(runtimehook.BeforeTargetActivation, lease.RecordingID); err != nil {
+		return errors.New("target activation failpoint failed after durable ownership transfer")
+	}
+	// Once the durable owner changes, finish or reverse that transaction even
+	// if the periodic reconciliation context is canceled during shutdown.
+	postCommitCtx, cancelPostCommit := context.WithTimeout(context.Background(), c.operationTimeout)
+	defer cancelPostCommit()
+	stage = "activate_target"
+	activateErr := targetManager.ActivatePreparedHandover(postCommitCtx, targetOwner, targetIdentity)
+	if activateErr != nil {
+		// An IPC timeout is ambiguous. First fence the target back to the paused
+		// source with a newer epoch. The shared canonical commit lock makes this
+		// wait for any target write already in progress and reject all future ones.
+		stage = "rollback_owner"
+		restoredOwner, rollbackErr := c.ownerAuthority.RollbackTransfer(targetOwner, source.resourceOwnerID)
+		if rollbackErr != nil {
+			return errors.New("target activation was ambiguous and source recovery could not be proven")
+		}
+		_ = targetManager.CompleteHandover(postCommitCtx, lease.RecordingID, targetOwner)
+		if err := sourceManager.ResumeHandover(postCommitCtx, lease.RecordingID, restoredOwner, finalSnapshot); err != nil {
+			return errors.New("target was fenced but paused source could not resume")
+		}
+		committed = false
+		paused = false
+		stage = "aborted"
+		slog.Info("recording handover_aborted", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", restoredOwner.Epoch, "stage", stage, "duration_ms", time.Since(started).Milliseconds())
+		return errors.New("target activation failed; source resumed after a higher-epoch rollback")
+	}
+	stage = "complete_source"
+	if err := runtimehook.Pause(runtimehook.BeforeSourceRetirement, lease.RecordingID); err != nil {
+		return errors.New("source retirement failpoint failed after target activation")
+	}
+	if err := sourceManager.CompleteHandover(postCommitCtx, lease.RecordingID, owner); err != nil {
+		// The target has the durable owner and source's old token remains fenced.
+		// The next inventory pass must confirm the target before retirement.
+		return errors.New("target owns the Recording but source detachment is incomplete")
+	}
+	committed = true
+	stage = "complete"
+	slog.Info("recording handover_committed", "recording_id", lease.RecordingID, "source_generation", source.generationID, "target_generation", target.generationID, "ownership_epoch", targetOwner.Epoch, "duration_ms", time.Since(started).Milliseconds())
+	return nil
+}
+
+func (c *updateController) engineManagerClient(attachment engineAttachment) (*recorderengine.ManagerClient, error) {
+	secret, err := controlplane.LoadPrivateIPCSecret(attachment.tokenPath)
+	if err != nil {
+		return nil, errors.New("Recorder Engine credential is unavailable")
+	}
+	client, err := runtimeipc.NewClientForInstance(attachment.socketPath, attachment.generationID, attachment.instanceID, secret, 3*time.Second)
+	if err != nil {
+		return nil, errors.New("Recorder Engine IPC endpoint is unavailable")
+	}
+	manager, err := recorderengine.NewManagerClient(client)
+	if err != nil {
+		return nil, errors.New("Recorder Engine manager client is unavailable")
+	}
+	return manager, nil
+}
+
+func inventoryHasOwner(inventory recorderengine.InventoryResult, recordingID string, owner recordingowner.Owner) bool {
+	for _, row := range inventory.Active {
+		if row.RecordingID == recordingID {
+			return row.Owner != nil && *row.Owner == owner
+		}
+	}
+	return false
+}
+
+func inventoryHasRecording(inventory recorderengine.InventoryResult, recordingID string) bool {
+	for _, row := range inventory.Active {
+		if row.RecordingID == recordingID {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *updateController) retireSafeGenerations(ctx context.Context) error {
@@ -1285,6 +1623,10 @@ func (c *updateController) startEngine(ctx context.Context, id, directory string
 		return engineAttachment{}, errors.New("generation resource owner identity could not be created")
 	}
 	owner := "e" + id + "-" + ownerNonce
+	engineInstanceID, err := newGenerationID()
+	if err != nil {
+		return engineAttachment{}, errors.New("Recorder Engine instance identity could not be created")
+	}
 	gen, ok := c.registry.Snapshot().Generations[id]
 	if !ok {
 		return engineAttachment{}, errors.New("Recorder Engine generation is unavailable")
@@ -1295,17 +1637,24 @@ func (c *updateController) startEngine(ctx context.Context, id, directory string
 	}
 	env := commonChildEnv(c.config, adapterDir)
 	env = append(env, "RUNTIME_RESOURCE_SOCKET_PATH="+c.resourceSocket, "RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath, "RUNTIME_RESOURCE_OWNER="+owner)
-	env = append(env, "ENGINE_SOCKET_PATH="+socket, "ENGINE_GENERATION_ID="+id, "ENGINE_RECOVERY_MODE=fresh", "ENGINE_IPC_TOKEN_FILE="+tokenPath)
+	env = append(env, "ENGINE_SOCKET_PATH="+socket, "ENGINE_GENERATION_ID="+id, "ENGINE_INSTANCE_ID="+engineInstanceID, "ENGINE_RECOVERY_MODE=fresh", "ENGINE_IPC_TOKEN_FILE="+tokenPath)
+	env = append(env, runtimehook.ChildEnvironment()...)
 	spec := supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleEngine, Executable: executable, Dir: directory, Env: env}
 	c.readiness.register(id, supervisor.RoleEngine, socket, tokenPath)
 	if err := c.supervisor.StartEngine(ctx, spec); err != nil {
 		return engineAttachment{}, err
 	}
 	ready, err := c.readiness.engineIdentity(id)
-	if err != nil || !ready.Ready || ready.GenerationID != id || ready.InstanceID == "" || ready.ProtocolVersion != runtimeipc.ProtocolVersion {
+	if err != nil || !ready.Ready || ready.GenerationID != id || ready.ProtocolVersion != runtimeipc.ProtocolVersion ||
+		(c.ownerAuthority != nil && ready.InstanceID != engineInstanceID) {
 		return engineAttachment{}, errors.New("Recorder Engine readiness identity is invalid")
 	}
-	attachment := engineAttachment{generationID: id, releaseDir: directory, adapterSetID: gen.AdapterSetID, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
+	if c.ownerAuthority != nil {
+		if err := c.ownerAuthority.RegisterEngine(owner, id, ready.InstanceID); err != nil {
+			return engineAttachment{}, errors.New("Recorder Engine resource identity could not be registered")
+		}
+	}
+	attachment := engineAttachment{generationID: id, resourceOwnerID: owner, releaseDir: directory, adapterSetID: gen.AdapterSetID, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
 	if manifest.ReleaseVersion != "" {
 		copyManifest := manifest
 		attachment.manifest = &copyManifest
