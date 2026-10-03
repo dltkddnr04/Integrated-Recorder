@@ -52,6 +52,10 @@ adapter sets. The application generation is the pair `(application release,
 adapter set)`, so local adapter additions, updates, and removals activate a
 new generation without restarting the Host or container. Existing Recordings
 remain pinned to their Engine and adapter artifacts until their leases drain.
-This local restartless lifecycle is implemented. A remote Plugin Store,
-remote plugin catalog/download/signature flow, and automatic remote adapter
-updates are separate follow-on work and are not implemented.
+This local restartless lifecycle is implemented. Plugin Registry v1 also
+supports operator-configured curated HTTPS catalogs and manual artifact
+install/update through the same immutable import path. The registry pins
+artifact size and SHA-256; publisher PKI/signatures, a community registry
+service, and automatic remote adapter updates remain follow-on work. See
+[`PLUGIN_REGISTRY_V1.md`](PLUGIN_REGISTRY_V1.md) for the schema and runtime
+contract.

@@ -21,6 +21,8 @@ type fakeController struct {
 	err           error
 	adapterResult AdapterReconcileResult
 	adapterErr    error
+	pluginStatus  PluginStatus
+	pluginErr     error
 	calls         map[string]int
 }
 
@@ -43,6 +45,37 @@ func (f *fakeController) ReconcileAdapters(context.Context) (AdapterReconcileRes
 	}
 	f.calls["reconcile_adapters"]++
 	return f.adapterResult, f.adapterErr
+}
+func (f *fakeController) pluginCall(name string) (PluginStatus, error) {
+	if f.calls == nil {
+		f.calls = make(map[string]int)
+	}
+	f.calls[name]++
+	return f.pluginStatus, f.pluginErr
+}
+func (f *fakeController) PluginStatus(context.Context) (PluginStatus, error) {
+	return f.pluginCall("plugin_status")
+}
+func (f *fakeController) RefreshPlugins(context.Context) (PluginStatus, error) {
+	return f.pluginCall("plugin_refresh")
+}
+func (f *fakeController) InstallPlugin(_ context.Context, id string) (PluginStatus, error) {
+	if id != "demo" {
+		return PluginStatus{}, NewControllerError("plugin_not_found")
+	}
+	return f.pluginCall("plugin_install")
+}
+func (f *fakeController) UpdatePlugin(_ context.Context, id string) (PluginStatus, error) {
+	if id != "demo" {
+		return PluginStatus{}, NewControllerError("plugin_not_found")
+	}
+	return f.pluginCall("plugin_update")
+}
+func (f *fakeController) UninstallPlugin(_ context.Context, id string) (PluginStatus, error) {
+	if id != "demo" {
+		return PluginStatus{}, NewControllerError("plugin_not_found")
+	}
+	return f.pluginCall("plugin_uninstall")
 }
 
 type authFixture struct {
@@ -144,6 +177,84 @@ func TestRoutesDispatchAndFallback(t *testing.T) {
 		if controller.calls[name] != 1 {
 			t.Errorf("controller %s calls = %d, want 1", name, controller.calls[name])
 		}
+	}
+}
+
+func TestPluginRoutesDispatchAndRejectMalformedIdentifiers(t *testing.T) {
+	controller := &fakeController{pluginStatus: PluginStatus{State: "ready", Plugins: []PluginStatusItem{{ID: "demo", Name: "Demo", AvailableVersion: "1.2.0", Installed: false}}}}
+	api, err := New(nil, true, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{http.MethodGet, PluginsEndpoint, "", http.StatusOK},
+		{http.MethodPost, PluginsEndpoint + "/refresh", `{}`, http.StatusOK},
+		{http.MethodPost, PluginsEndpoint + "/demo/install", `{}`, http.StatusOK},
+		{http.MethodPost, PluginsEndpoint + "/demo/update", `{}`, http.StatusOK},
+		{http.MethodDelete, PluginsEndpoint + "/demo", `{}`, http.StatusOK},
+		{http.MethodPost, PluginsEndpoint + "/../install", `{}`, http.StatusNotFound},
+		{http.MethodPost, PluginsEndpoint + "/demo/install", `{"url":"https://example.invalid/plugin"}`, http.StatusBadRequest},
+	} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		if tc.body != "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		api.ServeHTTP(recorder, request)
+		if recorder.Code != tc.want {
+			t.Errorf("%s %s status = %d, want %d (%s)", tc.method, tc.path, recorder.Code, tc.want, recorder.Body.String())
+		}
+	}
+	for _, name := range []string{"plugin_status", "plugin_refresh", "plugin_install", "plugin_update", "plugin_uninstall"} {
+		if controller.calls[name] != 1 {
+			t.Errorf("controller %s calls = %d, want 1", name, controller.calls[name])
+		}
+	}
+}
+
+func TestPluginStatusAcceptsMaximumRegistryVersionLength(t *testing.T) {
+	version := strings.Repeat("v", 128)
+	status := PluginStatus{State: "ready", Plugins: []PluginStatusItem{{
+		ID: "demo", Name: "Demo", AvailableVersion: version, InstalledVersion: "v", Installed: true, UpdateAvailable: true,
+	}}}
+	if err := status.Validate(); err != nil {
+		t.Fatalf("valid bounded registry version rejected: %v", err)
+	}
+}
+
+func TestPluginMutationRequiresAuthenticationAndCSRF(t *testing.T) {
+	fixture := testAuth(t)
+	controller := &fakeController{pluginStatus: PluginStatus{State: "ready", Plugins: []PluginStatusItem{}}}
+	api, err := New(fixture.service, false, false, controller, http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(token, csrf string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, PluginsEndpoint+"/refresh", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.AddCookie(&http.Cookie{Name: authn.SessionCookieName, Value: token})
+		}
+		if csrf != "" {
+			req.Header.Set("X-CSRF-Token", csrf)
+		}
+		api.ServeHTTP(recorder, req)
+		return recorder
+	}
+	if got := request("", "").Code; got != http.StatusUnauthorized {
+		t.Fatalf("anonymous refresh status = %d", got)
+	}
+	if got := request(fixture.session.Token, "bad").Code; got != http.StatusForbidden {
+		t.Fatalf("bad CSRF refresh status = %d", got)
+	}
+	if got := request(fixture.session.Token, fixture.session.CSRFToken).Code; got != http.StatusOK {
+		t.Fatalf("authenticated refresh status = %d", got)
 	}
 }
 

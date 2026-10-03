@@ -7,6 +7,7 @@ services:
       ADDR: ":8080"
       DATA_DIR: /data
       ADAPTER_DIR: /adapters:/external-adapters
+      IR_PLUGIN_REGISTRY_URL: ${IR_PLUGIN_REGISTRY_URL:-}
     volumes:
       - recording-data:/data
       - ./adapter-binaries:/external-adapters:ro

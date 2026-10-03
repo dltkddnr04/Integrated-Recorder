@@ -340,6 +340,19 @@ func TestFreshStartupImportsValidAdaptersWhenAnotherCandidateIsRejected(t *testi
 	}
 }
 
+func TestStartupReconcileFailsClosedWhenCatalogCannotImportPluginSources(t *testing.T) {
+	catalog := &testHostAdapterCatalog{sets: map[string]adaptercatalog.Snapshot{}}
+	pluginSource := filepath.Join(t.TempDir(), "plugin-source")
+	if _, _, _, err := reconcileStartupAdapterSet(context.Background(), catalog, generation.Snapshot{}, pluginSource); err == nil {
+		t.Fatal("startup silently ignored Host-owned plugin source")
+	}
+	catalog.mu.Lock()
+	defer catalog.mu.Unlock()
+	if catalog.reconcileCalls != 0 {
+		t.Fatalf("fallback reconcile calls = %d, want 0 when plugin source cannot be imported", catalog.reconcileCalls)
+	}
+}
+
 func writeStartupAdapter(t *testing.T, path string) {
 	t.Helper()
 	descriptor := `{"id":"startup-good","name":"Startup Test","version":"1.0.0","protocol_version":1,"capabilities":["resolve"],"input_schema":{"fields":[]},"configuration_schema":{"fields":[]},"media_types":["hls"]}`

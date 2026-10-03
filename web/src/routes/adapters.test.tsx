@@ -12,12 +12,16 @@ function renderAdapters() {
   return render(<QueryClientProvider client={client}><ToastProvider><AdaptersPage /></ToastProvider></QueryClientProvider>)
 }
 
+const availableRegistry = { state: 'ready', plugins: [{ id: 'demo', name: 'Demo Adapter', available_version: '1.2.0', installed: false, update_available: false }] }
+
 describe('adapter discovery controls', () => {
   it('requests an immediate Host reconciliation and shows its safe result', async () => {
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      const body = init?.method === 'POST'
+      void init
+      const url = String(_input)
+      const body = url === '/api/runtime/adapters/reconcile'
         ? { state: 'activated', active_adapter_count: 2, rejected_count: 0, generation_id: 'gen-123' }
-        : []
+        : url === '/api/runtime/plugins' ? { state: 'not_configured', plugins: [] } : []
       return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -28,5 +32,63 @@ describe('adapter discovery controls', () => {
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/adapters/reconcile' && init?.method === 'POST')).toBe(true))
     expect(await screen.findByText('새 어댑터 세대를 활성화했습니다.')).toBeInTheDocument()
     expect(screen.getByText(/Runtime Host가 자동으로 검증하고 활성화합니다/)).toBeInTheDocument()
+  })
+
+  it('shows the registry and installs an available plugin through the Host API', async () => {
+    let installed = false
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      let body: unknown = []
+      if (url === '/api/runtime/plugins') body = installed
+        ? { state: 'ready', plugins: [{ id: 'demo', name: 'Demo Adapter', available_version: '1.2.0', installed_version: '1.2.0', installed: true, update_available: false }] }
+        : availableRegistry
+      if (url === '/api/runtime/plugins/demo/install' && init?.method === 'POST') {
+        installed = true
+        body = { state: 'ready', plugins: [{ id: 'demo', name: 'Demo Adapter', available_version: '1.2.0', installed_version: '1.2.0', installed: true, update_available: false }] }
+      }
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderAdapters()
+    expect(await screen.findByText('Demo Adapter')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '설치' }))
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/demo/install' && init?.method === 'POST')).toBe(true))
+    expect(await screen.findByText('플러그인을 설치하고 새 어댑터 세대를 활성화했습니다.')).toBeInTheDocument()
+  })
+
+  it('keeps installed plugins visible while the registry is unavailable', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url === '/api/runtime/plugins'
+        ? { state: 'unavailable', failure_code: 'plugin_registry_unavailable', plugins: [{ id: 'demo', name: 'Demo Adapter', installed_version: '1.0.0', installed: true, update_available: false }] }
+        : []
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderAdapters()
+
+    expect(await screen.findByText(/Registry에 연결할 수 없습니다\. 이미 설치된 어댑터는 계속 사용할 수 있습니다\./)).toBeInTheDocument()
+    expect(screen.getByText(/설치 1\.0\.0/)).toBeInTheDocument()
+  })
+
+  it('shows artifact verification failures separately from registry availability', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/runtime/plugins/demo/install' && init?.method === 'POST') {
+        return new Response(JSON.stringify({ error: 'plugin_verification_failed', message: '다운로드한 플러그인을 검증하지 못했습니다.' }), { status: 422, headers: { 'content-type': 'application/json' } })
+      }
+      const body = url === '/api/runtime/plugins' ? availableRegistry : []
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    renderAdapters()
+    fireEvent.click(await screen.findByRole('button', { name: '설치' }))
+
+    expect(await screen.findByText('다운로드한 플러그인을 검증하지 못했습니다.')).toBeInTheDocument()
+    expect(screen.queryByText(/Registry에 연결할 수 없습니다/)).not.toBeInTheDocument()
   })
 })

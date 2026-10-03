@@ -14,10 +14,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +34,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
@@ -69,6 +72,10 @@ type Config struct {
 	AuthDisabled       bool
 	ForceSecureCookies bool
 	TrustedReleaseKeys map[string]ed25519.PublicKey
+	PluginRegistryURL  string
+	// PluginRegistryHTTPClient is a deterministic test seam. Production hosts
+	// leave it nil and use the bounded public HTTPS client.
+	PluginRegistryHTTPClient *http.Client
 	// ReleaseBundleDir optionally selects a local signed package as the update
 	// source. This supports offline administration and deterministic host tests;
 	// it is still verified against TrustedReleaseKeys before installation.
@@ -105,6 +112,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 	c.AuthDisabled = getenv("AUTH_DISABLED") == "1"
 	c.ForceSecureCookies = getenv("COOKIE_SECURE") == "1"
 	c.ReleaseBundleDir = strings.TrimSpace(getenv("IR_RELEASE_BUNDLE_DIR"))
+	c.PluginRegistryURL = strings.TrimSpace(getenv("IR_PLUGIN_REGISTRY_URL"))
 	trustedKeys, err := parseTrustedReleaseKeys(strings.TrimSpace(getenv("IR_RELEASE_TRUSTED_KEYS_JSON")))
 	if err != nil {
 		return Config{}, err
@@ -310,7 +318,18 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return errors.New("Runtime Host adapter catalog is unavailable")
 	}
-	adapterSet, activeGeneration, activeExists, err := reconcileStartupAdapterSet(ctx, adapterCatalog, registrySnapshot)
+	plugins, err := pluginregistry.Open(pluginregistry.Config{
+		Root: filepath.Join(config.DataDir, "runtime", "plugin-registry"), RegistryURL: config.PluginRegistryURL,
+		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, HTTPClient: config.PluginRegistryHTTPClient,
+	})
+	if err != nil {
+		return errors.New("Runtime Host plugin registry state is unavailable")
+	}
+	pluginSourceDirs, err := plugins.DesiredSourceDirs()
+	if err != nil {
+		return errors.New("Runtime Host plugin source state is unavailable")
+	}
+	adapterSet, activeGeneration, activeExists, err := reconcileStartupAdapterSet(ctx, adapterCatalog, registrySnapshot, pluginSourceDirs...)
 	if err != nil {
 		return err
 	}
@@ -491,7 +510,8 @@ func Run(ctx context.Context, config Config) error {
 	updates, err := newUpdateController(updateControllerOptions{
 		Config: config, HostBuild: build, ApplicationBuild: selected.appBuild,
 		Registry: registry, AdapterCatalog: adapterCatalog, Installation: installState,
-		Supervisor: sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
+		PluginRegistry: plugins,
+		Supervisor:     sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
 		EngineDetacher: lifecycle,
 		Coordinator:    coordinator, OwnerAuthority: ownerAuthority, Installer: installer, TrustedKeys: config.TrustedReleaseKeys,
 		Compatibility: currentHostCompatibility(), SourceFactory: configuredReleaseSourceFactory(config, selected.appBuild),
@@ -724,7 +744,7 @@ func configuredAdapterSourceDirs(value string) ([]string, error) {
 // generation's immutable set as a rejection fallback. A fresh installation
 // has no good set to preserve yet, so valid candidates must still be imported
 // when a different source binary is rejected.
-func reconcileStartupAdapterSet(ctx context.Context, catalog hostAdapterCatalog, registryState generation.Snapshot) (adaptercatalog.Snapshot, generation.Generation, bool, error) {
+func reconcileStartupAdapterSet(ctx context.Context, catalog hostAdapterCatalog, registryState generation.Snapshot, additionalSources ...string) (adaptercatalog.Snapshot, generation.Generation, bool, error) {
 	if catalog == nil {
 		return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("Runtime Host adapter catalog is unavailable")
 	}
@@ -738,7 +758,18 @@ func reconcileStartupAdapterSet(ctx context.Context, catalog hostAdapterCatalog,
 		}
 		fallbackSetID = activeGeneration.AdapterSetID
 	}
-	selected, err := catalog.Reconcile(ctx, fallbackSetID)
+	var selected adaptercatalog.Snapshot
+	var err error
+	if withSources, ok := catalog.(interface {
+		ReconcileWithSources(context.Context, string, []string) (adaptercatalog.Snapshot, error)
+	}); ok {
+		selected, err = withSources.ReconcileWithSources(ctx, fallbackSetID, additionalSources)
+	} else {
+		if len(additionalSources) > 0 {
+			return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("adapter catalog does not support Host-owned plugin sources")
+		}
+		selected, err = catalog.Reconcile(ctx, fallbackSetID)
+	}
 	if err != nil {
 		return adaptercatalog.Snapshot{}, generation.Generation{}, false, errors.New("Runtime Host adapter discovery failed")
 	}

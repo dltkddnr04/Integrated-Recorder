@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -59,6 +59,13 @@ export const adaptersAPI = {
   saveConfig: (id: string, body: { resource?: ResourceRef; values?: Record<string, unknown>; secrets?: Record<string, string>; clear_values?: string[]; clear_secrets?: string[] }) => api<AdapterConfig>(`/api/adapters/${encodeURIComponent(id)}/config`, { method: 'PUT', body }),
   action: (id: string, action: 'restart' | 'enable' | 'disable') => api<Adapter>(`/api/adapters/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),
   resources: (id: string, options: { q?: string; parent?: ResourceRef; resource_type?: string; cursor?: string; limit?: number }) => api<{ items: Resource[]; next_cursor?: string }>(`/api/adapters/${encodeURIComponent(id)}/resources${options.q ? `/search${queryString({ q: options.q, parent: options.parent ? encodeRef(options.parent) : undefined, resource_type: options.resource_type, cursor: options.cursor, limit: options.limit })}` : queryString({ parent: options.parent ? encodeRef(options.parent) : undefined, resource_type: options.resource_type, cursor: options.cursor, limit: options.limit })}`),
+}
+export const pluginsAPI = {
+  status: () => api<PluginRegistryStatus>('/api/runtime/plugins'),
+  refresh: () => api<PluginRegistryStatus>('/api/runtime/plugins/refresh', { method: 'POST', body: {} }),
+  install: (id: string) => api<PluginRegistryStatus>(`/api/runtime/plugins/${encodeURIComponent(id)}/install`, { method: 'POST', body: {} }),
+  update: (id: string) => api<PluginRegistryStatus>(`/api/runtime/plugins/${encodeURIComponent(id)}/update`, { method: 'POST', body: {} }),
+  uninstall: (id: string) => api<PluginRegistryStatus>(`/api/runtime/plugins/${encodeURIComponent(id)}`, { method: 'DELETE', body: {} }),
 }
 export const workflowsAPI = {
   list: () => api<WorkflowSummary[]>('/api/resolve-workflows'), get: (id: string) => api<WorkflowProgress>(`/api/resolve-workflows/${encodeURIComponent(id)}`),

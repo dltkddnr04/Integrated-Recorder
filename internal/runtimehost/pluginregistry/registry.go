@@ -1,0 +1,460 @@
+// Package pluginregistry reads the Runtime Host's approved static plugin
+// registry and prepares verified adapter sources for the existing immutable
+// adapter catalog. It does not build or execute installed adapters directly.
+package pluginregistry
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"regexp"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
+)
+
+const (
+	SchemaVersion        = 1
+	MaxCatalogBytes      = 2 << 20
+	MaxPlugins           = 256
+	MaxReleasesPerPlugin = 128
+	MaxArtifactsRelease  = 16
+	MaxArtifactBytes     = adaptercatalog.MaxArtifactBytes
+	maxRegistryURLBytes  = 2048
+	maxNameBytes         = 128
+	maxIdentityBytes     = 128
+	maxRepositoryBytes   = 512
+	maxSourceCommitBytes = 128
+	minSourceCommitBytes = 7
+	minFilenameBytes     = 29
+	maxFilenameBytes     = 92
+	maxChannelBytes      = 32
+)
+
+var (
+	ErrInvalidConfig       = errors.New("plugin registry configuration is invalid")
+	ErrUnavailable         = errors.New("plugin registry unavailable")
+	ErrPluginNotFound      = errors.New("plugin was not found")
+	ErrAlreadyInstalled    = errors.New("plugin is already installed")
+	ErrNotInstalled        = errors.New("plugin is not installed")
+	ErrPlatformUnsupported = errors.New("plugin is unavailable for this platform")
+	ErrDownloadFailed      = errors.New("plugin artifact download failed")
+	ErrVerificationFailed  = errors.New("plugin artifact verification failed")
+	ErrIdentityMismatch    = errors.New("plugin descriptor identity does not match registry")
+	ErrInstallFailed       = errors.New("plugin installation could not be prepared")
+	ErrNoUpdateAvailable   = errors.New("plugin has no stable update available")
+	ErrOperationConflict   = errors.New("plugin operation conflicts with current desired state")
+	ErrUnsafeStore         = errors.New("plugin registry store is unsafe")
+	versionPattern         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
+	pluginIDPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+	sourceCommitPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{6,127}$`)
+	shaPattern             = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
+
+type registryDocument struct {
+	SchemaVersion int              `json:"schema_version"`
+	Plugins       []registryPlugin `json:"plugins"`
+}
+
+type registryPlugin struct {
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Repository string            `json:"repository"`
+	Channels   map[string]string `json:"channels"`
+	Releases   []registryRelease `json:"releases"`
+}
+
+type registryRelease struct {
+	Version         string             `json:"version"`
+	ProtocolVersion int                `json:"protocol_version"`
+	SourceCommit    string             `json:"source_commit"`
+	Artifacts       []registryArtifact `json:"artifacts"`
+}
+
+type registryArtifact struct {
+	OS       string `json:"os"`
+	Arch     string `json:"arch"`
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256"`
+}
+
+// Registry, Plugin, Release, and Artifact are the stable v1 static-catalog
+// wire shapes. They intentionally contain approval metadata only.
+type Registry = registryDocument
+type Plugin = registryPlugin
+type Release = registryRelease
+type Artifact = registryArtifact
+
+type View struct {
+	Configured  bool         `json:"configured"`
+	Available   bool         `json:"available"`
+	FailureCode string       `json:"failure_code,omitempty"`
+	Plugins     []PluginView `json:"plugins"`
+	// Installed is for in-process Host orchestration only. In particular, its
+	// content digest and binary filename must never become a public projection.
+	Installed []DesiredPlugin `json:"-"`
+}
+
+type PluginView struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	AvailableVersion string `json:"available_version,omitempty"`
+	InstalledVersion string `json:"installed_version,omitempty"`
+	Installed        bool   `json:"installed"`
+	UpdateAvailable  bool   `json:"update_available"`
+}
+
+type selectedRelease struct {
+	plugin  registryPlugin
+	release registryRelease
+}
+
+func decodeRegistry(data []byte) (registryDocument, error) {
+	if len(data) == 0 || len(data) > MaxCatalogBytes || !utf8.Valid(data) {
+		return registryDocument{}, ErrUnavailable
+	}
+	if validateRegistryWireShape(data) != nil {
+		return registryDocument{}, ErrUnavailable
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var document registryDocument
+	if err := decoder.Decode(&document); err != nil {
+		return registryDocument{}, ErrUnavailable
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return registryDocument{}, ErrUnavailable
+	}
+	if err := validateRegistry(document); err != nil {
+		return registryDocument{}, ErrUnavailable
+	}
+	return document, nil
+}
+
+// validateRegistryWireShape enforces exact v1 field spelling and presence.
+// encoding/json intentionally matches struct keys case-insensitively and
+// accepts null for several Go zero values, both of which are too permissive
+// for a signed-off distribution catalog contract. It also rejects duplicate
+// object keys so the same bytes cannot have parser-dependent meanings.
+func validateRegistryWireShape(data []byte) error {
+	root, err := strictJSONObject(data, "schema_version", "plugins")
+	if err != nil || isJSONNull(root["schema_version"]) {
+		return ErrUnavailable
+	}
+	plugins, err := strictJSONArray(root["plugins"], MaxPlugins)
+	if err != nil {
+		return ErrUnavailable
+	}
+	for _, rawPlugin := range plugins {
+		plugin, err := strictJSONObject(rawPlugin, "id", "name", "repository", "channels", "releases")
+		if err != nil {
+			return ErrUnavailable
+		}
+		for _, key := range []string{"id", "name", "repository"} {
+			if !validJSONStringShape(plugin[key]) {
+				return ErrUnavailable
+			}
+		}
+		channels, err := strictJSONObjectAny(plugin["channels"], 3)
+		if err != nil {
+			return ErrUnavailable
+		}
+		for _, value := range channels {
+			if !validJSONStringShape(value) {
+				return ErrUnavailable
+			}
+		}
+		releases, err := strictJSONArray(plugin["releases"], MaxReleasesPerPlugin)
+		if err != nil {
+			return ErrUnavailable
+		}
+		for _, rawRelease := range releases {
+			release, err := strictJSONObject(rawRelease, "version", "protocol_version", "source_commit", "artifacts")
+			if err != nil {
+				return ErrUnavailable
+			}
+			for _, key := range []string{"version", "source_commit"} {
+				if !validJSONStringShape(release[key]) {
+					return ErrUnavailable
+				}
+			}
+			if isJSONNull(release["protocol_version"]) {
+				return ErrUnavailable
+			}
+			artifacts, err := strictJSONArray(release["artifacts"], MaxArtifactsRelease)
+			if err != nil {
+				return ErrUnavailable
+			}
+			for _, rawArtifact := range artifacts {
+				artifact, err := strictJSONObject(rawArtifact, "os", "arch", "url", "filename", "size", "sha256")
+				if err != nil {
+					return ErrUnavailable
+				}
+				for _, key := range []string{"os", "arch", "url", "filename", "sha256"} {
+					if !validJSONStringShape(artifact[key]) {
+						return ErrUnavailable
+					}
+				}
+				if isJSONNull(artifact["size"]) {
+					return ErrUnavailable
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func strictJSONObject(data []byte, required ...string) (map[string]json.RawMessage, error) {
+	fields, err := strictJSONObjectAny(data, len(required))
+	if err != nil || len(fields) != len(required) {
+		return nil, ErrUnavailable
+	}
+	for _, key := range required {
+		if _, ok := fields[key]; !ok {
+			return nil, ErrUnavailable
+		}
+	}
+	return fields, nil
+}
+
+func strictJSONObjectAny(data []byte, maxProperties int) (map[string]json.RawMessage, error) {
+	if maxProperties < 0 {
+		return nil, ErrUnavailable
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	delim, ok := token.(json.Delim)
+	if err != nil || !ok || delim != '{' {
+		return nil, ErrUnavailable
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return nil, ErrUnavailable
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return nil, ErrUnavailable
+		}
+		if len(fields) >= maxProperties {
+			return nil, ErrUnavailable
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || len(value) == 0 || isJSONNull(value) {
+			return nil, ErrUnavailable
+		}
+		fields[key] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, ErrUnavailable
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, ErrUnavailable
+	}
+	return fields, nil
+}
+
+func strictJSONArray(data []byte, maxItems int) ([]json.RawMessage, error) {
+	if maxItems < 0 {
+		return nil, ErrUnavailable
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	delim, ok := token.(json.Delim)
+	if err != nil || !ok || delim != '[' {
+		return nil, ErrUnavailable
+	}
+	values := make([]json.RawMessage, 0)
+	for decoder.More() {
+		if len(values) >= maxItems {
+			return nil, ErrUnavailable
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || len(value) == 0 || isJSONNull(value) {
+			return nil, ErrUnavailable
+		}
+		values = append(values, value)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, ErrUnavailable
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, ErrUnavailable
+	}
+	return values, nil
+}
+
+func validJSONStringShape(data []byte) bool {
+	if isJSONNull(data) {
+		return false
+	}
+	var value string
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if decoder.Decode(&value) != nil {
+		return false
+	}
+	return requireJSONEOF(decoder) == nil
+}
+
+func isJSONNull(data []byte) bool { return bytes.Equal(bytes.TrimSpace(data), []byte("null")) }
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func validateRegistry(document registryDocument) error {
+	if document.SchemaVersion != SchemaVersion || len(document.Plugins) > MaxPlugins {
+		return ErrUnavailable
+	}
+	plugins := make(map[string]bool, len(document.Plugins))
+	for _, plugin := range document.Plugins {
+		if !validPluginID(plugin.ID) || plugins[plugin.ID] || !validText(plugin.Name, maxNameBytes) || !validRepositoryURL(plugin.Repository) || len(plugin.Releases) == 0 || len(plugin.Releases) > MaxReleasesPerPlugin || len(plugin.Channels) == 0 || len(plugin.Channels) > 3 {
+			return ErrUnavailable
+		}
+		plugins[plugin.ID] = true
+		releases := make(map[string]registryRelease, len(plugin.Releases))
+		for _, release := range plugin.Releases {
+			if !validIdentity(release.Version) || releases[release.Version].Version != "" || release.ProtocolVersion != adapterproto.Version || !validSourceCommit(release.SourceCommit) || len(release.Artifacts) == 0 || len(release.Artifacts) > MaxArtifactsRelease {
+				return ErrUnavailable
+			}
+			platforms := map[string]bool{}
+			for _, artifact := range release.Artifacts {
+				platform := artifact.OS + "/" + artifact.Arch
+				if !validTarget(artifact.OS, artifact.Arch) || platforms[platform] || !validArtifactURL(artifact.URL) || artifact.Filename != adaptercatalog.BinaryPrefix+plugin.ID || len(artifact.Filename) < minFilenameBytes || !validText(artifact.Filename, maxFilenameBytes) || artifact.Size <= 0 || artifact.Size > MaxArtifactBytes || !shaPattern.MatchString(artifact.SHA256) {
+					return ErrUnavailable
+				}
+				platforms[platform] = true
+			}
+			releases[release.Version] = release
+		}
+		for channel, version := range plugin.Channels {
+			if channel != "stable" && channel != "beta" && channel != "development" || !validIdentity(channel) || !validIdentity(version) {
+				return ErrUnavailable
+			}
+			if _, ok := releases[version]; !ok {
+				return ErrUnavailable
+			}
+		}
+	}
+	return nil
+}
+
+func validIdentity(value string) bool {
+	return len(value) <= maxIdentityBytes && versionPattern.MatchString(value) && value != "." && value != ".."
+}
+
+func validPluginID(value string) bool { return len(value) <= 64 && pluginIDPattern.MatchString(value) }
+
+func validSourceCommit(value string) bool {
+	return len(value) >= minSourceCommitBytes && len(value) <= maxSourceCommitBytes && sourceCommitPattern.MatchString(value)
+}
+
+func validRepositoryURL(raw string) bool {
+	if len(raw) > maxRepositoryBytes || !validHTTPSURL(raw, false) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	return err == nil && u.EscapedPath() != "" && u.EscapedPath() != "/"
+}
+
+func validArtifactURL(raw string) bool {
+	if !validHTTPSURL(raw, true) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	return err == nil && u.EscapedPath() != ""
+}
+
+func validText(value string, max int) bool {
+	if len(value) == 0 || len(value) > max || !utf8.ValidString(value) || strings.TrimSpace(value) == "" {
+		return false
+	}
+	for _, r := range value {
+		if r == 0 || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validTarget(goos, goarch string) bool {
+	return goos == "linux" && (goarch == "amd64" || goarch == "arm64")
+}
+
+func validHTTPSURL(raw string, allowQuery bool) bool {
+	if len(raw) == 0 || len(raw) > maxRegistryURLBytes || !utf8.ValidString(raw) {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.Opaque != "" || (!allowQuery && (u.RawQuery != "" || u.ForceQuery)) {
+		return false
+	}
+	return validHostPort(u)
+}
+
+func validHostPort(u *url.URL) bool {
+	if strings.ContainsAny(u.Host, "\r\n\\") {
+		return false
+	}
+	port := u.Port()
+	if port == "" {
+		return !strings.HasSuffix(u.Host, ":")
+	}
+	for _, r := range port {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func stableRelease(plugin registryPlugin) (registryRelease, bool) {
+	version := plugin.Channels["stable"]
+	if version == "" {
+		return registryRelease{}, false
+	}
+	for _, release := range plugin.Releases {
+		if release.Version == version {
+			return release, true
+		}
+	}
+	return registryRelease{}, false
+}
+
+func selectArtifact(release registryRelease, goos, goarch string) (registryArtifact, bool) {
+	for _, artifact := range release.Artifacts {
+		if artifact.OS == goos && artifact.Arch == goarch {
+			return artifact, true
+		}
+	}
+	return registryArtifact{}, false
+}
+
+func redactFailure(err error) error {
+	if errors.Is(err, ErrPlatformUnsupported) {
+		return ErrPlatformUnsupported
+	}
+	if errors.Is(err, ErrIdentityMismatch) {
+		return ErrIdentityMismatch
+	}
+	if errors.Is(err, ErrVerificationFailed) {
+		return ErrVerificationFailed
+	}
+	if errors.Is(err, ErrDownloadFailed) {
+		return ErrDownloadFailed
+	}
+	return fmt.Errorf("%w", ErrInstallFailed)
+}

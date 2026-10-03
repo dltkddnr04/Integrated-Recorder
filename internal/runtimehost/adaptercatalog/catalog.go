@@ -153,9 +153,30 @@ func (c *Catalog) release() { <-c.gate }
 // can still be published. A fallback entry is retained only when a rejected
 // or ambiguous source could have replaced that exact binary/adapter identity.
 func (c *Catalog) Reconcile(ctx context.Context, fallbackSetID string) (Snapshot, error) {
+	return c.ReconcileWithSources(ctx, fallbackSetID, nil)
+}
+
+// ReconcileWithSources imports the catalog's configured trusted-local source
+// directories plus the immutable Host-owned source snapshots supplied for
+// this operation. Additional sources let Runtime Host add verified remote
+// registry artifacts without mutating the catalog's configured source list.
+// Callers must serialize source selection with application update operations.
+func (c *Catalog) ReconcileWithSources(ctx context.Context, fallbackSetID string, additionalSources []string) (Snapshot, error) {
 	if c == nil || ctx == nil {
 		return Snapshot{}, ErrInvalidConfig
 	}
+	if len(additionalSources) > maxSourceDirs || len(c.sources)+len(additionalSources) > maxSourceDirs {
+		return Snapshot{}, ErrInvalidConfig
+	}
+	sources := append([]string(nil), c.sources...)
+	for _, source := range additionalSources {
+		if !validAbsoluteClean(source) || filepath.Clean(source) == string(filepath.Separator) {
+			return Snapshot{}, ErrInvalidConfig
+		}
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
+	sources = compactStrings(sources)
 	if err := c.acquire(ctx); err != nil {
 		return Snapshot{}, err
 	}
@@ -175,7 +196,7 @@ func (c *Catalog) Reconcile(ctx context.Context, fallbackSetID string) (Snapshot
 		}
 	}
 
-	paths, overflow, err := c.sourceCandidates()
+	paths, overflow, err := c.sourceCandidates(sources)
 	if err != nil {
 		return c.fallbackOrError(fallback, fallbackSetID, "inventory_unavailable", err)
 	}
@@ -531,10 +552,10 @@ func (c *Catalog) Collect(keepIDs []string) error {
 	return nil
 }
 
-func (c *Catalog) sourceCandidates() ([]string, bool, error) {
+func (c *Catalog) sourceCandidates(sourceDirs []string) ([]string, bool, error) {
 	paths := []string{}
 	overflow := false
-	for _, dir := range c.sources {
+	for _, dir := range sourceDirs {
 		info, err := os.Lstat(dir)
 		if errors.Is(err, os.ErrNotExist) {
 			continue

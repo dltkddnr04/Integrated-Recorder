@@ -25,6 +25,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/install"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/leases"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
@@ -95,6 +96,7 @@ type updateControllerOptions struct {
 	ApplicationBuild  buildinfo.Info
 	Registry          *generation.Registry
 	AdapterCatalog    hostAdapterCatalog
+	PluginRegistry    *pluginregistry.Manager
 	Installation      *installation.Store
 	Supervisor        updateSupervisor
 	Readiness         readinessRegistrar
@@ -123,6 +125,7 @@ type updateController struct {
 	applicationBuild  buildinfo.Info
 	registry          *generation.Registry
 	adapterCatalog    hostAdapterCatalog
+	pluginRegistry    *pluginregistry.Manager
 	installation      *installation.Store
 	supervisor        updateSupervisor
 	readiness         readinessRegistrar
@@ -212,7 +215,7 @@ func newUpdateController(options updateControllerOptions) (*updateController, er
 	}
 	c := &updateController{
 		config: options.Config, hostBuild: options.HostBuild, applicationBuild: options.ApplicationBuild,
-		registry: options.Registry, adapterCatalog: options.AdapterCatalog, installation: options.Installation,
+		registry: options.Registry, adapterCatalog: options.AdapterCatalog, pluginRegistry: options.PluginRegistry, installation: options.Installation,
 		supervisor: options.Supervisor, readiness: options.Readiness,
 		lifecycle: options.Lifecycle, drain: options.Drain, engineDetacher: options.EngineDetacher, coordinator: options.Coordinator,
 		ownerAuthority: options.OwnerAuthority,
@@ -568,6 +571,17 @@ func (c *updateController) reconcileAdaptersIfIdle(ctx context.Context) (bool, e
 }
 
 func (c *updateController) reconcileAdapters(ctx context.Context, wait bool) (httpapi.AdapterReconcileResult, bool, error) {
+	return c.reconcileAdaptersWithGate(ctx, wait, false)
+}
+
+// reconcileAdaptersLocked runs adapter-set reconciliation while the caller
+// already owns the common app-update/plugin-operation gate.
+func (c *updateController) reconcileAdaptersLocked(ctx context.Context) (httpapi.AdapterReconcileResult, error) {
+	result, _, err := c.reconcileAdaptersWithGate(ctx, true, true)
+	return result, err
+}
+
+func (c *updateController) reconcileAdaptersWithGate(ctx context.Context, wait, gateHeld bool) (httpapi.AdapterReconcileResult, bool, error) {
 	if ctx == nil {
 		return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("internal_error")
 	}
@@ -577,13 +591,15 @@ func (c *updateController) reconcileAdapters(ctx context.Context, wait bool) (ht
 	if c.adapterCatalog == nil {
 		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, false, nil
 	}
-	if err := c.lockOperation(ctx, wait); err != nil {
-		if !wait {
-			return httpapi.AdapterReconcileResult{}, false, nil
+	if !gateHeld {
+		if err := c.lockOperation(ctx, wait); err != nil {
+			if !wait {
+				return httpapi.AdapterReconcileResult{}, false, nil
+			}
+			return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("operation_conflict")
 		}
-		return httpapi.AdapterReconcileResult{}, false, httpapi.NewControllerError("operation_conflict")
+		defer c.releaseOperation()
 	}
-	defer c.releaseOperation()
 	if err := ctx.Err(); err != nil {
 		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, true, nil
 	}
@@ -612,7 +628,7 @@ func (c *updateController) reconcileAdapters(ctx context.Context, wait bool) (ht
 		}
 		fallbackSetID = empty.ID
 	}
-	selected, err := c.adapterCatalog.Reconcile(ctx, fallbackSetID)
+	selected, err := c.reconcileCatalog(ctx, fallbackSetID)
 	if err != nil {
 		return httpapi.AdapterReconcileResult{State: "failed", FailureCode: "reconcile_failed"}, true, nil
 	}

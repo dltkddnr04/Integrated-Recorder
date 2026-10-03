@@ -56,6 +56,34 @@ func TestReconcilePublishesStableImmutableSetAndReloads(t *testing.T) {
 	}
 }
 
+func TestReconcileWithAdditionalImmutableSource(t *testing.T) {
+	root, source := newCatalogDirs(t)
+	extra := filepath.Join(filepath.Dir(source), "registry-source")
+	if err := os.Mkdir(extra, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeAdapter(t, source, "integrated-recorder-adapter-local", validDescriptor("local", "1"), "normal", "")
+	writeAdapter(t, extra, "integrated-recorder-adapter-registry", validDescriptor("registry", "2"), "normal", "")
+	catalog, err := Open(root, []string{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := catalog.ReconcileWithSources(context.Background(), "", []string{extra})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected.Entries) != 2 || selected.Entries[0].AdapterID != "local" || selected.Entries[1].AdapterID != "registry" {
+		t.Fatalf("reconcile with additional source = %+v", selected.Entries)
+	}
+	without, err := catalog.Reconcile(context.Background(), selected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(without.Entries) != 1 || without.Entries[0].AdapterID != "local" {
+		t.Fatalf("base reconciliation retained an ad hoc source: %+v", without.Entries)
+	}
+}
+
 func TestDifferentArtifactBytesProduceDifferentSetIdentity(t *testing.T) {
 	root, source := newCatalogDirs(t)
 	path := filepath.Join(source, "integrated-recorder-adapter-demo")
