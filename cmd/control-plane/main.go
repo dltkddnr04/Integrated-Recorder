@@ -34,6 +34,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/server"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/storageprocess"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 	"github.com/dltkddnr04/integrated-recorder/internal/watch"
 )
@@ -142,6 +143,8 @@ type processConfig struct {
 	resourceSocket      string
 	resourceTokenFile   string
 	resourceOwner       string
+	storageCatalogRoot  string
+	storageProviderSet  string
 	adapterDirs         []string
 	authDisabled        bool
 	forceSecureCookies  bool
@@ -155,6 +158,7 @@ func loadProcessConfig() (processConfig, error) {
 		controlTokenFile: strings.TrimSpace(os.Getenv("CONTROL_IPC_TOKEN_FILE")), engineCatalog: strings.TrimSpace(os.Getenv("ENGINE_CATALOG_FILE")),
 		activeEngine: strings.TrimSpace(os.Getenv("ACTIVE_ENGINE_GENERATION")), authDisabled: os.Getenv("AUTH_DISABLED") == "1", forceSecureCookies: os.Getenv("COOKIE_SECURE") == "1", installationManaged: os.Getenv("RUNTIME_INSTALLATION_MANAGED") == "1",
 		resourceSocket: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_SOCKET_PATH")), resourceTokenFile: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_TOKEN_FILE")), resourceOwner: strings.TrimSpace(os.Getenv("RUNTIME_RESOURCE_OWNER")),
+		storageCatalogRoot: strings.TrimSpace(os.Getenv("STORAGE_PROVIDER_CATALOG_ROOT")), storageProviderSet: strings.TrimSpace(os.Getenv("STORAGE_PROVIDER_SET_ID")),
 	}
 	if c.dataDir == "" || c.controlAddr == "" || c.generationID == "" || c.controlIPCSocket == "" || c.controlTokenFile == "" || c.engineCatalog == "" || c.activeEngine == "" {
 		return processConfig{}, errors.New("required Control Plane runtime configuration is missing")
@@ -171,6 +175,12 @@ func loadProcessConfig() (processConfig, error) {
 	}
 	if resourcePresent != 0 && resourcePresent != len(resourceFields) {
 		return processConfig{}, errors.New("Runtime Host resource coordinator settings must be provided together")
+	}
+	if (c.storageCatalogRoot == "") != (c.storageProviderSet == "") {
+		return processConfig{}, errors.New("storage provider generation settings must be provided together")
+	}
+	if c.storageCatalogRoot != "" && (!filepath.IsAbs(c.storageCatalogRoot) || filepath.Clean(c.storageCatalogRoot) != c.storageCatalogRoot || c.storageCatalogRoot != filepath.Join(c.dataDir, "runtime", "storage-providers")) {
+		return processConfig{}, errors.New("storage provider catalog identity is invalid")
 	}
 	adapterDirsValue := strings.TrimSpace(os.Getenv("ADAPTER_DIR"))
 	if adapterDirsValue == "" {
@@ -387,10 +397,16 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 	if setupCtx == nil {
 		setupCtx = context.Background()
 	}
-	store, err := storage.New(config.dataDir)
+	store, storageRuntime, err := storageprocess.OpenStore(setupCtx, config.dataDir, config.storageCatalogRoot, config.storageProviderSet)
 	if err != nil {
-		return nil, fmt.Errorf("initialize archive read facade: %w", err)
+		return nil, errors.New("initialize generation-pinned archive read facade")
 	}
+	cleanupStorageRuntime := true
+	defer func() {
+		if cleanupStorageRuntime && storageRuntime != nil {
+			_ = storageRuntime.Close()
+		}
+	}()
 	settings, err := systemsettings.Open(config.dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("initialize system settings: %w", err)
@@ -519,7 +535,8 @@ func openControlApplication(config processConfig, gate *controlplane.MutationGat
 		InstallationManaged: config.installationManaged,
 	})
 	cleanupAdapters, cleanupIntegrity, cleanupExport, cleanupPreview, cleanupWatch = false, false, false, false, false
-	return &controlApplication{adapters: adapters, manager: manager, store: store, integrity: integrityService, exports: exportService, previews: previewService, watches: watchService, api: api, gate: gate, lifetime: processCtx, dataDir: config.dataDir, installationManaged: config.installationManaged}, nil
+	cleanupStorageRuntime = false
+	return &controlApplication{adapters: adapters, manager: manager, store: store, storageRuntime: storageRuntime, integrity: integrityService, exports: exportService, previews: previewService, watches: watchService, api: api, gate: gate, lifetime: processCtx, dataDir: config.dataDir, installationManaged: config.installationManaged}, nil
 }
 
 func configureRuntimeResources(store *storage.Store, config processConfig) error {
@@ -607,6 +624,7 @@ type controlApplication struct {
 	adapters            *adapterhost.Host
 	manager             *recorderengine.ManagerRouter
 	store               *storage.Store
+	storageRuntime      *storageprocess.Runtime
 	integrity           *integrity.Service
 	exports             *derivative.Service
 	previews            *preview.Service
@@ -1008,6 +1026,10 @@ func (a *controlApplication) close(ctx context.Context) error {
 	}
 	joined = errors.Join(previewErr, retentionErr, storageMetricsErr, joined, a.watches.Close(ctx), a.previews.Close(ctx), a.exports.Close(ctx), a.integrity.Close(ctx))
 	a.adapters.Close()
+	if a.storageRuntime != nil {
+		joined = errors.Join(joined, a.storageRuntime.Close())
+		a.storageRuntime = nil
+	}
 	return joined
 }
 

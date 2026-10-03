@@ -23,7 +23,9 @@ Integrated Recorder follows the source manifest, stores original media segments 
 
 See [Architecture](docs/ARCHITECTURE.md) for the detailed design and storage direction.
 
-Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. The Runtime Host treats configured source directories as import sources, validates executable adapters, and stores immutable artifacts and adapter sets. An application generation is identified by `(application release, adapter set)`; adapter changes activate a new generation without restarting the Host or container, and application release updates carry forward the selected adapter set. Existing recordings remain pinned to their original Engine and adapter artifacts until their leases drain. Install a binary by copying it under a temporary name and atomically renaming it to `integrated-recorder-adapter-*`. When an administrator configures an HTTPS `IR_PLUGIN_REGISTRY_URL`, the `/adapters` page can manually install or update curated stable plugins. The registry is approval metadata, not a build or publisher-signing service; it pins exact artifact size and SHA-256. Installed adapters run as trusted local code and are not sandboxed. The default file secret stores use restricted permissions but do not encrypt values at rest.
+Adapters declare input/settings schemas and may discover opaque resources or suspend for generic configuration challenges. The Runtime Host treats configured source directories as import sources, validates executable adapters, and stores immutable artifacts and adapter sets. An application generation is the tuple `(application release, adapter set, storage provider set)`. Adapter reconciliation and explicit storage-backend activation can activate a new generation without restarting the Host or container; application release updates carry forward both selected sets. Existing recordings remain pinned to their original Engine, adapter artifacts, and storage provider artifact until their leases drain. Install an adapter binary by copying it under a temporary name and atomically renaming it to `integrated-recorder-adapter-*`. When an administrator configures an HTTPS `IR_PLUGIN_REGISTRY_URL`, the `/adapters` page can manually install or update curated stable plugins. Registry v1 retains the existing source-adapter format; v2 identifies each plugin type and protocol explicitly. The registry is approval metadata, not a build or publisher-signing service; it pins exact artifact size and SHA-256. Installed executables are trusted local code and are not sandboxed. The default file secret stores and storage-provider configuration use restricted permissions but do not encrypt values at rest.
+
+Core continues to own archive format and write authority. A Storage Provider Protocol v1 executable only maps logical object keys to physical bytes; it does not decide Recording, segment ordinals, metadata, gaps, or ownership semantics. The built-in local filesystem remains the default. A registry storage provider is installed, configured, and probed separately from selecting it as the primary backend. V1 has one primary backend at a time; changing backend kind is allowed only when the archive and active leases are empty and the target backend is empty. There is no automatic archive migration. No production S3/B2/WebDAV provider is included. See [Storage Provider Protocol v1](docs/STORAGE_PROVIDER_PROTOCOL_V1.md), the [storage-provider lifecycle guide](docs/STORAGE_PROVIDER_V1.md), and the [architecture](docs/ARCHITECTURE.md).
 
 ## Current status
 
@@ -31,7 +33,7 @@ Adapters declare input/settings schemas and may discover opaque resources or sus
 
 Management UI v2 connects recording search/pagination, tags/deletion, integrity checks and cancellation, adapter controls, capability-driven resource browsing, workflows, notifications, supported settings and optional recording retention, global search, request-log viewing, the Preview Frame Index, and automatic recording Watches to backend APIs. A Watch is a durable recording intent; each detected broadcast becomes a separate Recording. Automatic recording is shown only for adapters that declare the `watch` capability. Fresh installs use the `/setup` wizard to claim the administrator and complete installation diagnostics before normal operation starts. If FFmpeg is available, segment preview generation and separate remux exports are offered without changing the canonical recording.
 
-The production container separates a stable-listener Runtime Host, replaceable Control Plane, and Recorder Engine that owns segment acquisition and canonical archive writes. Activating an application release leaves existing Engine generations running until their recordings finish; new recordings use the new default generation. Replacing the Host/container itself is a separate maintenance operation. See the [architecture](docs/ARCHITECTURE.md) and [release process](docs/RELEASING.md) for generation and signed-release behavior.
+The production container separates a stable-listener Runtime Host, replaceable Control Plane, and Recorder Engine that owns segment acquisition and canonical archive writes. Activating an application, adapter, or storage-provider generation leaves existing Engine generations using their pinned artifacts until their recordings finish; new recordings use the new default generation. Replacing the Host/container itself is a separate maintenance operation. See the [architecture](docs/ARCHITECTURE.md) and [release process](docs/RELEASING.md) for generation and signed-release behavior.
 
 Scene previews are an opt-in derivative per recording and default to disabled. A background service produces at most one reusable frame for each committed primary-track segment. It first tries the target segment alone (including the required fMP4 init object); only after decode failure does it stage bounded prior-segment context. Posters, storyboards, and future navigation views reuse the stored frames, and slow or failed FFmpeg work never blocks acquisition.
 
@@ -49,7 +51,8 @@ Currently supported:
 - duplicate suppression, bounded retries, and gap detection;
 - restart-safe recording metadata;
 - generated finite HLS VOD playback;
-- browser playback and seek.
+- browser playback and seek;
+- Storage Provider Protocol v1 and the Registry v2 storage-executable lifecycle over Core-owned archive semantics. The built-in local backend remains available; no production cloud provider is included.
 
 The first live acceptance test used the public Owncast TV example stream: 90 segments, about 270 seconds of VOD, zero detected gaps, successful restart/reload, and successful seeks at 0:00, 2:15, and 4:27. Stored segment hashes matched re-fetched source objects.
 
@@ -57,7 +60,7 @@ Not supported yet:
 
 - chat timeline;
 - finalized TAR/index archive format;
-- HDD/NAS/LTO storage lifecycle;
+- HDD/NAS/LTO tiering, multi-pool placement, archive migration, and replication/mirroring;
 - additional platform adapters;
 - external audio rendition synchronization;
 - encrypted HLS and partial-only/delta LL-HLS;

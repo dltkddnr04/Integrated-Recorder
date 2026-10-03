@@ -1,0 +1,4 @@
+{
+  "values": {"bucket": "recordings"},
+  "secrets": {"access_key": "fixture-secret-value"}
+}

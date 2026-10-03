@@ -23,7 +23,9 @@ Integrated Recorder는 source manifest를 직접 추적하고 원본 media segme
 
 상세 설계와 저장 방향은 [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
-Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. Runtime Host가 설정된 source directory를 주기적으로 import source로 확인하고 새 executable을 검증해 immutable artifact/set으로 보관합니다. Application generation의 identity는 `(application release, adapter set)`이며, 어댑터 변경은 Host나 container 재시작 없이 새 generation을 활성화합니다. Application release update는 현재 adapter set을 이어 쓰고, 기존 녹화는 시작 당시 Engine과 adapter artifact를 lease가 끝날 때까지 유지합니다. 부분 복사를 피하려면 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 최종 이름으로 atomic rename하세요. 관리자가 HTTPS `IR_PLUGIN_REGISTRY_URL`을 설정하면 `/adapters` 화면에서 승인된 stable plugin을 수동 설치·업데이트할 수 있습니다. Registry는 빌드나 서명 체계가 아니며, 승인된 artifact의 크기와 SHA-256을 고정합니다. 설치된 adapter는 신뢰된 로컬 코드로 실행되고 sandbox되지 않습니다. 기본 file secret store는 권한이 제한되지만 저장 시 암호화되지 않습니다.
+Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선언합니다. Runtime Host가 설정된 source directory를 주기적으로 import source로 확인하고 새 executable을 검증해 immutable artifact/set으로 보관합니다. Application generation은 `(application release, adapter set, storage provider set)`의 조합으로 구분됩니다. Adapter reconciliation과 명시적인 storage backend activation은 Host나 container 재시작 없이 새 generation을 활성화합니다. Application release update는 현재 두 set을 이어 씁니다. 기존 녹화는 시작 당시 Engine, adapter artifact, storage provider artifact를 lease가 끝날 때까지 유지합니다. 부분 복사를 피하려면 adapter binary를 임시 이름으로 복사한 뒤 `integrated-recorder-adapter-*` 최종 이름으로 atomic rename하세요. 관리자가 HTTPS `IR_PLUGIN_REGISTRY_URL`을 설정하면 `/adapters` 화면에서 승인된 stable plugin을 수동으로 설치·업데이트할 수 있습니다. Registry v1은 기존 source adapter 형식을 유지하고, v2는 source/storage plugin type과 protocol을 명시합니다. Registry는 빌드나 publisher 서명 체계가 아니며, 승인된 artifact의 크기와 SHA-256을 고정합니다. 실행 파일은 신뢰된 로컬 코드이며 sandbox되지 않습니다. 기본 file secret store와 storage provider 설정은 private 권한으로 저장하지만 저장 시 암호화되지 않습니다.
+
+Core는 archive 형식과 쓰기 권한을 계속 소유합니다. Storage provider executable은 별도의 Storage Provider Protocol v1을 통해 logical object key의 bytes를 물리적으로 배치·전달할 뿐이며 Recording, segment ordinal, metadata, gap, ownership semantics를 결정하지 않습니다. 기본은 built-in local filesystem입니다. Registry의 storage provider는 설치, 설정, probe를 거쳐 별도로 primary backend로 활성화해야 합니다. v1은 한 번에 하나의 primary backend만 사용하며 backend 종류 변경은 archive와 active lease가 비어 있고 대상 backend도 비어 있을 때만 허용됩니다. 자동 archive migration은 없습니다. 실제 S3/B2/WebDAV provider는 아직 포함되지 않습니다. 자세한 내용은 [Storage Provider Protocol v1](docs/STORAGE_PROVIDER_PROTOCOL_V1.md), [storage provider lifecycle](docs/STORAGE_PROVIDER_V1.md), [아키텍처 문서](docs/ARCHITECTURE.ko.md)를 참고하세요.
 
 ## 현재 상태
 
@@ -31,7 +33,7 @@ Adapter는 입력·설정 schema와 resource discovery/challenge workflow를 선
 
 React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 확인·취소, 어댑터 관리, 리소스 탐색 capability, workflow, 알림, 설정·선택적 녹화 보존, 전역 검색, 로그 조회, Preview Frame Index, 자동 녹화 Watch를 backend API에 연결합니다. Watch는 지속적인 녹화 의도이고 방송 한 회차마다 별도의 Recording을 만듭니다. `watch` capability가 없는 어댑터에는 자동 녹화 등록을 표시하지 않습니다. 새 설치는 `/setup` wizard에서 관리자를 설정하고 설치 진단을 통과한 뒤 운영을 시작합니다. FFmpeg가 설치된 경우 장면 미리보기 프레임 생성과 별도의 remux export를 제공하며 canonical 녹화 데이터는 변경하지 않습니다.
 
-운영 컨테이너는 안정된 listener를 소유하는 Runtime Host, 교체 가능한 Control Plane, segment 수집과 canonical archive를 소유하는 Recorder Engine으로 나뉩니다. 애플리케이션 release를 활성화해도 이미 녹화 중인 Engine은 살아서 작업을 마치고, 이후 시작한 녹화는 새 기본 세대를 사용합니다. Host/container 자체 교체는 별도의 유지보수 작업입니다. 세대 runtime, signed application release, rollback 동작은 [architecture 문서](docs/ARCHITECTURE.ko.md)와 [release 절차](docs/RELEASING.md)를 참고하세요.
+운영 컨테이너는 안정된 listener를 소유하는 Runtime Host, 교체 가능한 Control Plane, segment 수집과 canonical archive를 소유하는 Recorder Engine으로 나뉩니다. 애플리케이션·adapter·storage provider 세대를 활성화해도 이미 녹화 중인 Engine은 자신이 pin한 artifact로 작업을 계속하고, 이후 시작한 녹화는 새 기본 세대를 사용합니다. Host/container 자체 교체는 별도의 유지보수 작업입니다. 세대 runtime, signed application release, rollback 동작은 [architecture 문서](docs/ARCHITECTURE.ko.md)와 [release 절차](docs/RELEASING.md)를 참고하세요.
 
 장면 미리보기는 녹화별 opt-in 파생 기능이며 기본값은 꺼져 있습니다. 각 확정된 primary track 세그먼트에는 최대 한 개의 재사용 가능한 프레임을 비동기로 생성합니다. 먼저 대상 세그먼트만 시도하고(필요한 fMP4 init object 포함), 실패할 때만 제한된 이전 세그먼트 context로 재시도합니다. FFmpeg가 느리거나 실패해도 녹화는 계속되며, 포스터·스토리보드·향후 탐색 UI는 저장된 프레임을 재사용합니다.
 
@@ -50,6 +52,7 @@ React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 
 - 프로세스 재시작 후 recording reload
 - finite HLS VOD 재구성
 - 브라우저 playback 및 seek
+- Core-owned archive semantics 위에 놓이는 Storage Provider Protocol v1과 Registry v2 storage executable lifecycle 기반. 기본 local backend는 계속 사용 가능하며, production cloud provider는 포함되지 않습니다.
 
 첫 실제 acceptance test는 공개 Owncast TV 예제 방송으로 수행했습니다. media segment 90개, 약 270초 VOD, detected gap 0개를 기록했고, 재시작/reload 및 0:00, 2:15, 4:27 seek에 성공했습니다. 저장 segment의 hash도 source 재요청본과 일치했습니다.
 
@@ -57,7 +60,7 @@ React 관리 UI는 녹화 검색·페이지네이션, 태그·삭제, 무결성 
 
 - chat timeline
 - finalized TAR/index archive format
-- HDD/NAS/LTO storage lifecycle
+- HDD/NAS/LTO tiering, multi-pool placement, archive migration, replication/mirroring
 - 추가 platform adapter
 - external audio rendition synchronization
 - 암호화 HLS 및 partial-only/delta LL-HLS

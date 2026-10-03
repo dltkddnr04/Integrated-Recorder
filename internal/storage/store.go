@@ -36,8 +36,9 @@ var ErrPayloadSizeMismatch = errors.New("payload size mismatch")
 var ErrReadOnlyListLimit = errors.New("read-only recording list exceeds limit")
 
 // StorageBackend is the set of canonical archive operations currently needed
-// by the application. Store is the stable archive facade; New currently wires
-// exactly one implementation, LocalFilesystemBackend.
+// by the application. Store is the stable archive facade; New wires the
+// default LocalFilesystemBackend, while NewWithObjectStore keeps these same
+// archive semantics over a physical object provider.
 //
 // The methods speak recording IDs and logical recording-relative paths. Root
 // is retained for internal diagnostics and existing tests only; it is not a
@@ -57,6 +58,7 @@ type StorageBackend interface {
 	SaveSidecar(string, string, any) error
 	SaveSnapshot(string, string, string, []byte, time.Time) (domain.ManifestSnapshot, error)
 	OpenPayloadReader(string, string) (io.ReadCloser, error)
+	OpenPayloadRangeReaderContext(context.Context, string, string, int64, int64) (io.ReadCloser, error)
 	StatPayload(string, string) (ObjectInfo, error)
 	ArchiveIndex(*domain.Recording) ([]ArchiveEntry, error)
 	RecordingDirectoryBytes(string) (int64, error)
@@ -121,6 +123,38 @@ func New(root string) (*Store, error) {
 	// was running, remove only stale, private probe directories when a later
 	// application generation opens storage.
 	cleanupSetupProbeResidue(filepath.Join(abs, "runtime", "state"))
+	return &Store{StorageBackend: backend, root: abs, ingestOptions: DefaultIngestOptions()}, nil
+}
+
+// NewWithObjectStore creates a Store whose canonical archive semantics remain
+// owned by Core while physical logical-key placement is delegated to objects.
+// The provider is never given recording/domain objects, only validated keys
+// and byte streams. The ordinary New constructor and its local filesystem
+// behavior are deliberately unchanged.
+func NewWithObjectStore(root string, objects PhysicalObjectStore) (*Store, error) {
+	if strings.TrimSpace(root) == "" || objects == nil {
+		return nil, errors.New("object storage configuration is invalid")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	if err = ensureStorageRoot(abs); err != nil {
+		return nil, errors.New("storage staging area is unavailable")
+	}
+	runtimeDir := filepath.Join(abs, "runtime")
+	if err = ensurePrivateStorageDirectory(runtimeDir); err != nil {
+		return nil, errors.New("storage staging area is unavailable")
+	}
+	stageDir := filepath.Join(runtimeDir, "storage-staging")
+	if err = ensurePrivateStorageDirectory(stageDir); err != nil {
+		return nil, errors.New("storage staging area is unavailable")
+	}
+	// Writers in old and candidate generations may use this same staging
+	// parent concurrently. Each object publication receives a private child
+	// directory; opening a new generation must never clean another Engine's
+	// admitted in-flight payload.
+	backend := &ObjectStoreArchiveBackend{root: abs, stageDir: stageDir, objects: objects, telemetry: newTelemetry()}
 	return &Store{StorageBackend: backend, root: abs, ingestOptions: DefaultIngestOptions()}, nil
 }
 
@@ -210,6 +244,8 @@ func (s *Store) ConfigureIngestOptions(options IngestOptions) error {
 	s.ingestOptions = options
 	if backend, ok := s.StorageBackend.(*LocalFilesystemBackend); ok {
 		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
+	} else if backend, ok := s.StorageBackend.(*ObjectStoreArchiveBackend); ok {
+		backend.telemetry.configure(options.SampleInterval, options.MetricsRetention)
 	}
 	return nil
 }
@@ -293,11 +329,13 @@ func (s *Store) publishRuntimeStorageIOTotals(ingest IngestSnapshot) {
 	s.telemetryMu.RLock()
 	runtimeTelemetry := s.runtimeTelemetry
 	s.telemetryMu.RUnlock()
-	backend, ok := s.StorageBackend.(*LocalFilesystemBackend)
-	if runtimeTelemetry == nil || !ok || backend.telemetry == nil {
+	backend, ok := s.StorageBackend.(interface {
+		ioTotals() (readBytes, writeBytes, errors uint64)
+	})
+	if runtimeTelemetry == nil || !ok {
 		return
 	}
-	readBytes, writeBytes, errorsTotal := backend.telemetry.ioTotals()
+	readBytes, writeBytes, errorsTotal := backend.ioTotals()
 	_ = runtimeTelemetry.ReportStorageIOTotals(readBytes, writeBytes, errorsTotal, ingest)
 }
 
@@ -319,6 +357,10 @@ func (s *Store) PoolMetricsWindow(window time.Duration) PoolSnapshot {
 }
 
 func (s *LocalFilesystemBackend) recordStorageError() { s.telemetry.recordError() }
+
+func (s *LocalFilesystemBackend) ioTotals() (readBytes, writeBytes, errors uint64) {
+	return s.telemetry.ioTotals()
+}
 
 // RecoveryIssues returns a snapshot of the most recent LoadAll recovery
 // findings. Issues contain only safe identifiers and fixed messages.
@@ -1164,6 +1206,63 @@ func (s *LocalFilesystemBackend) OpenPayloadReader(id, relativePath string) (io.
 		return nil, err
 	}
 	return &meteredReadCloser{File: f, telemetry: s.telemetry}, nil
+}
+
+// OpenPayloadRangeReaderContext opens only the requested byte range of a
+// canonical payload. The logical path is validated through the same safe
+// opener as full payload reads, and the section reader cannot read beyond the
+// requested length.
+func (s *LocalFilesystemBackend) OpenPayloadRangeReaderContext(ctx context.Context, id, relativePath string, offset, length int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if offset < 0 || length <= 0 || length > MaxObjectBytes || offset > MaxObjectBytes-length {
+		return nil, fmt.Errorf("invalid payload range")
+	}
+	f, info, err := s.openPayload(id, relativePath)
+	if err != nil {
+		s.telemetry.recordError()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || offset > info.Size()-length {
+		_ = f.Close()
+		return nil, fmt.Errorf("invalid payload range")
+	}
+	return &meteredSectionReadCloser{
+		reader:    io.NewSectionReader(f, offset, length),
+		file:      f,
+		telemetry: s.telemetry,
+	}, nil
+}
+
+type meteredSectionReadCloser struct {
+	reader    io.Reader
+	file      *os.File
+	telemetry *telemetry
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (r *meteredSectionReadCloser) Read(p []byte) (int, error) {
+	started := time.Now()
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.telemetry.recordRead(uint64(n), 1, time.Since(started))
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		r.telemetry.recordError()
+	}
+	return n, err
+}
+
+func (r *meteredSectionReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.file.Close()
+		if r.closeErr != nil {
+			r.telemetry.recordError()
+		}
+	})
+	return r.closeErr
 }
 
 type meteredReadCloser struct {

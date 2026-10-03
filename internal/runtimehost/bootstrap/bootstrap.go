@@ -37,6 +37,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
@@ -318,6 +319,10 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return errors.New("Runtime Host adapter catalog is unavailable")
 	}
+	storageCatalog, err := storagecatalog.Open(filepath.Join(config.DataDir, "runtime", "storage-providers"))
+	if err != nil {
+		return errors.New("Runtime Host storage provider catalog is unavailable")
+	}
 	plugins, err := pluginregistry.Open(pluginregistry.Config{
 		Root: filepath.Join(config.DataDir, "runtime", "plugin-registry"), RegistryURL: config.PluginRegistryURL,
 		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, HTTPClient: config.PluginRegistryHTTPClient,
@@ -345,6 +350,11 @@ func Run(ctx context.Context, config Config) error {
 	selected, startupGeneration, needsRegistryStage, err := prepareStartupGeneration(selected, registrySnapshot, adapterSet.ID)
 	if err != nil {
 		return err
+	}
+	if startupGeneration.StorageProviderSetID != "" {
+		if _, err := storageCatalog.LoadSet(startupGeneration.StorageProviderSetID); err != nil {
+			return errors.New("active Runtime Host storage provider set is unavailable")
+		}
 	}
 	generationID := selected.generationID
 	engineToken, err := randomSecret()
@@ -386,6 +396,7 @@ func Run(ctx context.Context, config Config) error {
 		"ENGINE_INSTANCE_ID="+engineInstanceID,
 		"ENGINE_RECOVERY_MODE="+engineRecoveryMode,
 		"ENGINE_IPC_TOKEN_FILE="+engineTokenPath)
+	engineEnv = append(engineEnv, storageProviderChildEnv(config.DataDir, startupGeneration.StorageProviderSetID)...)
 	engineEnv = append(engineEnv, runtimehook.ChildEnvironment()...)
 	engineSpec := supervisor.ProcessSpec{
 		GenerationID: generationID, Role: supervisor.RoleEngine,
@@ -452,6 +463,7 @@ func Run(ctx context.Context, config Config) error {
 		"ACTIVE_ENGINE_GENERATION="+generationID,
 		"COOKIE_SECURE="+boolEnv(config.ForceSecureCookies),
 	)
+	controlEnv = append(controlEnv, storageProviderChildEnv(config.DataDir, startupGeneration.StorageProviderSetID)...)
 	if config.AuthDisabled {
 		controlEnv = append(controlEnv, "AUTH_DISABLED=1")
 	}
@@ -504,14 +516,14 @@ func Run(ctx context.Context, config Config) error {
 		return fmt.Errorf("initialize immutable release installer: %w", err)
 	}
 	initialEngine := engineAttachment{
-		generationID: generationID, resourceOwnerID: ownerID, releaseDir: selected.directory, adapterSetID: adapterSet.ID, socketPath: engineSocket,
+		generationID: generationID, resourceOwnerID: ownerID, releaseDir: selected.directory, adapterSetID: adapterSet.ID, storageProviderSetID: startupGeneration.StorageProviderSetID, socketPath: engineSocket,
 		tokenPath: engineTokenPath, instanceID: engineReady.InstanceID, manifest: selected.manifest,
 	}
 	updates, err := newUpdateController(updateControllerOptions{
 		Config: config, HostBuild: build, ApplicationBuild: selected.appBuild,
 		Registry: registry, AdapterCatalog: adapterCatalog, Installation: installState,
-		PluginRegistry: plugins,
-		Supervisor:     sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
+		PluginRegistry: plugins, StorageCatalog: storageCatalog,
+		Supervisor: sup, Readiness: readiness, Lifecycle: lifecycle, Drain: drain,
 		EngineDetacher: lifecycle,
 		Coordinator:    coordinator, OwnerAuthority: ownerAuthority, Installer: installer, TrustedKeys: config.TrustedReleaseKeys,
 		Compatibility: currentHostCompatibility(), SourceFactory: configuredReleaseSourceFactory(config, selected.appBuild),
@@ -722,6 +734,19 @@ func commonChildEnv(config Config, adapterDirectory string) []string {
 		env = append(env, "FFMPEG_PATH="+config.FFmpegPath)
 	}
 	return env
+}
+
+// storageProviderChildEnv pins application processes to the immutable storage
+// provider set recorded in their Runtime Host generation. Empty means the
+// legacy/built-in local-primary backend.
+func storageProviderChildEnv(dataDir, setID string) []string {
+	if setID == "" {
+		return nil
+	}
+	return []string{
+		"STORAGE_PROVIDER_CATALOG_ROOT=" + filepath.Join(dataDir, "runtime", "storage-providers"),
+		"STORAGE_PROVIDER_SET_ID=" + setID,
+	}
 }
 
 func configuredAdapterSourceDirs(value string) ([]string, error) {

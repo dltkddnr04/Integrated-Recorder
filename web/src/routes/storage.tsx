@@ -1,10 +1,10 @@
 import { useState, type ReactNode } from 'react'
 import { Link, useParams } from '@tanstack/react-router'
-import { ArrowLeft, ArrowRight, Database, Gauge, HardDrive, Layers3, RefreshCw, Server, ShieldCheck, Timer, TriangleAlert, Waves } from 'lucide-react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ArrowLeft, ArrowRight, Check, Database, Gauge, HardDrive, Layers3, RefreshCw, Server, ShieldCheck, Timer, TriangleAlert, Waves } from 'lucide-react'
 import { storageMetricsQuery, storagePoolsQuery } from '@/api/queries'
-import type { StorageMetricWindow } from '@/api'
-import type { StoragePool } from '@/types/api'
+import { storageProvidersAPI, type StorageMetricWindow } from '@/api'
+import type { StoragePool, StorageProviderConfigBody, StorageProviderSummary, StorageProviderStatus } from '@/types/api'
 import { MetricChart } from '@/components/storage/metric-chart'
 import { EmptyState, ErrorState, LoadingState } from '@/components/query-state'
 import { PageHeading } from '@/components/page-heading'
@@ -14,13 +14,135 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Select, SelectItem } from '@/components/ui/select'
 import { errorMessage } from '@/lib/errors'
 import { formatBytes } from '@/lib/utils'
+import { SchemaForm } from '@/components/schema-form'
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
+import { useToast } from '@/components/ui/use-toast'
 
 export function StoragePage() {
   const pools = useQuery(storagePoolsQuery)
   return <div className="page-enter">
-    <PageHeading eyebrow="운영 현황" title="저장소" description="저장 풀의 용량과 Integrated Recorder가 수행한 읽기·쓰기 및 수집 대기 상태를 확인합니다." actions={<Button variant="outline" onClick={() => void pools.refetch()}><RefreshCw className="h-4 w-4" />새로고침</Button>} />
+    <PageHeading eyebrow="운영 현황" title="저장소" description="기본 보관 저장소와 설치된 storage provider를 관리하고, 저장 풀의 용량과 읽기·쓰기 상태를 확인합니다." actions={<Button variant="outline" onClick={() => void pools.refetch()}><RefreshCw className="h-4 w-4" />새로고침</Button>} />
+    <StorageProviderManagement />
     {pools.isLoading ? <LoadingState label="저장 풀을 불러오는 중입니다" /> : pools.error ? <ErrorState message={errorMessage(pools.error)} retry={() => void pools.refetch()} /> : <StoragePoolList pools={pools.data?.items ?? []} />}
   </div>
+}
+
+function StorageProviderManagement() {
+  const client = useQueryClient()
+  const queryKey = ['runtime-storage-provider'] as const
+  const query = useQuery({ queryKey, queryFn: storageProvidersAPI.status, staleTime: 5_000 })
+  const retry = () => void query.refetch()
+  return <section aria-labelledby="primary-storage-title" className="mb-8 space-y-4">
+    <Card>
+      <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70">
+        <div><CardTitle id="primary-storage-title" className="flex items-center gap-2"><HardDrive className="h-4 w-4 text-primary" />기본 보관 저장소</CardTitle><p className="mt-1 text-xs text-muted-foreground">Core가 archive 형식과 기록 의미를 관리하고, provider는 객체의 물리적 저장과 조회를 담당합니다.</p></div>
+        <Button variant="outline" onClick={() => { retry(); void client.invalidateQueries({ queryKey }) }} disabled={query.isFetching}><RefreshCw className={`h-4 w-4 ${query.isFetching ? 'animate-spin' : ''}`} />새로고침</Button>
+      </CardHeader>
+      <CardContent className="pt-4">
+        {query.isLoading ? <LoadingState label="기본 저장소 상태를 불러오는 중입니다" /> : query.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">저장소 상태를 불러오지 못했습니다. 내부 경로와 provider 오류 세부 정보는 표시하지 않습니다.</p><Button variant="outline" onClick={retry}>다시 시도</Button></div> : query.data ? <PrimaryStorageSummary status={query.data} /> : null}
+      </CardContent>
+    </Card>
+    {query.data && <div className="space-y-3">
+      <div><h2 className="text-base font-semibold">설치된 Storage Provider</h2><p className="mt-1 text-xs text-muted-foreground">설정, 연결 검사, 기본 저장소 활성화는 각각 별도 단계입니다. 저장소 전환은 기존 archive를 이동하지 않으며 archive가 비어 있지 않으면 거부될 수 있습니다.</p></div>
+      {query.data.providers.length ? <div className="grid min-w-0 gap-4 xl:grid-cols-2">{query.data.providers.map(provider => <StorageProviderCard key={provider.id} provider={provider} />)}</div> : <EmptyState title="설치된 storage provider가 없습니다." description="Plugin Registry에서 provider를 설치할 수 있습니다. 설치만으로는 기본 저장소가 바뀌지 않습니다." />}
+    </div>}
+  </section>
+}
+
+function PrimaryStorageSummary({ status }: { status: StorageProviderStatus }) {
+  const provider = status.primary.kind === 'plugin' ? status.providers.find(item => item.id === status.primary.provider_id) : undefined
+  const label = status.primary.kind === 'local' ? 'Local filesystem' : provider?.name ?? status.primary.provider_id ?? 'Storage provider'
+  return <div className="flex flex-wrap items-center justify-between gap-3">
+    <div><p className="text-sm font-semibold">{label}{status.primary.version ? ` · ${status.primary.version}` : ''}</p><p className="mt-1 text-xs text-muted-foreground">{status.primary.kind === 'local' ? '로컬 파일 시스템' : `Provider ID: ${status.primary.provider_id ?? '—'}`}</p></div>
+    <Badge tone={status.primary.state === 'ready' ? 'green' : 'amber'}>{status.primary.state === 'ready' ? '활성 · 준비됨' : '활성 저장소 사용 불가'}</Badge>
+  </div>
+}
+
+function StorageProviderCard({ provider }: { provider: StorageProviderSummary }) {
+  const client = useQueryClient()
+  const { toast } = useToast()
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [actionMessage, setActionMessage] = useState('')
+  const configKey = ['storage-provider-config', provider.id] as const
+  const configQuery = useQuery({ queryKey: configKey, queryFn: () => storageProvidersAPI.config(provider.id), staleTime: 10_000 })
+  const invalidate = async () => {
+    await Promise.all([
+      client.invalidateQueries({ queryKey: ['runtime-storage-provider'] }),
+      client.invalidateQueries({ queryKey: configKey }),
+      client.invalidateQueries({ queryKey: ['storage', 'pools'] }),
+    ])
+  }
+  const save = useMutation({
+    mutationFn: (body: StorageProviderConfigBody) => storageProvidersAPI.saveConfig(provider.id, body),
+    onSuccess: async () => { setActionMessage('설정을 저장했습니다. 이제 연결을 검사할 수 있습니다.'); toast('Storage provider 설정을 저장했습니다.'); await invalidate() },
+    onError: error => setActionMessage(storageActionError(error)),
+  })
+  const probe = useMutation({
+    mutationFn: () => storageProvidersAPI.probe(provider.id),
+    onSuccess: async () => { setActionMessage('연결 및 읽기·쓰기 검사가 성공했습니다.'); toast('Storage provider 연결 검사를 통과했습니다.'); await invalidate() },
+    onError: error => setActionMessage(storageActionError(error)),
+  })
+  const activate = useMutation({
+    mutationFn: () => storageProvidersAPI.activate(provider.id),
+    onSuccess: async () => { setConfirmOpen(false); setActionMessage('새 storage provider generation을 활성화했습니다.'); toast('기본 저장소를 변경했습니다.'); await invalidate() },
+    onError: error => { setConfirmOpen(false); setActionMessage(storageActionError(error)) },
+  })
+  const busy = save.isPending || probe.isPending || activate.isPending
+  const configuredSecrets = Object.fromEntries((configQuery.data?.configured_secrets ?? []).map(name => [name, true]))
+  return <Card className="min-w-0">
+    <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border/70">
+      <div className="min-w-0"><CardTitle className="truncate text-base">{provider.name}</CardTitle><p className="mt-1 font-mono text-[11px] text-muted-foreground">{provider.id} · {provider.version}</p></div>
+      <div className="flex flex-wrap gap-1.5"><Badge tone={provider.configured ? 'green' : 'amber'}>{provider.configured ? '설정됨' : '설정 필요'}</Badge><Badge tone={healthTone(provider.health)}>{healthLabel(provider.health)}</Badge>{provider.active && <Badge tone="blue">기본 저장소</Badge>}</div>
+    </CardHeader>
+    <CardContent className="space-y-5 pt-4">
+      {configQuery.isLoading ? <LoadingState label="Provider 설정 양식을 불러오는 중입니다" /> : configQuery.error ? <div role="alert" className="space-y-2"><p className="text-sm text-muted-foreground">설정 양식을 불러오지 못했습니다.</p><Button variant="outline" onClick={() => void configQuery.refetch()}>다시 시도</Button></div> : <SchemaForm
+        key={`${provider.id}-${JSON.stringify(configQuery.data?.values ?? {})}-${(configQuery.data?.configured_secrets ?? []).join(',')}`}
+        schema={provider.configuration_schema}
+        initialValues={configQuery.data?.values}
+        initialSecrets={configuredSecrets}
+        mode="config"
+        submitLabel="설정 저장"
+        busy={busy}
+        onSubmit={({ values, secrets }) => { setActionMessage(''); save.mutate({ values, secrets }) }}
+      />}
+      <div className="flex flex-wrap gap-2 border-t border-border/70 pt-4">
+        <Button variant="outline" disabled={!provider.configured || busy} onClick={() => { setActionMessage(''); probe.mutate() }}>{probe.isPending ? '검사 중…' : '연결 검사'}</Button>
+        <Button disabled={provider.active || !provider.configured || provider.health !== 'ready' || busy} onClick={() => { setActionMessage(''); setConfirmOpen(true) }}>{provider.active ? <><Check className="h-4 w-4" />기본 저장소</> : '기본 저장소로 활성화'}</Button>
+      </div>
+      {!provider.configured && <p className="text-xs text-muted-foreground">설정을 저장한 뒤 연결 검사를 통과해야 활성화할 수 있습니다.</p>}
+      {actionMessage && <p role={actionMessage.includes('성공') || actionMessage.includes('활성화') || actionMessage.includes('저장했습니다') ? 'status' : 'alert'} className="text-sm text-muted-foreground">{actionMessage}</p>}
+      <Dialog open={confirmOpen} onOpenChange={open => { if (!activate.isPending) setConfirmOpen(open) }}>
+        <DialogContent aria-describedby={`storage-activate-description-${provider.id}`}>
+          <DialogTitle>기본 저장소를 변경할까요?</DialogTitle>
+          <DialogDescription id={`storage-activate-description-${provider.id}`} className="mt-2 text-sm leading-6 text-muted-foreground">{provider.name}을 기본 저장소로 사용합니다. 기존 녹화는 자동으로 이동하지 않으며, archive가 비어 있지 않으면 전환이 거부될 수 있습니다. 진행 중인 녹화는 기존 storage generation을 계속 사용합니다.</DialogDescription>
+          <div className="mt-5 flex justify-end gap-2"><Button variant="outline" disabled={activate.isPending} onClick={() => setConfirmOpen(false)}>취소</Button><Button disabled={activate.isPending} onClick={() => activate.mutate()}>{activate.isPending ? '활성화 중…' : '확인 후 활성화'}</Button></div>
+        </DialogContent>
+      </Dialog>
+    </CardContent>
+  </Card>
+}
+
+function healthTone(health: StorageProviderSummary['health']): 'green' | 'amber' | 'red' | 'neutral' {
+  return health === 'ready' ? 'green' : health === 'failed' ? 'red' : 'neutral'
+}
+function healthLabel(health: StorageProviderSummary['health']) {
+  return health === 'ready' ? '연결 준비됨' : health === 'failed' ? '검사 실패' : '검사 필요'
+}
+function storageActionError(error: unknown): string {
+  const text = errorMessage(error)
+  const safeMessages: Record<string, string> = {
+    storage_provider_not_installed: 'Storage provider가 설치되어 있지 않습니다.',
+    storage_provider_not_configured: 'Storage provider 설정을 먼저 완료하세요.',
+    storage_provider_unavailable: 'Storage provider를 사용할 수 없습니다.',
+    storage_provider_probe_failed: '연결 검사를 통과하지 못했습니다. 설정을 확인하고 다시 시도하세요.',
+    storage_provider_identity_mismatch: 'Storage provider identity가 일치하지 않습니다.',
+    storage_provider_protocol_unsupported: '지원하지 않는 Storage Provider Protocol 버전입니다.',
+    storage_backend_in_use: '기존 녹화가 사용 중이라 저장소를 변경할 수 없습니다.',
+    storage_backend_switch_requires_empty_archive: '기존 archive를 이동하지 않으므로 비어 있지 않은 archive에서는 저장소를 변경할 수 없습니다.',
+    storage_operation_conflict: '다른 저장소 작업이 진행 중입니다. 잠시 후 다시 시도하세요.',
+    storage_activation_failed: '기본 저장소를 활성화하지 못했습니다.',
+  }
+  return safeMessages[text] ?? '저장소 작업을 완료하지 못했습니다. 설정과 연결 상태를 확인한 뒤 다시 시도하세요.'
 }
 
 export function StoragePoolList({ pools }: { pools: StoragePool[] }) {

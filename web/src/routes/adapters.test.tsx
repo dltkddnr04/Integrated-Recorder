@@ -1,15 +1,22 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from '@tanstack/react-router'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AdaptersPage } from './adapters'
 import { ToastProvider } from '@/components/ui/toast'
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
-function renderAdapters() {
+async function renderAdapters() {
+  vi.spyOn(window, 'scrollTo').mockImplementation(() => undefined)
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   client.setQueryData(['adapters'], [])
-  return render(<QueryClientProvider client={client}><ToastProvider><AdaptersPage /></ToastProvider></QueryClientProvider>)
+  const root = createRootRoute()
+  const adaptersRoute = createRoute({ getParentRoute: () => root, path: '/', component: AdaptersPage })
+  const storageRoute = createRoute({ getParentRoute: () => root, path: '/storage', component: () => null })
+  const router = createRouter({ routeTree: root.addChildren([adaptersRoute, storageRoute]), history: createMemoryHistory({ initialEntries: ['/'] }), scrollRestoration: false })
+  await router.load()
+  return render(<QueryClientProvider client={client}><ToastProvider><RouterProvider router={router} /></ToastProvider></QueryClientProvider>)
 }
 
 const availableRegistry = { state: 'ready', plugins: [{ id: 'demo', name: 'Demo Adapter', available_version: '1.2.0', installed: false, update_available: false }] }
@@ -26,7 +33,7 @@ describe('adapter discovery controls', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    renderAdapters()
+    await renderAdapters()
     fireEvent.click(await screen.findByRole('button', { name: '어댑터 다시 검색' }))
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/adapters/reconcile' && init?.method === 'POST')).toBe(true))
@@ -50,12 +57,38 @@ describe('adapter discovery controls', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    renderAdapters()
+    await renderAdapters()
     expect(await screen.findByText('Demo Adapter')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '설치' }))
 
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/demo/install' && init?.method === 'POST')).toBe(true))
     expect(await screen.findByText('플러그인을 설치하고 새 어댑터 세대를 활성화했습니다.')).toBeInTheDocument()
+  })
+
+  it('separates typed source and storage registry entries and does not activate storage on install', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/runtime/plugins/storage-sample/install' && init?.method === 'POST') {
+        return new Response(JSON.stringify({ state: 'ready', plugins: [{ id: 'storage-sample', type: 'storage', name: 'Sample Storage', available_version: '1.0.0', installed_version: '1.0.0', installed: true, update_available: false }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      const body = url === '/api/runtime/plugins' ? { state: 'ready', plugins: [
+        { id: 'source-sample', type: 'source', name: 'Sample Source', available_version: '2.0.0', installed: false, update_available: false },
+        { id: 'storage-sample', type: 'storage', name: 'Sample Storage', available_version: '1.0.0', installed: false, update_available: false },
+      ] } : []
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await renderAdapters()
+    expect(await screen.findByRole('region', { name: 'Source adapters' })).toHaveTextContent('Sample Source')
+    expect(screen.getByRole('region', { name: 'Storage providers' })).toHaveTextContent('Sample Storage')
+    expect(screen.getByText(/기본 저장소를 바꾸지 않습니다/)).toBeInTheDocument()
+    const storageSection = screen.getByRole('region', { name: 'Storage providers' })
+    fireEvent.click(within(storageSection).getByRole('button', { name: '설치' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => url === '/api/runtime/plugins/storage-sample/install' && init?.method === 'POST')).toBe(true))
+    expect(await screen.findByText('Storage provider 실행 파일을 설치했습니다.')).toBeInTheDocument()
+    expect(screen.queryByText('기본 저장소로 활성화됨')).not.toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/activate'))).toBe(false)
   })
 
   it('keeps installed plugins visible while the registry is unavailable', async () => {
@@ -68,7 +101,7 @@ describe('adapter discovery controls', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    renderAdapters()
+    await renderAdapters()
 
     expect(await screen.findByText(/Registry에 연결할 수 없습니다\. 이미 설치된 어댑터는 계속 사용할 수 있습니다\./)).toBeInTheDocument()
     expect(screen.getByText(/설치 1\.0\.0/)).toBeInTheDocument()
@@ -85,7 +118,7 @@ describe('adapter discovery controls', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    renderAdapters()
+    await renderAdapters()
     fireEvent.click(await screen.findByRole('button', { name: '설치' }))
 
     expect(await screen.findByText('다운로드한 플러그인을 검증하지 못했습니다.')).toBeInTheDocument()

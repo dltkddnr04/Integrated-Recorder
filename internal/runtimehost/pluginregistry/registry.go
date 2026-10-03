@@ -16,10 +16,15 @@ import (
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
+	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
 )
 
 const (
 	SchemaVersion        = 1
+	SchemaVersionV2      = 2
+	TypeSource           = "source"
+	TypeStorage          = "storage"
+	StorageBinaryPrefix  = "integrated-recorder-storage-"
 	MaxCatalogBytes      = 2 << 20
 	MaxPlugins           = 256
 	MaxReleasesPerPlugin = 128
@@ -63,6 +68,7 @@ type registryDocument struct {
 
 type registryPlugin struct {
 	ID         string            `json:"id"`
+	Type       string            `json:"type,omitempty"`
 	Name       string            `json:"name"`
 	Repository string            `json:"repository"`
 	Channels   map[string]string `json:"channels"`
@@ -71,9 +77,17 @@ type registryPlugin struct {
 
 type registryRelease struct {
 	Version         string             `json:"version"`
-	ProtocolVersion int                `json:"protocol_version"`
+	ProtocolVersion int                `json:"protocol_version,omitempty"`
+	Protocol        *Protocol          `json:"protocol,omitempty"`
 	SourceCommit    string             `json:"source_commit"`
 	Artifacts       []registryArtifact `json:"artifacts"`
+}
+
+// Protocol describes the typed protocol required by schema v2 releases.
+// Schema v1 continues to use registryRelease.ProtocolVersion.
+type Protocol struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
 }
 
 type registryArtifact struct {
@@ -104,6 +118,7 @@ type View struct {
 
 type PluginView struct {
 	ID               string `json:"id"`
+	Type             string `json:"type"`
 	Name             string `json:"name"`
 	AvailableVersion string `json:"available_version,omitempty"`
 	InstalledVersion string `json:"installed_version,omitempty"`
@@ -139,7 +154,8 @@ func decodeRegistry(data []byte) (registryDocument, error) {
 	return document, nil
 }
 
-// validateRegistryWireShape enforces exact v1 field spelling and presence.
+// validateRegistryWireShape enforces exact field spelling and presence for
+// each supported schema version.
 // encoding/json intentionally matches struct keys case-insensitively and
 // accepts null for several Go zero values, both of which are too permissive
 // for a signed-off distribution catalog contract. It also rejects duplicate
@@ -149,12 +165,23 @@ func validateRegistryWireShape(data []byte) error {
 	if err != nil || isJSONNull(root["schema_version"]) {
 		return ErrUnavailable
 	}
+	var schemaVersion int
+	if err := json.Unmarshal(root["schema_version"], &schemaVersion); err != nil {
+		return ErrUnavailable
+	}
+	if schemaVersion != SchemaVersion && schemaVersion != SchemaVersionV2 {
+		return ErrUnavailable
+	}
 	plugins, err := strictJSONArray(root["plugins"], MaxPlugins)
 	if err != nil {
 		return ErrUnavailable
 	}
 	for _, rawPlugin := range plugins {
-		plugin, err := strictJSONObject(rawPlugin, "id", "name", "repository", "channels", "releases")
+		pluginFields := []string{"id", "name", "repository", "channels", "releases"}
+		if schemaVersion == SchemaVersionV2 {
+			pluginFields = []string{"id", "type", "name", "repository", "channels", "releases"}
+		}
+		plugin, err := strictJSONObject(rawPlugin, pluginFields...)
 		if err != nil {
 			return ErrUnavailable
 		}
@@ -162,6 +189,9 @@ func validateRegistryWireShape(data []byte) error {
 			if !validJSONStringShape(plugin[key]) {
 				return ErrUnavailable
 			}
+		}
+		if schemaVersion == SchemaVersionV2 && !validJSONStringShape(plugin["type"]) {
+			return ErrUnavailable
 		}
 		channels, err := strictJSONObjectAny(plugin["channels"], 3)
 		if err != nil {
@@ -177,7 +207,11 @@ func validateRegistryWireShape(data []byte) error {
 			return ErrUnavailable
 		}
 		for _, rawRelease := range releases {
-			release, err := strictJSONObject(rawRelease, "version", "protocol_version", "source_commit", "artifacts")
+			releaseFields := []string{"version", "protocol_version", "source_commit", "artifacts"}
+			if schemaVersion == SchemaVersionV2 {
+				releaseFields = []string{"version", "protocol", "source_commit", "artifacts"}
+			}
+			release, err := strictJSONObject(rawRelease, releaseFields...)
 			if err != nil {
 				return ErrUnavailable
 			}
@@ -186,8 +220,15 @@ func validateRegistryWireShape(data []byte) error {
 					return ErrUnavailable
 				}
 			}
-			if isJSONNull(release["protocol_version"]) {
-				return ErrUnavailable
+			if schemaVersion == SchemaVersion {
+				if isJSONNull(release["protocol_version"]) {
+					return ErrUnavailable
+				}
+			} else {
+				protocol, err := strictJSONObject(release["protocol"], "name", "version")
+				if err != nil || !validJSONStringShape(protocol["name"]) || isJSONNull(protocol["version"]) {
+					return ErrUnavailable
+				}
 			}
 			artifacts, err := strictJSONArray(release["artifacts"], MaxArtifactsRelease)
 			if err != nil {
@@ -316,24 +357,55 @@ func requireJSONEOF(decoder *json.Decoder) error {
 }
 
 func validateRegistry(document registryDocument) error {
-	if document.SchemaVersion != SchemaVersion || len(document.Plugins) > MaxPlugins {
+	if (document.SchemaVersion != SchemaVersion && document.SchemaVersion != SchemaVersionV2) || len(document.Plugins) > MaxPlugins {
 		return ErrUnavailable
 	}
 	plugins := make(map[string]bool, len(document.Plugins))
 	for _, plugin := range document.Plugins {
+		pluginType := plugin.Type
+		if document.SchemaVersion == SchemaVersion {
+			if plugin.Type != "" {
+				return ErrUnavailable
+			}
+			// A v1 plugin has no type on the wire and is interpreted as a source.
+			pluginType = TypeSource
+		} else if pluginType != TypeSource && pluginType != TypeStorage {
+			return ErrUnavailable
+		}
 		if !validPluginID(plugin.ID) || plugins[plugin.ID] || !validText(plugin.Name, maxNameBytes) || !validRepositoryURL(plugin.Repository) || len(plugin.Releases) == 0 || len(plugin.Releases) > MaxReleasesPerPlugin || len(plugin.Channels) == 0 || len(plugin.Channels) > 3 {
+			return ErrUnavailable
+		}
+		// "local" is the Runtime Host's built-in primary-storage selector in
+		// the Storage API. A remote provider with this ID would be impossible
+		// to activate or address unambiguously.
+		if pluginType == TypeStorage && plugin.ID == "local" {
 			return ErrUnavailable
 		}
 		plugins[plugin.ID] = true
 		releases := make(map[string]registryRelease, len(plugin.Releases))
 		for _, release := range plugin.Releases {
-			if !validIdentity(release.Version) || releases[release.Version].Version != "" || release.ProtocolVersion != adapterproto.Version || !validSourceCommit(release.SourceCommit) || len(release.Artifacts) == 0 || len(release.Artifacts) > MaxArtifactsRelease {
+			protocolVersion := release.ProtocolVersion
+			if document.SchemaVersion == SchemaVersion {
+				if release.Protocol != nil {
+					return ErrUnavailable
+				}
+			} else {
+				if release.Protocol == nil || release.Protocol.Name != pluginType || release.Protocol.Version != protocolVersionForType(pluginType) || release.ProtocolVersion != 0 {
+					return ErrUnavailable
+				}
+				protocolVersion = release.Protocol.Version
+			}
+			if !validIdentity(release.Version) || releases[release.Version].Version != "" || protocolVersion != protocolVersionForType(pluginType) || !validSourceCommit(release.SourceCommit) || len(release.Artifacts) == 0 || len(release.Artifacts) > MaxArtifactsRelease {
 				return ErrUnavailable
 			}
 			platforms := map[string]bool{}
 			for _, artifact := range release.Artifacts {
 				platform := artifact.OS + "/" + artifact.Arch
-				if !validTarget(artifact.OS, artifact.Arch) || platforms[platform] || !validArtifactURL(artifact.URL) || artifact.Filename != adaptercatalog.BinaryPrefix+plugin.ID || len(artifact.Filename) < minFilenameBytes || !validText(artifact.Filename, maxFilenameBytes) || artifact.Size <= 0 || artifact.Size > MaxArtifactBytes || !shaPattern.MatchString(artifact.SHA256) {
+				prefix := adaptercatalog.BinaryPrefix
+				if pluginType == TypeStorage {
+					prefix = StorageBinaryPrefix
+				}
+				if !validTarget(artifact.OS, artifact.Arch) || platforms[platform] || !validArtifactURL(artifact.URL) || artifact.Filename != prefix+plugin.ID || len(artifact.Filename) < minFilenameBytes || !validText(artifact.Filename, maxFilenameBytes) || artifact.Size <= 0 || artifact.Size > MaxArtifactBytes || !shaPattern.MatchString(artifact.SHA256) {
 					return ErrUnavailable
 				}
 				platforms[platform] = true
@@ -350,6 +422,17 @@ func validateRegistry(document registryDocument) error {
 		}
 	}
 	return nil
+}
+
+func protocolVersionForType(pluginType string) int {
+	switch pluginType {
+	case TypeSource:
+		return adapterproto.Version
+	case TypeStorage:
+		return storageproto.Version
+	default:
+		return 0
+	}
 }
 
 func validIdentity(value string) bool {
@@ -391,7 +474,13 @@ func validText(value string, max int) bool {
 }
 
 func validTarget(goos, goarch string) bool {
-	return goos == "linux" && (goarch == "amd64" || goarch == "arm64")
+	if goarch != "amd64" && goarch != "arm64" {
+		return false
+	}
+	// Linux is the production container target. Native Darwin builds use the
+	// same Go executable and Unix-domain-socket protocol and are supported for
+	// local installations and development.
+	return goos == "linux" || goos == "darwin"
 }
 
 func validHTTPSURL(raw string, allowQuery bool) bool {

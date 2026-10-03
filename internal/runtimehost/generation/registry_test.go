@@ -472,6 +472,117 @@ func TestAdapterSetIdentityMustBeCanonicalSHA256(t *testing.T) {
 	}
 }
 
+func TestStorageProviderSetIdentityPersistsAcrossActivationAndRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "generations.json")
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Older generation records have no storage provider identity. Empty keeps
+	// those generations on the built-in local-primary backend.
+	legacy := testGeneration(generationOne, StateStaging)
+	if err := r.Stage(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkVerified(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkReady(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Activate(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationOne); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Snapshot().Generations[generationOne].StorageProviderSetID; got != "" {
+		t.Fatalf("legacy generation storage identity = %q, want empty local-primary identity", got)
+	}
+
+	firstStorageSet := strings.Repeat("a", 64)
+	secondStorageSet := strings.Repeat("b", 64)
+	first := testGeneration(generationTwo, StateStaging)
+	first.StorageProviderSetID = firstStorageSet
+	stageGenerationReady(t, r, first)
+	if err := r.Activate(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationTwo); err != nil {
+		t.Fatal(err)
+	}
+
+	second := testGeneration(generationThree, StateStaging)
+	second.StorageProviderSetID = secondStorageSet
+	stageGenerationReady(t, r, second)
+	if err := r.Activate(generationThree); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.FinalizeActivation(generationThree); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkEngineDormant(generationTwo); err != nil {
+		t.Fatalf("mark previous Engine dormant: %v", err)
+	}
+
+	reloaded, err := Open(path)
+	if err != nil {
+		t.Fatalf("reload generation storage identities: %v", err)
+	}
+	state := reloaded.Snapshot()
+	if got := state.Generations[generationTwo].StorageProviderSetID; got != firstStorageSet {
+		t.Fatalf("old generation storage set after activation/reload = %q, want %q", got, firstStorageSet)
+	}
+	if got := state.Generations[generationThree].StorageProviderSetID; got != secondStorageSet {
+		t.Fatalf("active generation storage set after reload = %q, want %q", got, secondStorageSet)
+	}
+	if got := state.Generations[generationTwo]; !got.EngineDormant || got.StorageProviderSetID != firstStorageSet {
+		t.Fatalf("dormant generation did not retain its storage set: %+v", got)
+	}
+
+	if err := reloaded.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	state = reloaded.Snapshot()
+	if got := state.Generations[generationTwo].StorageProviderSetID; got != firstStorageSet {
+		t.Fatalf("rollback target storage set = %q, want %q", got, firstStorageSet)
+	}
+	if got := state.Generations[generationTwo].EngineDormant; got {
+		t.Fatal("rollback left reactivated Engine dormant")
+	}
+	if got := state.Generations[generationThree].StorageProviderSetID; got != secondStorageSet {
+		t.Fatalf("draining generation storage set = %q, want %q", got, secondStorageSet)
+	}
+}
+
+func TestStorageProviderSetIdentityMustBeCanonicalSHA256(t *testing.T) {
+	for _, value := range []string{
+		"storage-set-name",
+		"../" + strings.Repeat("a", 64),
+		strings.Repeat("A", 64),
+		strings.Repeat("a", 63),
+		strings.Repeat("a", 65),
+	} {
+		item := testGeneration(generationOne, StateStaging)
+		item.StorageProviderSetID = value
+		if err := validateGeneration(item); err == nil {
+			t.Errorf("noncanonical storage provider set identity %q was accepted", value)
+		}
+		r, err := Open(filepath.Join(t.TempDir(), "registry.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Stage(item); err == nil {
+			t.Errorf("Stage accepted noncanonical storage provider set identity %q", value)
+		}
+	}
+	legacy := testGeneration(generationOne, StateStaging)
+	if err := validateGeneration(legacy); err != nil {
+		t.Fatalf("legacy generation without a storage set was rejected: %v", err)
+	}
+}
+
 func TestReconcileInventoryCreatesAndRefreshesLeases(t *testing.T) {
 	r := openActivated(t, generationOne)
 	now := time.Now().UTC()
@@ -866,6 +977,22 @@ func stageReady(t *testing.T, r *Registry, id string) {
 		t.Fatal(err)
 	}
 	if err := r.MarkReady(id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func stageGenerationReady(t *testing.T, r *Registry, item Generation) {
+	t.Helper()
+	if item.State != StateStaging {
+		t.Fatalf("stageGenerationReady received state %q", item.State)
+	}
+	if err := r.Stage(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkVerified(item.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkReady(item.ID); err != nil {
 		t.Fatal(err)
 	}
 }

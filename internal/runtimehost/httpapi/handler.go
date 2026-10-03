@@ -52,29 +52,40 @@ type safeErrorDefinition struct {
 }
 
 var safeControllerErrors = map[string]safeErrorDefinition{
-	"invalid_request":             {http.StatusBadRequest, "요청 형식이 올바르지 않습니다."},
-	"update_unavailable":          {http.StatusServiceUnavailable, "업데이트 기능을 사용할 수 없습니다."},
-	"plugin_registry_unavailable": {http.StatusServiceUnavailable, "플러그인 레지스트리를 사용할 수 없습니다."},
-	"plugin_not_found":            {http.StatusNotFound, "플러그인을 찾을 수 없습니다."},
-	"plugin_platform_unsupported": {http.StatusConflict, "이 플러그인은 현재 플랫폼을 지원하지 않습니다."},
-	"plugin_download_failed":      {http.StatusBadGateway, "플러그인을 다운로드하지 못했습니다."},
-	"plugin_verification_failed":  {http.StatusUnprocessableEntity, "다운로드한 플러그인을 검증하지 못했습니다."},
-	"plugin_identity_mismatch":    {http.StatusUnprocessableEntity, "플러그인 식별 정보가 레지스트리와 일치하지 않습니다."},
-	"plugin_install_failed":       {http.StatusBadGateway, "플러그인 설치를 완료하지 못했습니다."},
-	"plugin_operation_conflict":   {http.StatusConflict, "다른 Runtime 변경 작업이 진행 중입니다."},
-	"update_check_failed":         {http.StatusBadGateway, "업데이트 확인에 실패했습니다."},
-	"no_update_available":         {http.StatusNotFound, "사용 가능한 업데이트가 없습니다."},
-	"operation_conflict":          {http.StatusConflict, "다른 업데이트 작업이 진행 중입니다."},
-	"verification_failed":         {http.StatusUnprocessableEntity, "릴리스 검증에 실패했습니다."},
-	"candidate_not_ready":         {http.StatusConflict, "후보 릴리스가 준비되지 않았습니다."},
-	"release_incompatible":        {http.StatusConflict, "현재 실행 환경과 호환되지 않는 릴리스입니다."},
-	"stage_failed":                {http.StatusBadGateway, "릴리스를 준비하지 못했습니다."},
-	"activation_failed":           {http.StatusBadGateway, "릴리스를 활성화하지 못했습니다."},
-	"rollback_unavailable":        {http.StatusConflict, "롤백할 릴리스가 없습니다."},
-	"rollback_failed":             {http.StatusBadGateway, "이전 릴리스로 롤백하지 못했습니다."},
-	"installation_incomplete":     {http.StatusConflict, "설치 설정을 완료한 뒤 이용할 수 있습니다."},
-	"adapter_reconcile_failed":    {http.StatusBadGateway, "어댑터를 다시 확인하지 못했습니다."},
-	"internal_error":              {http.StatusInternalServerError, "요청을 처리하지 못했습니다."},
+	"invalid_request":                               {http.StatusBadRequest, "요청 형식이 올바르지 않습니다."},
+	"update_unavailable":                            {http.StatusServiceUnavailable, "업데이트 기능을 사용할 수 없습니다."},
+	"plugin_registry_unavailable":                   {http.StatusServiceUnavailable, "플러그인 레지스트리를 사용할 수 없습니다."},
+	"plugin_not_found":                              {http.StatusNotFound, "플러그인을 찾을 수 없습니다."},
+	"plugin_platform_unsupported":                   {http.StatusConflict, "이 플러그인은 현재 플랫폼을 지원하지 않습니다."},
+	"plugin_download_failed":                        {http.StatusBadGateway, "플러그인을 다운로드하지 못했습니다."},
+	"plugin_verification_failed":                    {http.StatusUnprocessableEntity, "다운로드한 플러그인을 검증하지 못했습니다."},
+	"plugin_identity_mismatch":                      {http.StatusUnprocessableEntity, "플러그인 식별 정보가 레지스트리와 일치하지 않습니다."},
+	"plugin_type_mismatch":                          {http.StatusUnprocessableEntity, "플러그인 종류가 설치 작업과 일치하지 않습니다."},
+	"plugin_install_failed":                         {http.StatusBadGateway, "플러그인 설치를 완료하지 못했습니다."},
+	"plugin_operation_conflict":                     {http.StatusConflict, "다른 Runtime 변경 작업이 진행 중입니다."},
+	"storage_provider_not_installed":                {http.StatusNotFound, "스토리지 제공자를 찾을 수 없습니다."},
+	"storage_provider_not_configured":               {http.StatusConflict, "스토리지 제공자 설정이 필요합니다."},
+	"storage_provider_unavailable":                  {http.StatusServiceUnavailable, "스토리지 제공자를 사용할 수 없습니다."},
+	"storage_provider_probe_failed":                 {http.StatusBadGateway, "스토리지 연결 검사를 완료하지 못했습니다."},
+	"storage_provider_identity_mismatch":            {http.StatusUnprocessableEntity, "스토리지 제공자 식별 정보가 일치하지 않습니다."},
+	"storage_provider_protocol_unsupported":         {http.StatusUnprocessableEntity, "지원하지 않는 스토리지 프로토콜입니다."},
+	"storage_backend_in_use":                        {http.StatusConflict, "현재 보관소가 사용 중입니다."},
+	"storage_backend_switch_requires_empty_archive": {http.StatusConflict, "기존 보관 데이터가 없는 경우에만 기본 스토리지를 변경할 수 있습니다."},
+	"storage_operation_conflict":                    {http.StatusConflict, "다른 Runtime 변경 작업이 진행 중입니다."},
+	"storage_activation_failed":                     {http.StatusBadGateway, "기본 스토리지를 활성화하지 못했습니다."},
+	"update_check_failed":                           {http.StatusBadGateway, "업데이트 확인에 실패했습니다."},
+	"no_update_available":                           {http.StatusNotFound, "사용 가능한 업데이트가 없습니다."},
+	"operation_conflict":                            {http.StatusConflict, "다른 업데이트 작업이 진행 중입니다."},
+	"verification_failed":                           {http.StatusUnprocessableEntity, "릴리스 검증에 실패했습니다."},
+	"candidate_not_ready":                           {http.StatusConflict, "후보 릴리스가 준비되지 않았습니다."},
+	"release_incompatible":                          {http.StatusConflict, "현재 실행 환경과 호환되지 않는 릴리스입니다."},
+	"stage_failed":                                  {http.StatusBadGateway, "릴리스를 준비하지 못했습니다."},
+	"activation_failed":                             {http.StatusBadGateway, "릴리스를 활성화하지 못했습니다."},
+	"rollback_unavailable":                          {http.StatusConflict, "롤백할 릴리스가 없습니다."},
+	"rollback_failed":                               {http.StatusBadGateway, "이전 릴리스로 롤백하지 못했습니다."},
+	"installation_incomplete":                       {http.StatusConflict, "설치 설정을 완료한 뒤 이용할 수 있습니다."},
+	"adapter_reconcile_failed":                      {http.StatusBadGateway, "어댑터를 다시 확인하지 못했습니다."},
+	"internal_error":                                {http.StatusInternalServerError, "요청을 처리하지 못했습니다."},
 }
 
 // NewControllerError returns a predefined safe public error. Unknown codes
@@ -116,6 +127,10 @@ func New(auth *authn.Service, authDisabled, forceSecureCookies bool, controller 
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if operation, id, ok := routeStorageOperation(r.Method, r.URL.Path); ok {
+		h.serveStorageOperation(w, r, operation, id)
+		return
+	}
 	if operation, id, ok := routePluginOperation(r.Method, r.URL.Path); ok {
 		h.servePluginOperation(w, r, operation, id)
 		return

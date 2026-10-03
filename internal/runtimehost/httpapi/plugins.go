@@ -28,6 +28,7 @@ type PluginStatus struct {
 
 type PluginStatusItem struct {
 	ID               string `json:"id"`
+	Type             string `json:"type"`
 	Name             string `json:"name"`
 	AvailableVersion string `json:"available_version,omitempty"`
 	InstalledVersion string `json:"installed_version,omitempty"`
@@ -47,7 +48,7 @@ func (s PluginStatus) Validate() error {
 	}
 	seen := make(map[string]struct{}, len(s.Plugins))
 	for _, item := range s.Plugins {
-		if !pluginIDPattern.MatchString(item.ID) || !safePluginText(item.Name, 128) || item.AvailableVersion != "" && !safePluginText(item.AvailableVersion, 128) || item.InstalledVersion != "" && !safePluginText(item.InstalledVersion, 128) {
+		if !pluginIDPattern.MatchString(item.ID) || (item.Type != "" && item.Type != "source" && item.Type != "storage") || !safePluginText(item.Name, 128) || item.AvailableVersion != "" && !safePluginText(item.AvailableVersion, 128) || item.InstalledVersion != "" && !safePluginText(item.InstalledVersion, 128) {
 			return errInvalidPluginStatus
 		}
 		if _, exists := seen[item.ID]; exists {

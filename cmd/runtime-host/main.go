@@ -35,6 +35,10 @@ func main() {
 		log.Printf("runtime-host: invalid startup configuration: %v", err)
 		os.Exit(1)
 	}
+	if err := configureRuntimeE2EPluginRegistryTrust(&config); err != nil {
+		log.Printf("runtime-host: test registry transport configuration is invalid")
+		os.Exit(1)
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := bootstrap.Run(ctx, config); err != nil && !errors.Is(err, context.Canceled) {

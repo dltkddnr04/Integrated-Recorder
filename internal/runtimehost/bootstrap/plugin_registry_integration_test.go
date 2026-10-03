@@ -97,9 +97,9 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 	}
 
 	initialGeneration := fixture.registry.Snapshot().ActiveGenerationID
-	status, code, _ := callPluginAPI(t, hostAPI, http.MethodPost, httpapi.PluginsEndpoint+"/registry_fixture/install")
+	status, code, body := callPluginAPI(t, hostAPI, http.MethodPost, httpapi.PluginsEndpoint+"/registry_fixture/install")
 	if code != http.StatusOK {
-		t.Fatalf("POST plugin install v1: status %d", code)
+		t.Fatalf("POST plugin install v1: status %d body %s", code, body)
 	}
 	if status.State != "ready" || !pluginStatusHasVersion(status, "registry_fixture", "1.0.0") {
 		t.Fatalf("install status = %+v, want registry_fixture 1.0.0 installed", status)
@@ -118,9 +118,9 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 	if _, code, _ := callPluginAPI(t, hostAPI, http.MethodPost, httpapi.PluginsEndpoint+"/refresh"); code != http.StatusOK {
 		t.Fatalf("POST plugin registry refresh v2: status %d", code)
 	}
-	status, code, _ = callPluginAPI(t, hostAPI, http.MethodPost, httpapi.PluginsEndpoint+"/registry_fixture/update")
+	status, code, body = callPluginAPI(t, hostAPI, http.MethodPost, httpapi.PluginsEndpoint+"/registry_fixture/update")
 	if code != http.StatusOK {
-		t.Fatalf("POST plugin update v2: status %d", code)
+		t.Fatalf("POST plugin update v2: status %d body %s", code, body)
 	}
 	if !pluginStatusHasVersion(status, "registry_fixture", "2.0.0") {
 		t.Fatalf("update status = %+v, want registry_fixture 2.0.0 installed", status)
@@ -141,7 +141,7 @@ func TestPluginRegistryInstallUpdateUninstallUsesImmutableGenerationLifecycle(t 
 	// uninstall must not report success while that set still contains the
 	// requested plugin; the durable desired state is rolled back in that case.
 	fixture.controller.adapterCatalog = rejectedFallbackCatalog{Catalog: catalog}
-	_, code, body := callPluginAPI(t, hostAPI, http.MethodDelete, httpapi.PluginsEndpoint+"/registry_fixture")
+	_, code, body = callPluginAPI(t, hostAPI, http.MethodDelete, httpapi.PluginsEndpoint+"/registry_fixture")
 	if code != http.StatusBadGateway || !strings.Contains(body, "plugin_install_failed") {
 		t.Fatalf("uninstall with rejected fallback = status %d, body %s", code, body)
 	}

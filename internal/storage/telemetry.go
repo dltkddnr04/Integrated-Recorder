@@ -49,6 +49,7 @@ type PoolSnapshot struct {
 	Role             string           `json:"role"`
 	Health           string           `json:"health"`
 	Capacity         PoolCapacity     `json:"capacity"`
+	CapacityKnown    bool             `json:"capacity_known"`
 	Throughput       PoolThroughput   `json:"throughput"`
 	EstimatedCeiling EstimatedCeiling `json:"estimated_ceiling"`
 	Buffer           PoolBuffer       `json:"buffer"`
@@ -321,6 +322,7 @@ func (s *LocalFilesystemBackend) poolMetricsAt(ingest IngestSnapshot, now time.T
 		return result
 	}
 	result.Capacity = capacity
+	result.CapacityKnown = true
 	total := capacity.TotalBytes
 	if total > 0 {
 		result.Capacity.UsageRatio = math.Min(1, float64(capacity.UsedBytes)/float64(total))

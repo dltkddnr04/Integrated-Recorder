@@ -25,6 +25,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 	"github.com/dltkddnr04/integrated-recorder/internal/storage"
+	"github.com/dltkddnr04/integrated-recorder/internal/storageprocess"
 	"github.com/dltkddnr04/integrated-recorder/internal/systemsettings"
 )
 
@@ -61,9 +62,13 @@ func run() error {
 		return err
 	}
 
-	store, err := storage.New(dataDir)
+	store, providerRuntime, err := storageprocess.OpenStore(context.Background(), dataDir,
+		strings.TrimSpace(os.Getenv("STORAGE_PROVIDER_CATALOG_ROOT")), strings.TrimSpace(os.Getenv("STORAGE_PROVIDER_SET_ID")))
 	if err != nil {
-		return fmt.Errorf("initialize archive storage: %w", err)
+		return errors.New("initialize generation-pinned archive storage")
+	}
+	if providerRuntime != nil {
+		defer func() { _ = providerRuntime.Close() }()
 	}
 	settings, err := systemsettings.Open(dataDir)
 	if err != nil {

@@ -105,6 +105,18 @@ func validRegistry(data []byte, artifactURL, id, version string) Registry {
 	}
 }
 
+func validRegistryV2(data []byte, artifactURL, id, version, pluginType string) Registry {
+	document := validRegistry(data, artifactURL, id, version)
+	document.SchemaVersion = SchemaVersionV2
+	document.Plugins[0].Type = pluginType
+	document.Plugins[0].Releases[0].Protocol = &Protocol{Name: pluginType, Version: 1}
+	document.Plugins[0].Releases[0].ProtocolVersion = 0
+	if pluginType == TypeStorage {
+		document.Plugins[0].Releases[0].Artifacts[0].Filename = StorageBinaryPrefix + id
+	}
+	return document
+}
+
 func marshalRegistry(t *testing.T, document Registry) []byte {
 	t.Helper()
 	data, err := json.Marshal(document)
@@ -158,6 +170,9 @@ func TestDecodeRegistryStrictAndBounded(t *testing.T) {
 	data := compiledFixture(t)
 	document := validRegistry(data, "https://cdn.example.test/artifact", "registry-fixture", "1.0.0")
 	valid := marshalRegistry(t, document)
+	if bytes.Contains(valid, []byte(`"type"`)) || bytes.Contains(valid, []byte(`"protocol"`)) || !bytes.Contains(valid, []byte(`"protocol_version":1`)) {
+		t.Fatalf("v1 encoding changed its legacy field contract: %s", valid)
+	}
 	if _, err := decodeRegistry(valid); err != nil {
 		t.Fatalf("valid catalog rejected: %v", err)
 	}
@@ -191,6 +206,12 @@ func TestDecodeRegistryStrictAndBounded(t *testing.T) {
 		{name: "duplicate field", edit: func(data []byte) []byte {
 			return bytes.Replace(data, []byte(`{"schema_version":1`), []byte(`{"schema_version":1,"schema_version":1`), 1)
 		}},
+		{name: "v1 plugin type field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"id":"registry-fixture",`), []byte(`"id":"registry-fixture","type":"source",`), 1)
+		}},
+		{name: "v1 typed protocol field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol_version":1`), []byte(`"protocol":{"name":"source","version":1}`), 1)
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -201,6 +222,80 @@ func TestDecodeRegistryStrictAndBounded(t *testing.T) {
 	}
 	if _, err := decodeRegistry(bytes.Repeat([]byte{' '}, MaxCatalogBytes+1)); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("oversized catalog accepted: %v", err)
+	}
+}
+
+func TestDecodeRegistryV2TypedPlugins(t *testing.T) {
+	data := []byte("fixture")
+	for _, pluginType := range []string{TypeSource, TypeStorage} {
+		t.Run(pluginType, func(t *testing.T) {
+			wire := marshalRegistry(t, validRegistryV2(data, "https://cdn.example.test/artifact", "registry-fixture", "1.0.0", pluginType))
+			document, err := decodeRegistry(wire)
+			if err != nil {
+				t.Fatalf("valid v2 %s catalog rejected: %v", pluginType, err)
+			}
+			if bytes.Contains(wire, []byte(`"protocol_version"`)) {
+				t.Fatalf("v2 encoding contains legacy protocol_version: %s", wire)
+			}
+			if document.SchemaVersion != SchemaVersionV2 || len(document.Plugins) != 1 || document.Plugins[0].Type != pluginType {
+				t.Fatalf("decoded v2 plugin = %+v", document)
+			}
+			protocol := document.Plugins[0].Releases[0].Protocol
+			if protocol.Name != pluginType || protocol.Version != 1 {
+				t.Fatalf("decoded protocol = %+v", protocol)
+			}
+		})
+	}
+	localStorage := validRegistryV2(data, "https://cdn.example.test/artifact", "local", "1.0.0", TypeStorage)
+	if _, err := decodeRegistry(marshalRegistry(t, localStorage)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("storage provider using the reserved local selector was accepted: %v", err)
+	}
+
+	valid := marshalRegistry(t, validRegistryV2(data, "https://cdn.example.test/artifact", "registry-fixture", "1.0.0", TypeSource))
+	tests := []struct {
+		name string
+		edit func([]byte) []byte
+	}{
+		{name: "missing type", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"type":"source",`), nil, 1)
+		}},
+		{name: "unknown type", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"type":"source"`), []byte(`"type":"other"`), 1)
+		}},
+		{name: "wrong case type field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"type":"source"`), []byte(`"Type":"source"`), 1)
+		}},
+		{name: "mismatched protocol name", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1}`), []byte(`"protocol":{"name":"storage","version":1}`), 1)
+		}},
+		{name: "missing protocol", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1},`), nil, 1)
+		}},
+		{name: "null protocol", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1}`), []byte(`"protocol":null`), 1)
+		}},
+		{name: "wrong case protocol field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1}`), []byte(`"Protocol":{"name":"source","version":1}`), 1)
+		}},
+		{name: "wrong protocol version", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1}`), []byte(`"protocol":{"name":"source","version":2}`), 1)
+		}},
+		{name: "legacy protocol version field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"version":"1.0.0",`), []byte(`"version":"1.0.0","protocol_version":1,`), 1)
+		}},
+		{name: "unknown protocol field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1}`), []byte(`"protocol":{"name":"source","version":1,"extra":true}`), 1)
+		}},
+		{name: "duplicate protocol field", edit: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"protocol":{"name":"source","version":1}`), []byte(`"protocol":{"name":"source","name":"source","version":1}`), 1)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := decodeRegistry(test.edit(valid)); !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("expected unavailable, got %v", err)
+			}
+		})
 	}
 }
 
@@ -409,7 +504,7 @@ func TestInstallUpdateRollbackUninstallAndRegistryOutage(t *testing.T) {
 	plan.Close()
 	plan.Close()
 	view := manager.View()
-	if !view.Configured || !view.Available || len(view.Installed) != 1 || view.Plugins[0].InstalledVersion != "1.0.0" {
+	if !view.Configured || !view.Available || len(view.Installed) != 1 || view.Plugins[0].Type != TypeSource || view.Plugins[0].InstalledVersion != "1.0.0" {
 		t.Fatalf("installed view not updated: %+v", view)
 	}
 	if dirs, err := manager.DesiredSourceDirs(); err != nil || len(dirs) != 1 || dirs[0] != filepath.Dir(path) {
@@ -598,7 +693,7 @@ func TestInstallRejectsDigestSizeAndDescriptorMismatchWithoutStateMutation(t *te
 func TestUnsupportedPlatformAndDesiredOnlyUninstall(t *testing.T) {
 	fixture := compiledFixture(t)
 	document := validRegistry(fixture, "https://cdn.invalid/artifact", "registry-fixture", "1.0.0")
-	manager, server := openFixtureManager(t, document, fixture, "darwin", runtime.GOARCH)
+	manager, server := openFixtureManager(t, document, fixture, "windows", runtime.GOARCH)
 	_ = server
 	if err := manager.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
@@ -875,9 +970,22 @@ func TestRegistryFailedRefreshKeepsPreviouslyApprovedCacheOutOfView(t *testing.T
 
 func TestArtifactSchemaBoundaryRejectsUnsupportedPlatformArtifacts(t *testing.T) {
 	document := validRegistry([]byte("x"), "https://cdn.example.test/a", "registry-fixture", "1.0.0")
-	document.Plugins[0].Releases[0].Artifacts[0].OS = "darwin"
+	document.Plugins[0].Releases[0].Artifacts[0].OS = "windows"
 	if validateRegistry(document) == nil {
 		t.Fatal("unsupported platform artifact accepted")
+	}
+}
+
+func TestRegistryAcceptsNativeDarwinTargets(t *testing.T) {
+	for _, arch := range []string{"amd64", "arm64"} {
+		if !validTarget("darwin", arch) {
+			t.Errorf("native darwin/%s target was rejected", arch)
+		}
+	}
+	for _, platform := range [][2]string{{"windows", "amd64"}, {"darwin", "386"}, {"freebsd", "arm64"}} {
+		if validTarget(platform[0], platform[1]) {
+			t.Errorf("unsupported target %s/%s was accepted", platform[0], platform[1])
+		}
 	}
 }
 

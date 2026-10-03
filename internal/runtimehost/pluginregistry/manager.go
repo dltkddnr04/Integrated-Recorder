@@ -2,6 +2,7 @@ package pluginregistry
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -21,6 +22,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterhost"
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/network"
+	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
 )
 
 const (
@@ -28,6 +30,8 @@ const (
 	maxRedirects   = 3
 	copyBufferSize = 128 << 10
 )
+
+var ErrWrongPluginType = errors.New("plugin type is not supported by the source adapter installer")
 
 type Config struct {
 	Root        string
@@ -233,7 +237,14 @@ func (m *Manager) View() View {
 		for _, plugin := range plugins {
 			release, hasStable := stableRelease(plugin)
 			item, isInstalled := installed[plugin.ID]
-			p := PluginView{ID: plugin.ID, Name: plugin.Name, Installed: isInstalled}
+			pluginType := plugin.Type
+			if m.registry.SchemaVersion == SchemaVersion {
+				pluginType = TypeSource
+			}
+			if pluginType == "" {
+				pluginType = TypeSource
+			}
+			p := PluginView{ID: plugin.ID, Name: plugin.Name, Type: pluginType, Installed: isInstalled}
 			if hasStable {
 				p.AvailableVersion = release.Version
 			}
@@ -252,10 +263,34 @@ func (m *Manager) View() View {
 		if seen[item.ID] {
 			continue
 		}
-		view.Plugins = append(view.Plugins, PluginView{ID: item.ID, Name: item.Name, InstalledVersion: item.Version, Installed: true})
+		view.Plugins = append(view.Plugins, PluginView{ID: item.ID, Name: item.Name, Type: TypeSource, InstalledVersion: item.Version, Installed: true})
 	}
 	sort.Slice(view.Plugins, func(i, j int) bool { return view.Plugins[i].ID < view.Plugins[j].ID })
 	return view
+}
+
+// UpdateAvailable reports whether the currently approved registry snapshot
+// has a stable artifact for the running platform whose version differs from
+// the installed typed plugin version.
+func (m *Manager) UpdateAvailable(id, installedVersion string) bool {
+	if m == nil || !validPluginID(id) || installedVersion == "" {
+		return false
+	}
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	if !m.available || m.registry == nil {
+		return false
+	}
+	plugin, ok := findPlugin(m.registry.Plugins, id)
+	if !ok {
+		return false
+	}
+	release, ok := stableRelease(plugin)
+	if !ok || release.Version == installedVersion {
+		return false
+	}
+	_, ok = selectArtifact(release, m.goos, m.goarch)
+	return ok
 }
 
 func (m *Manager) DesiredSourceDirs() ([]string, error) {
@@ -307,6 +342,13 @@ func (m *Manager) PrepareInstall(ctx context.Context, id string, update bool) (*
 	plugin, ok := findPlugin(registryCopy.Plugins, id)
 	if !ok {
 		return nil, ErrPluginNotFound
+	}
+	pluginType := plugin.Type
+	if registryCopy.SchemaVersion == SchemaVersion {
+		pluginType = TypeSource
+	}
+	if pluginType != TypeSource {
+		return nil, ErrWrongPluginType
 	}
 	release, ok := stableRelease(plugin)
 	if !ok {
@@ -492,17 +534,78 @@ func (m *Manager) downloadAndVerify(ctx context.Context, plugin registryPlugin, 
 		}
 		return ErrDownloadFailed
 	}
-	// The name and executable bit are applied only after exact bytes and size
-	// have passed the registry pin. Descriptor probing uses Core's production
-	// adapterhost discovery and validation path.
+	// The executable bit is applied only after exact bytes and size pass the
+	// Registry's digest pin. Protocol-specific black-box probing follows before
+	// the verified artifact is published.
 	if err := os.Chmod(stagePath, 0500); err != nil {
 		return ErrInstallFailed
 	}
-	if err := probeIdentity(ctx, stageDir, plugin.ID, release.Version, release.ProtocolVersion); err != nil {
-		return err
+	protocolVersion := release.ProtocolVersion
+	if release.Protocol != nil {
+		protocolVersion = release.Protocol.Version
+	}
+	var probeErr error
+	if plugin.Type == TypeStorage {
+		probeErr = probeStorageIdentity(ctx, stageDir, stagePath, plugin.ID, release.Version, protocolVersion)
+	} else {
+		probeErr = probeIdentity(ctx, stageDir, plugin.ID, release.Version, protocolVersion)
+	}
+	if probeErr != nil {
+		return probeErr
 	}
 	if _, err := m.persistVerifiedArtifact(stagePath, artifact.SHA256, artifact.Size); err != nil {
 		return err
+	}
+	return nil
+}
+
+func probeStorageIdentity(ctx context.Context, _ string, binary, id, version string, protocol int) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	// The adapter is discovered from a nested staging directory, which can be
+	// longer than the platform's Unix-domain socket pathname limit. Keep the
+	// private IPC rendezvous under a short, separately-owned temp directory;
+	// only the verified executable remains in the download staging area.
+	probeDir, err := os.MkdirTemp("/tmp", "irpr-")
+	if err != nil {
+		return ErrIdentityMismatch
+	}
+	defer os.RemoveAll(probeDir)
+	if err := os.Chmod(probeDir, 0700); err != nil {
+		return ErrIdentityMismatch
+	}
+	socketPath := filepath.Join(probeDir, "p.sock")
+	tokenPath := filepath.Join(probeDir, "t")
+	token := make([]byte, 32)
+	if _, err := rand.Read(token); err != nil {
+		return ErrIdentityMismatch
+	}
+	tokenText := []byte(hex.EncodeToString(token))
+	if err := os.WriteFile(tokenPath, tokenText, 0600); err != nil {
+		for i := range tokenText {
+			tokenText[i] = 0
+		}
+		for i := range token {
+			token[i] = 0
+		}
+		return ErrIdentityMismatch
+	}
+	client, err := storageproto.Start(probeCtx, storageproto.StartOptions{
+		Binary: binary, SocketPath: socketPath, TokenFile: tokenPath, StartupTimeout: 5 * time.Second,
+	})
+	for i := range tokenText {
+		tokenText[i] = 0
+	}
+	for i := range token {
+		token[i] = 0
+	}
+	if err != nil {
+		return ErrIdentityMismatch
+	}
+	defer func() { _ = client.Close() }()
+	descriptor, err := client.Describe(probeCtx)
+	if err != nil || storageproto.ValidateDescriptor(descriptor) != nil || descriptor.ID != id || descriptor.Version != version || descriptor.ProtocolVersion != protocol || descriptor.ProtocolVersion != storageproto.Version {
+		return ErrIdentityMismatch
 	}
 	return nil
 }

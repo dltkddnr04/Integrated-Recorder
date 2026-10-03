@@ -1171,10 +1171,40 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	f, err := s.storage.OpenPayloadReader(recording.ID, found.StoragePath)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "stored payload is unavailable")
-		return
+	var f io.ReadCloser
+	status := http.StatusOK
+	contentLength := found.PayloadSize
+	contentRange := ""
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		info, statErr := s.storage.StatPayload(recording.ID, found.StoragePath)
+		if statErr != nil || !info.Regular || info.Size < 0 || info.Size != found.PayloadSize {
+			writeError(w, http.StatusNotFound, "stored payload is unavailable")
+			return
+		}
+		offset, length, valid := parseSingleByteRange(rangeHeader, info.Size)
+		if !valid {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size))
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Type", mediaContentType(found.StoragePath))
+			w.Header().Set("Cache-Control", "private, no-store")
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		f, err = s.storage.OpenPayloadRangeReaderContext(r.Context(), recording.ID, found.StoragePath, offset, length)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "stored payload is unavailable")
+			return
+		}
+		status = http.StatusPartialContent
+		contentLength = length
+		contentRange = fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, info.Size)
+	} else {
+		f, err = s.storage.OpenPayloadReader(recording.ID, found.StoragePath)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "stored payload is unavailable")
+			return
+		}
 	}
 	defer f.Close()
 	// net/http applies the server's WriteTimeout to the entire handler body.
@@ -1185,11 +1215,68 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", mediaContentType(found.StoragePath))
-	w.Header().Set("Content-Length", strconv.FormatInt(found.PayloadSize, 10))
+	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Accept-Ranges", "bytes")
+	if contentRange != "" {
+		w.Header().Set("Content-Range", contentRange)
+		w.WriteHeader(status)
+	}
 	if _, err = io.Copy(w, f); err != nil {
 		return
 	}
+}
+
+// parseSingleByteRange parses a single RFC 9110 byte range. Multiple ranges
+// are deliberately rejected rather than causing a full-object fallback or a
+// multipart response that might buffer the archive object.
+func parseSingleByteRange(header string, size int64) (offset, length int64, ok bool) {
+	if size <= 0 || size > storage.MaxObjectBytes {
+		return 0, 0, false
+	}
+	unit, spec, found := strings.Cut(strings.TrimSpace(header), "=")
+	if !found || !strings.EqualFold(unit, "bytes") || strings.Contains(spec, ",") || strings.Count(spec, "-") != 1 {
+		return 0, 0, false
+	}
+	first, last, _ := strings.Cut(spec, "-")
+	if first == "" {
+		suffix, valid := parseByteRangeNumber(last)
+		if !valid || suffix == 0 {
+			return 0, 0, false
+		}
+		if suffix >= size {
+			return 0, size, true
+		}
+		return size - suffix, suffix, true
+	}
+	start, valid := parseByteRangeNumber(first)
+	if !valid || start >= size {
+		return 0, 0, false
+	}
+	end := size - 1
+	if last != "" {
+		end, valid = parseByteRangeNumber(last)
+		if !valid || end < start {
+			return 0, 0, false
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return start, end - start + 1, true
+}
+
+func parseByteRangeNumber(value string) (int64, bool) {
+	if value == "" {
+		return 0, false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return 0, false
+		}
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return parsed, err == nil
 }
 
 func (s *Server) playableRecording(id string) (*domain.Recording, error) {

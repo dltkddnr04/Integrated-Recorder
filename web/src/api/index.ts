@@ -1,5 +1,5 @@
 import { api, queryString } from './client'
-import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
+import type { Adapter, AdapterConfig, AdapterDescriptor, AdapterReconcileResult, ApiSession, ArchiveEntry, AuditEvent, Dashboard, ExportJob, InstallationStatus, IntegrityJob, IntegrityResult, LogEntry, Notification, PluginRegistryStatus, PreviewFramesResponse, RecordingDetail, RecordingEvent, RecordingMetadata, RecordingPage, RecordingSummary, Resource, ResourceRef, RuntimeUpdateStatus, Schema, SearchResult, SetupStorageTest, StorageInfo, StorageMetricsResponse, StoragePoolsResponse, StorageProviderConfig, StorageProviderConfigBody, StorageProviderStatus, StorageSettings, SystemInfo, SystemSettings, WatchEvent, WatchView, WorkflowHistoryEvent, WorkflowProgress, WorkflowSummary } from '@/types/api'
 
 export const authAPI = {
   session: () => api<ApiSession>('/api/auth/session'),
@@ -20,6 +20,13 @@ export type StorageMetricWindow = '1h' | '6h' | '24h'
 export const storageAPI = {
   pools: () => api<StoragePoolsResponse>('/api/storage/pools'),
   metrics: (poolId: string, window: StorageMetricWindow) => api<StorageMetricsResponse>(`/api/storage/pools/${encodeURIComponent(poolId)}/metrics${queryString({ window })}`),
+}
+export const storageProvidersAPI = {
+  status: () => api<StorageProviderStatus>('/api/runtime/storage/provider'),
+  config: (id: string) => api<StorageProviderConfig>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/config`),
+  saveConfig: (id: string, body: StorageProviderConfigBody) => api<StorageProviderConfig>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/config`, { method: 'PUT', body }),
+  probe: (id: string) => api<void>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/probe`, { method: 'POST', body: {} }),
+  activate: (id: string) => api<StorageProviderStatus>(`/api/runtime/storage/providers/${encodeURIComponent(id)}/activate`, { method: 'POST', body: {} }),
 }
 export type RecordingQuery = { q?: string; state?: string; adapter?: string; resource_type?: string; started_after?: string; started_before?: string; has_gaps?: string; integrity?: string; tag?: string; sort?: string; limit?: number; cursor?: string }
 export type PreviewQuery = { sampling: 'uniform' | 'recent' | 'nearest'; limit: number; time_seconds?: number }

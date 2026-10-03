@@ -1,0 +1,16 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-storage",
+  "name": "Fixture Storage",
+  "version": "1.0.0",
+  "configuration_schema": {"fields": []},
+  "capabilities": [
+    "object.read",
+    "object.write",
+    "object.stat",
+    "object.list",
+    "object.delete",
+    "object.range_read",
+    "atomic_replace"
+  ]
+}

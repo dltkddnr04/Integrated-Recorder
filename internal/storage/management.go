@@ -65,6 +65,7 @@ type IntegrityResult struct {
 // absolute machine path by serializing this value directly.
 type StorageStats struct {
 	ArchiveRoot              string `json:"-"`
+	CapacityKnown            bool   `json:"capacity_known"`
 	FilesystemTotalBytes     uint64 `json:"filesystem_total_bytes"`
 	FilesystemUsedBytes      uint64 `json:"filesystem_used_bytes"`
 	FilesystemAvailableBytes uint64 `json:"filesystem_available_bytes"`
@@ -338,6 +339,7 @@ func (s *LocalFilesystemBackend) StorageStats() (StorageStats, error) {
 	stats.FilesystemTotalBytes = total
 	stats.FilesystemUsedBytes = used
 	stats.FilesystemAvailableBytes = available
+	stats.CapacityKnown = true
 
 	base := filepath.Join(s.root, "recordings")
 	baseInfo, err := os.Lstat(base)

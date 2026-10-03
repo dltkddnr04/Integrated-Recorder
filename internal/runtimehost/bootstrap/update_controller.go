@@ -29,6 +29,7 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/recordingowner"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/release"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/resources"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/supervisor"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimeipc"
 )
@@ -80,14 +81,15 @@ type EngineDetacher interface {
 // engineAttachment is private Host runtime state. Paths and tokens in this
 // value are never projected through the update API.
 type engineAttachment struct {
-	generationID    string
-	resourceOwnerID string
-	releaseDir      string
-	adapterSetID    string
-	socketPath      string
-	tokenPath       string
-	instanceID      string
-	manifest        *release.Manifest
+	generationID         string
+	resourceOwnerID      string
+	releaseDir           string
+	adapterSetID         string
+	storageProviderSetID string
+	socketPath           string
+	tokenPath            string
+	instanceID           string
+	manifest             *release.Manifest
 }
 
 type updateControllerOptions struct {
@@ -97,6 +99,7 @@ type updateControllerOptions struct {
 	Registry          *generation.Registry
 	AdapterCatalog    hostAdapterCatalog
 	PluginRegistry    *pluginregistry.Manager
+	StorageCatalog    *storagecatalog.Catalog
 	Installation      *installation.Store
 	Supervisor        updateSupervisor
 	Readiness         readinessRegistrar
@@ -126,6 +129,7 @@ type updateController struct {
 	registry          *generation.Registry
 	adapterCatalog    hostAdapterCatalog
 	pluginRegistry    *pluginregistry.Manager
+	storageCatalog    *storagecatalog.Catalog
 	installation      *installation.Store
 	supervisor        updateSupervisor
 	readiness         readinessRegistrar
@@ -215,7 +219,7 @@ func newUpdateController(options updateControllerOptions) (*updateController, er
 	}
 	c := &updateController{
 		config: options.Config, hostBuild: options.HostBuild, applicationBuild: options.ApplicationBuild,
-		registry: options.Registry, adapterCatalog: options.AdapterCatalog, pluginRegistry: options.PluginRegistry, installation: options.Installation,
+		registry: options.Registry, adapterCatalog: options.AdapterCatalog, pluginRegistry: options.PluginRegistry, storageCatalog: options.StorageCatalog, installation: options.Installation,
 		supervisor: options.Supervisor, readiness: options.Readiness,
 		lifecycle: options.Lifecycle, drain: options.Drain, engineDetacher: options.EngineDetacher, coordinator: options.Coordinator,
 		ownerAuthority: options.OwnerAuthority,
@@ -356,8 +360,8 @@ func (c *updateController) Stage(ctx context.Context) (httpapi.Status, error) {
 	}
 	newGeneration := generation.Generation{
 		ID: genID, Version: installed.Manifest.ReleaseVersion, Commit: strings.ToLower(installed.Manifest.Commit),
-		AdapterSetID: activeGeneration.AdapterSetID,
-		InstalledAt:  time.Now().UTC(), State: generation.StateStaging,
+		AdapterSetID: activeGeneration.AdapterSetID, StorageProviderSetID: activeGeneration.StorageProviderSetID,
+		InstalledAt: time.Now().UTC(), State: generation.StateStaging,
 		ControlProtocol: installed.Manifest.ControlProtocolVersion, EngineProtocol: installed.Manifest.EngineProtocolVersion,
 		ArchiveReadCompatibility: generation.CompatibilityRange{Minimum: installed.Manifest.ArchiveReadMinimum, Maximum: installed.Manifest.ArchiveReadMaximum},
 		ArchiveWriteEpoch:        installed.Manifest.ArchiveWriteEpoch,
@@ -872,7 +876,7 @@ func (c *updateController) handoverOneDrainingRecording(ctx context.Context, rea
 
 	sourceIDs := make([]string, 0, len(registryState.Generations))
 	for id, sourceGeneration := range registryState.Generations {
-		if id == targetID || sourceGeneration.State != generation.StateDraining || sourceGeneration.AdapterSetID == "" || sourceGeneration.AdapterSetID != targetGeneration.AdapterSetID {
+		if id == targetID || sourceGeneration.State != generation.StateDraining || sourceGeneration.AdapterSetID == "" || sourceGeneration.AdapterSetID != targetGeneration.AdapterSetID || sourceGeneration.StorageProviderSetID != targetGeneration.StorageProviderSetID {
 			continue
 		}
 		if _, live := ready[id]; live {
@@ -1295,17 +1299,75 @@ func (c *updateController) finishRetiredGeneration(ctx context.Context, g genera
 }
 
 func (c *updateController) collectAdapterSets() {
-	if c.adapterCatalog == nil || c.registry == nil || c.supervisor == nil {
+	if c.registry == nil || c.supervisor == nil {
 		return
 	}
 	registryState := c.registry.Snapshot()
-	keep, consistent := adapterSetCollectionRoots(registryState, c.EngineAttachments(), c.supervisor.Snapshot())
+	attachments := c.EngineAttachments()
+	processes := c.supervisor.Snapshot()
+	keep, consistent := adapterSetCollectionRoots(registryState, attachments, processes)
 	if !consistent {
-		// The registry and live Engine views no longer identify every possible
-		// reader. Retain all immutable sets until a later consistent pass.
+		// The registry and live process views no longer identify every possible
+		// reader. Retain all immutable adapter and storage sets until a later
+		// consistent pass.
 		return
 	}
-	_ = c.adapterCatalog.Collect(keep)
+	if c.adapterCatalog != nil {
+		_ = c.adapterCatalog.Collect(keep)
+	}
+	if c.storageCatalog != nil {
+		storageRoots, ok := storageProviderSetCollectionRoots(registryState, attachments, processes)
+		if !ok {
+			return
+		}
+		_ = c.storageCatalog.CollectGarbage(storageRoots)
+	}
+}
+
+// storageProviderSetCollectionRoots mirrors the full generation/process
+// consistency audit used for source adapter sets. A provider set remains
+// pinned by every active, staged, draining, lease-bearing, or attached Engine
+// generation. Ambiguous process state disables collection.
+func storageProviderSetCollectionRoots(registryState generation.Snapshot, attachments []engineAttachment, processes supervisor.Snapshot) ([]string, bool) {
+	if _, consistent := adapterSetCollectionRoots(registryState, attachments, processes); !consistent {
+		return nil, false
+	}
+	roots := make(map[string]struct{})
+	for id, item := range registryState.Generations {
+		if item.ID != id || (item.StorageProviderSetID != "" && !validStorageProviderSetIdentity(item.StorageProviderSetID)) {
+			return nil, false
+		}
+		switch item.State {
+		case generation.StateActive, generation.StateDraining, generation.StateStaging, generation.StateVerified, generation.StateReady:
+			if item.StorageProviderSetID != "" {
+				roots[item.StorageProviderSetID] = struct{}{}
+			}
+		}
+	}
+	for _, lease := range registryState.Leases {
+		item, exists := registryState.Generations[lease.EngineGeneration]
+		if !exists || item.ID != lease.EngineGeneration {
+			return nil, false
+		}
+		if item.StorageProviderSetID != "" {
+			roots[item.StorageProviderSetID] = struct{}{}
+		}
+	}
+	for _, attachment := range attachments {
+		item, exists := registryState.Generations[attachment.generationID]
+		if !exists || item.ID != attachment.generationID || item.StorageProviderSetID != attachment.storageProviderSetID {
+			return nil, false
+		}
+		if attachment.storageProviderSetID != "" {
+			roots[attachment.storageProviderSetID] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(roots))
+	for id := range roots {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result, true
 }
 
 // adapterSetCollectionRoots returns only adapter sets referenced by live
@@ -1353,7 +1415,7 @@ func adapterSetCollectionRoots(registryState generation.Snapshot, attachments []
 	rootGenerations := make(map[string]struct{})
 	activeCount := 0
 	for id, item := range registryState.Generations {
-		if item.ID != id || !generationPattern.MatchString(id) || (item.AdapterSetID != "" && !validAdapterSetIdentity(item.AdapterSetID)) {
+		if item.ID != id || !generationPattern.MatchString(id) || (item.AdapterSetID != "" && !validAdapterSetIdentity(item.AdapterSetID)) || (item.StorageProviderSetID != "" && !validStorageProviderSetIdentity(item.StorageProviderSetID)) {
 			return nil, false
 		}
 		switch item.State {
@@ -1398,7 +1460,7 @@ func adapterSetCollectionRoots(registryState generation.Snapshot, attachments []
 	attachmentByGeneration := make(map[string]engineAttachment, len(attachments))
 	for _, attachment := range attachments {
 		item, exists := lookup(attachment.generationID)
-		if !exists || item.AdapterSetID != attachment.adapterSetID || !addSet(attachment.adapterSetID) {
+		if !exists || item.AdapterSetID != attachment.adapterSetID || item.StorageProviderSetID != attachment.storageProviderSetID || !addSet(attachment.adapterSetID) {
 			return nil, false
 		}
 		if _, duplicate := attachmentByGeneration[attachment.generationID]; duplicate {
@@ -1451,6 +1513,18 @@ func adapterSetCollectionRoots(registryState generation.Snapshot, attachments []
 }
 
 func validAdapterSetIdentity(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9') && !(character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validStorageProviderSetIdentity(value string) bool {
 	if len(value) != 64 {
 		return false
 	}
@@ -1653,6 +1727,7 @@ func (c *updateController) startEngine(ctx context.Context, id, directory string
 	}
 	env := commonChildEnv(c.config, adapterDir)
 	env = append(env, "RUNTIME_RESOURCE_SOCKET_PATH="+c.resourceSocket, "RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath, "RUNTIME_RESOURCE_OWNER="+owner)
+	env = append(env, storageProviderChildEnv(c.config.DataDir, gen.StorageProviderSetID)...)
 	env = append(env, "ENGINE_SOCKET_PATH="+socket, "ENGINE_GENERATION_ID="+id, "ENGINE_INSTANCE_ID="+engineInstanceID, "ENGINE_RECOVERY_MODE=fresh", "ENGINE_IPC_TOKEN_FILE="+tokenPath)
 	env = append(env, runtimehook.ChildEnvironment()...)
 	spec := supervisor.ProcessSpec{GenerationID: id, Role: supervisor.RoleEngine, Executable: executable, Dir: directory, Env: env}
@@ -1670,7 +1745,7 @@ func (c *updateController) startEngine(ctx context.Context, id, directory string
 			return engineAttachment{}, errors.New("Recorder Engine resource identity could not be registered")
 		}
 	}
-	attachment := engineAttachment{generationID: id, resourceOwnerID: owner, releaseDir: directory, adapterSetID: gen.AdapterSetID, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
+	attachment := engineAttachment{generationID: id, resourceOwnerID: owner, releaseDir: directory, adapterSetID: gen.AdapterSetID, storageProviderSetID: gen.StorageProviderSetID, socketPath: socket, tokenPath: tokenPath, instanceID: ready.InstanceID}
 	if manifest.ReleaseVersion != "" {
 		copyManifest := manifest
 		attachment.manifest = &copyManifest
@@ -1754,6 +1829,7 @@ func (c *updateController) publishControl(ctx context.Context, id, directory str
 		"RUNTIME_RESOURCE_TOKEN_FILE="+c.resourceTokenPath,
 		"RUNTIME_RESOURCE_OWNER="+resourceOwner,
 	)
+	env = append(env, storageProviderChildEnv(c.config.DataDir, gen.StorageProviderSetID)...)
 	if c.config.AuthDisabled {
 		env = append(env, "AUTH_DISABLED=1")
 	}

@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"sort"
 
 	"github.com/dltkddnr04/integrated-recorder/internal/adapterproto"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/adaptercatalog"
@@ -10,6 +11,8 @@ import (
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/httpapi"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/installation"
 	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/pluginregistry"
+	"github.com/dltkddnr04/integrated-recorder/internal/runtimehost/storagecatalog"
+	"github.com/dltkddnr04/integrated-recorder/internal/storageproto"
 )
 
 type sourceAwareAdapterCatalog interface {
@@ -59,14 +62,23 @@ func (c *updateController) RefreshPlugins(ctx context.Context) (httpapi.PluginSt
 }
 
 func (c *updateController) InstallPlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	if c.pluginType(id) == pluginregistry.TypeStorage {
+		return c.installStoragePlugin(ctx, id, false)
+	}
 	return c.changePlugin(ctx, id, false)
 }
 
 func (c *updateController) UpdatePlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	if c.pluginType(id) == pluginregistry.TypeStorage {
+		return c.installStoragePlugin(ctx, id, true)
+	}
 	return c.changePlugin(ctx, id, true)
 }
 
 func (c *updateController) UninstallPlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	if c.isStoragePluginInstalled(id) {
+		return c.uninstallStoragePlugin(ctx, id)
+	}
 	operationCtx, cancel, err := c.beginPluginOperation(ctx)
 	if err != nil {
 		return httpapi.PluginStatus{}, err
@@ -100,6 +112,142 @@ func (c *updateController) UninstallPlugin(ctx context.Context, id string) (http
 		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
 	}
 	return c.pluginStatus(), nil
+}
+
+func (c *updateController) installStoragePlugin(ctx context.Context, id string, update bool) (httpapi.PluginStatus, error) {
+	operationCtx, cancel, err := c.beginPluginOperation(ctx)
+	if err != nil {
+		return httpapi.PluginStatus{}, err
+	}
+	defer cancel()
+	defer c.releaseOperation()
+	if c.pluginRegistry == nil || c.storageCatalog == nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_registry_unavailable")
+	}
+	if c.registry.Snapshot().StagedGenerationID != "" {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
+	installed, installedErr := c.installedStorageArtifact(id)
+	if installedErr != nil && !errors.Is(installedErr, storagecatalog.ErrArtifactMissing) {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
+	}
+	if update {
+		if installedErr != nil || c.pluginRegistry == nil || !c.pluginRegistry.UpdateAvailable(id, installed.Version) {
+			return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+		}
+	} else if installedErr == nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
+	var previousConfig *storagecatalog.SetConfig
+	if update {
+		previous, previousErr := c.storageCatalog.DesiredSet(id)
+		if previousErr == nil {
+			config := previous.Config
+			previousConfig = &config
+		} else if !errors.Is(previousErr, storagecatalog.ErrSetMissing) {
+			return httpapi.PluginStatus{}, httpapi.NewControllerError("storage_provider_unavailable")
+		}
+	}
+	plan, err := c.pluginRegistry.PrepareStorageArtifact(operationCtx, id)
+	if err != nil {
+		return httpapi.PluginStatus{}, mapPluginRegistryError(err)
+	}
+	defer plan.Close()
+	selection := plan.Selection()
+	artifact, err := c.storageCatalog.Import(operationCtx, plan.BinaryPath(), storagecatalog.Expected{
+		ID: selection.ID, Version: selection.Version, ProtocolVersion: storageproto.Version,
+		SHA256: selection.Digest, Size: selection.Size,
+	})
+	if err != nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+	}
+	var migratedSet *storagecatalog.Set
+	if update {
+		if previousConfig != nil {
+			// Carry forward the provider configuration to the new immutable
+			// artifact when its schema still accepts it. Existing generations keep
+			// their old set; this only changes the configured candidate. An
+			// incompatible schema leaves the old desired set selected so the
+			// current artifact is reported as needing configuration.
+			if _, _, describeErr := c.storageCatalog.DescribeArtifact(artifact.Digest); describeErr != nil {
+				return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+			}
+			next, setErr := c.storageCatalog.CreateSet(artifact.Digest, *previousConfig)
+			if setErr == nil {
+				migratedSet = &next
+			} else if !errors.Is(setErr, storagecatalog.ErrInvalidConfig) {
+				return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+			}
+		}
+	}
+	if err := c.storageCatalog.Install(artifact); err != nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+	}
+	if migratedSet != nil {
+		if err := c.storageCatalog.SelectDesiredSet(id, migratedSet.ID); err != nil {
+			return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_install_failed")
+		}
+	}
+	return c.pluginStatus(), nil
+}
+
+func (c *updateController) uninstallStoragePlugin(ctx context.Context, id string) (httpapi.PluginStatus, error) {
+	operationCtx, cancel, err := c.beginPluginOperation(ctx)
+	if err != nil {
+		return httpapi.PluginStatus{}, err
+	}
+	defer cancel()
+	defer c.releaseOperation()
+	if c.storageCatalog == nil || c.registry == nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("storage_provider_not_installed")
+	}
+	snapshot := c.registry.Snapshot()
+	if snapshot.StagedGenerationID != "" {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
+	for _, item := range snapshot.Generations {
+		if (item.State == generation.StateActive || item.State == generation.StateDraining || item.State == generation.StateStaging || item.State == generation.StateVerified || item.State == generation.StateReady) && item.StorageProviderSetID != "" {
+			set, loadErr := c.storageCatalog.LoadSet(item.StorageProviderSetID)
+			if loadErr == nil && set.Artifact.ID == id && item.State == generation.StateActive {
+				return httpapi.PluginStatus{}, httpapi.NewControllerError("storage_backend_in_use")
+			}
+		}
+	}
+	if err := operationCtx.Err(); err != nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("plugin_operation_conflict")
+	}
+	if err := c.storageCatalog.Uninstall(id); err != nil {
+		return httpapi.PluginStatus{}, httpapi.NewControllerError("storage_provider_not_installed")
+	}
+	return c.pluginStatus(), nil
+}
+
+func (c *updateController) pluginType(id string) string {
+	if c == nil || c.pluginRegistry == nil {
+		return ""
+	}
+	for _, item := range c.pluginRegistry.View().Plugins {
+		if item.ID == id {
+			return item.Type
+		}
+	}
+	return ""
+}
+
+func (c *updateController) isStoragePluginInstalled(id string) bool {
+	if c == nil || c.storageCatalog == nil || id == "" {
+		return false
+	}
+	items, err := c.storageCatalog.Installed()
+	if err != nil {
+		return false
+	}
+	for _, item := range items {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *updateController) changePlugin(ctx context.Context, id string, update bool) (httpapi.PluginStatus, error) {
@@ -161,24 +309,52 @@ func (c *updateController) beginPluginOperation(ctx context.Context) (context.Co
 }
 
 func (c *updateController) pluginStatus() httpapi.PluginStatus {
-	if c.pluginRegistry == nil {
-		return httpapi.PluginStatus{State: "not_configured", Plugins: []httpapi.PluginStatusItem{}}
+	view := pluginregistry.View{Plugins: []pluginregistry.PluginView{}}
+	status := httpapi.PluginStatus{State: "not_configured", Plugins: []httpapi.PluginStatusItem{}}
+	if c.pluginRegistry != nil {
+		view = c.pluginRegistry.View()
+		status.State = "ready"
+		if !view.Configured {
+			status.State = "not_configured"
+		} else if !view.Available {
+			status.State = "unavailable"
+			status.FailureCode = "plugin_registry_unavailable"
+		}
 	}
-	view := c.pluginRegistry.View()
-	status := httpapi.PluginStatus{State: "ready", Plugins: make([]httpapi.PluginStatusItem, 0, len(view.Plugins))}
-	if !view.Configured {
-		status.State = "not_configured"
-	} else if !view.Available {
-		status.State = "unavailable"
-		status.FailureCode = "plugin_registry_unavailable"
-	}
+	byID := make(map[string]int, len(view.Plugins))
 	for _, item := range view.Plugins {
+		byID[item.ID] = len(status.Plugins)
 		status.Plugins = append(status.Plugins, httpapi.PluginStatusItem{
-			ID: item.ID, Name: item.Name, AvailableVersion: item.AvailableVersion,
+			ID: item.ID, Type: item.Type, Name: item.Name, AvailableVersion: item.AvailableVersion,
 			InstalledVersion: item.InstalledVersion, Installed: item.Installed,
 			UpdateAvailable: item.UpdateAvailable,
 		})
 	}
+	if c.storageCatalog != nil {
+		installed, err := c.storageCatalog.Installed()
+		if err == nil {
+			for _, artifact := range installed {
+				index, exists := byID[artifact.ID]
+				if exists {
+					item := &status.Plugins[index]
+					item.Type = pluginregistry.TypeStorage
+					item.Installed = true
+					item.InstalledVersion = artifact.Version
+					item.UpdateAvailable = c.pluginRegistry != nil && c.pluginRegistry.UpdateAvailable(artifact.ID, artifact.Version)
+					continue
+				}
+				name := artifact.ID
+				if _, descriptor, describeErr := c.storageCatalog.DescribeArtifact(artifact.Digest); describeErr == nil && descriptor.Name != "" {
+					name = descriptor.Name
+				}
+				status.Plugins = append(status.Plugins, httpapi.PluginStatusItem{
+					ID: artifact.ID, Type: pluginregistry.TypeStorage, Name: name,
+					InstalledVersion: artifact.Version, Installed: true,
+				})
+			}
+		}
+	}
+	sort.Slice(status.Plugins, func(i, j int) bool { return status.Plugins[i].ID < status.Plugins[j].ID })
 	return status
 }
 
@@ -236,6 +412,8 @@ func mapPluginRegistryError(err error) error {
 		return httpapi.NewControllerError("plugin_verification_failed")
 	case errors.Is(err, pluginregistry.ErrIdentityMismatch):
 		return httpapi.NewControllerError("plugin_identity_mismatch")
+	case errors.Is(err, pluginregistry.ErrWrongPluginType):
+		return httpapi.NewControllerError("plugin_type_mismatch")
 	case errors.Is(err, pluginregistry.ErrUnavailable):
 		return httpapi.NewControllerError("plugin_registry_unavailable")
 	case errors.Is(err, pluginregistry.ErrAlreadyInstalled), errors.Is(err, pluginregistry.ErrNoUpdateAvailable), errors.Is(err, pluginregistry.ErrOperationConflict):

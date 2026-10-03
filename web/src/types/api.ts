@@ -18,7 +18,7 @@ export type Adapter = { descriptor?: AdapterDescriptor; status: AdapterStatus }
 export type AdapterReconcileResult = { state: 'unchanged' | 'activated' | 'rejected' | 'failed'; active_adapter_count: number; rejected_count: number; failure_code?: string; generation_id?: string }
 export type PluginRegistryStatus = {
   state: 'ready' | 'unavailable' | 'not_configured'; failure_code?: 'plugin_registry_unavailable';
-  plugins: { id: string; name: string; available_version?: string; installed_version?: string; installed: boolean; update_available: boolean }[]
+  plugins: { id: string; type: 'source' | 'storage'; name: string; available_version?: string; installed_version?: string; installed: boolean; update_available: boolean }[]
 }
 export type WatchState = 'disabled' | 'offline' | 'checking' | 'starting' | 'recording' | 'backoff' | 'attention_required' | 'suppressed'
 export type WatchView = {
@@ -123,6 +123,15 @@ export type StoragePool = {
 export type StorageMetricSample = { at: string; read_bytes_per_second: number; write_bytes_per_second: number; buffer_used_bytes: number; persist_queue_bytes: number }
 export type StoragePoolsResponse = { items: StoragePool[] }
 export type StorageMetricsResponse = { pool_id: string; sample_interval_ms: number; sample_interval_seconds: number; items: StorageMetricSample[] }
+export type StorageProviderHealth = 'ready' | 'unknown' | 'failed'
+export type StoragePrimaryProvider = { kind: 'local' | 'plugin'; provider_id?: string; version?: string; state: 'ready' | 'unavailable' }
+export type StorageProviderSummary = {
+  id: string; name: string; version: string; configured: boolean; active: boolean;
+  health: StorageProviderHealth; configuration_schema: Schema
+}
+export type StorageProviderStatus = { primary: StoragePrimaryProvider; providers: StorageProviderSummary[] }
+export type StorageProviderConfig = { values: Record<string, unknown>; configured_secrets: string[] }
+export type StorageProviderConfigBody = { values: Record<string, unknown>; secrets: Record<string, string> }
 export type SystemInfo = { version: string; commit: string; go_version: string; goos: string; goarch: string; started_at: string; uptime_seconds: number; export_available: boolean }
 export type RuntimeBuildIdentity = { version: string; commit: string; build_time: string; release_channel: string; runtime_protocol_version: number }
 export type RuntimeGenerationSummary = { id: string; version: string; commit: string; installed_at: string; state: string; active_recordings: number }

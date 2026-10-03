@@ -49,34 +49,52 @@ function PluginRegistrySection() {
     onError: async error => { await client.invalidateQueries({ queryKey: qk.plugins }); toast('Registry 새로 고침 실패', errorMessage(error), 'error') },
   })
   const install = useMutation({
-    mutationFn: pluginsAPI.install,
-    onSuccess: async () => { await invalidate(); toast('플러그인을 설치하고 새 어댑터 세대를 활성화했습니다.') },
+    mutationFn: ({ id }: { id: string; type: 'source' | 'storage' }) => pluginsAPI.install(id),
+    onSuccess: async (_result, plugin) => { await invalidate(); toast(plugin.type === 'storage' ? 'Storage provider 실행 파일을 설치했습니다.' : '플러그인을 설치하고 새 어댑터 세대를 활성화했습니다.', plugin.type === 'storage' ? '저장소 페이지에서 설정하고 별도로 활성화해야 기본 저장소가 바뀝니다.' : undefined) },
     onError: error => toast('플러그인 설치 실패', errorMessage(error), 'error'),
   })
   const update = useMutation({
-    mutationFn: pluginsAPI.update,
-    onSuccess: async () => { await invalidate(); toast('플러그인을 업데이트하고 새 어댑터 세대를 활성화했습니다.', '진행 중인 녹화는 기존 어댑터 세대를 계속 사용합니다.') },
+    mutationFn: ({ id }: { id: string; type: 'source' | 'storage' }) => pluginsAPI.update(id),
+    onSuccess: async (_result, plugin) => { await invalidate(); toast(plugin.type === 'storage' ? 'Storage provider 실행 파일을 업데이트했습니다.' : '플러그인을 업데이트하고 새 어댑터 세대를 활성화했습니다.', plugin.type === 'storage' ? '기본 저장소는 변경되지 않았습니다. 저장소 페이지에서 적용할 수 있습니다.' : '진행 중인 녹화는 기존 어댑터 세대를 계속 사용합니다.') },
     onError: error => toast('플러그인 업데이트 실패', errorMessage(error), 'error'),
   })
   const uninstall = useMutation({
-    mutationFn: pluginsAPI.uninstall,
-    onSuccess: async () => { await invalidate(); toast('플러그인을 제거하고 새 어댑터 세대를 활성화했습니다.', '기존 녹화가 참조하는 파일은 안전하게 보존됩니다.') },
+    mutationFn: ({ id }: { id: string; type: 'source' | 'storage' }) => pluginsAPI.uninstall(id),
+    onSuccess: async (_result, plugin) => { await invalidate(); toast(plugin.type === 'storage' ? 'Storage provider 설치 파일을 제거했습니다.' : '플러그인을 제거하고 새 어댑터 세대를 활성화했습니다.', plugin.type === 'storage' ? '현재 세대나 진행 중인 녹화가 참조하는 파일은 보존됩니다.' : '기존 녹화가 참조하는 파일은 안전하게 보존됩니다.') },
     onError: error => toast('플러그인 제거 실패', errorMessage(error), 'error'),
   })
   const busy = refresh.isPending || install.isPending || update.isPending || uninstall.isPending
   const status = query.data as PluginRegistryStatus | undefined
+  const sourcePlugins = status?.plugins.filter(plugin => plugin.type !== 'storage') ?? []
+  const storagePlugins = status?.plugins.filter(plugin => plugin.type === 'storage') ?? []
   return <section aria-labelledby="plugin-registry-title" className="overflow-hidden rounded-lg border border-border bg-card">
     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
-      <div className="flex items-center gap-2"><PackageOpen className="h-4 w-4 text-primary" /><div><h2 id="plugin-registry-title" className="text-sm font-semibold">Plugin Registry</h2><p className="mt-0.5 text-xs text-muted-foreground">승인된 어댑터를 검증한 뒤 새 Runtime 세대로 적용합니다.</p></div></div>
+      <div className="flex items-center gap-2"><PackageOpen className="h-4 w-4 text-primary" /><div><h2 id="plugin-registry-title" className="text-sm font-semibold">Plugin Registry</h2><p className="mt-0.5 text-xs text-muted-foreground">승인된 source adapter와 storage provider 실행 파일을 내려받습니다.</p></div></div>
       <Button variant="outline" disabled={busy} onClick={() => refresh.mutate()}><RefreshCw className={`h-4 w-4 ${refresh.isPending ? 'animate-spin' : ''}`} />Registry 새로고침</Button>
     </div>
     {query.isPending ? <div className="p-4"><LoadingState /></div> : query.error ? <div className="p-4"><ErrorState message={errorMessage(query.error)} retry={() => void query.refetch()} /></div> : status?.state === 'not_configured' ? <div className="p-4 text-sm text-muted-foreground">Plugin Registry가 구성되지 않았습니다. 관리자가 Runtime Host의 registry URL을 설정하면 사용할 수 있습니다.</div> : <>
-      {status?.state === 'unavailable' && <div role="status" className="flex items-start gap-2 border-b border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"><CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />Registry에 연결할 수 없습니다. 이미 설치된 어댑터는 계속 사용할 수 있습니다.</div>}
-      {status?.plugins.length ? <div className="divide-y divide-border">{status.plugins.map(plugin => <div key={plugin.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-        <div className="min-w-0"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{plugin.name}</span>{plugin.installed && <Badge tone="green">설치됨</Badge>}</div><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{plugin.id} · {plugin.installed ? `설치 ${plugin.installed_version}` : '미설치'}{plugin.available_version ? ` · Registry ${plugin.available_version}` : ''}</p></div>
-        <div className="flex flex-wrap gap-2">{!plugin.installed && plugin.available_version && <Button size="sm" disabled={busy} onClick={() => install.mutate(plugin.id)}><Download className="h-3.5 w-3.5" />설치</Button>}{plugin.installed && plugin.update_available && <Button size="sm" variant="outline" disabled={busy} onClick={() => update.mutate(plugin.id)}><Upload className="h-3.5 w-3.5" />업데이트</Button>}{plugin.installed && <Button size="sm" variant="ghost" disabled={busy} onClick={() => uninstall.mutate(plugin.id)}><Trash2 className="h-3.5 w-3.5" />제거</Button>}</div>
-      </div>)}</div> : <div className="p-4 text-sm text-muted-foreground">{status?.state === 'unavailable' ? 'Registry를 사용할 수 없어 설치 가능한 플러그인을 표시하지 못했습니다.' : 'Registry에 등록된 플러그인이 없습니다.'}</div>}
+      {status?.state === 'unavailable' && <div role="status" className="flex items-start gap-2 border-b border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"><CircleAlert className="mt-0.5 h-4 w-4 shrink-0" />Registry에 연결할 수 없습니다. 이미 설치된 어댑터는 계속 사용할 수 있습니다. 설치된 storage provider도 계속 사용할 수 있습니다.</div>}
+      <PluginGroup title="Source adapters" description="설치·업데이트하면 검증 후 새 adapter generation에 적용됩니다." plugins={sourcePlugins} busy={busy} onInstall={plugin => install.mutate(plugin)} onUpdate={plugin => update.mutate(plugin)} onUninstall={plugin => uninstall.mutate(plugin)} unavailable={status?.state === 'unavailable'} />
+      <div className="border-t border-border">
+        <PluginGroup title="Storage providers" description="설치·업데이트는 실행 파일을 검증해 보관할 뿐 기본 저장소를 바꾸지 않습니다. 설정 및 별도 활성화는 저장소 페이지에서 진행합니다." plugins={storagePlugins} busy={busy} onInstall={plugin => install.mutate(plugin)} onUpdate={plugin => update.mutate(plugin)} onUninstall={plugin => uninstall.mutate(plugin)} unavailable={status?.state === 'unavailable'} storage />
+        <div className="px-4 pb-4"><Link to="/storage" className="text-xs font-medium text-primary hover:underline">저장소 설정 보기 <ArrowRight className="inline h-3 w-3" /></Link></div>
+      </div>
     </>}
+  </section>
+}
+
+type RegistryPlugin = PluginRegistryStatus['plugins'][number]
+function PluginGroup({ title, description, plugins, busy, onInstall, onUpdate, onUninstall, unavailable, storage = false }: {
+  title: string; description: string; plugins: RegistryPlugin[]; busy: boolean;
+  onInstall: (plugin: RegistryPlugin) => void; onUpdate: (plugin: RegistryPlugin) => void;
+  onUninstall: (plugin: RegistryPlugin) => void; unavailable: boolean; storage?: boolean
+}) {
+  return <section aria-label={title}>
+    <div className="px-4 pb-2 pt-4"><h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</h3><p className="mt-1 text-xs text-muted-foreground">{description}</p></div>
+    {plugins.length ? <div className="divide-y divide-border">{plugins.map(plugin => <div key={plugin.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+      <div className="min-w-0"><div className="flex items-center gap-2"><span className="truncate text-sm font-medium">{plugin.name}</span>{plugin.installed && <Badge tone="green">설치됨</Badge>}</div><p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{plugin.id} · {plugin.installed ? `설치 ${plugin.installed_version ?? '버전 미상'}` : '미설치'}{plugin.available_version ? ` · 사용 가능 ${plugin.available_version}` : ''}</p></div>
+      <div className="flex flex-wrap gap-2">{!plugin.installed && plugin.available_version && <Button size="sm" disabled={busy || unavailable} onClick={() => onInstall(plugin)}><Download className="h-3.5 w-3.5" />설치</Button>}{plugin.installed && plugin.update_available && <Button size="sm" variant="outline" disabled={busy || unavailable} onClick={() => onUpdate(plugin)}><Upload className="h-3.5 w-3.5" />업데이트</Button>}{plugin.installed && <Button size="sm" variant="ghost" disabled={busy} onClick={() => onUninstall(plugin)}><Trash2 className="h-3.5 w-3.5" />제거</Button>}</div>
+    </div>)}</div> : <p className="px-4 pb-4 text-sm text-muted-foreground">{unavailable ? `Registry를 사용할 수 없어 새 ${storage ? 'storage provider' : 'source adapter'} 목록을 표시하지 못했습니다.` : `등록된 ${storage ? 'storage provider' : 'source adapter'}가 없습니다.`}</p>}
   </section>
 }
 

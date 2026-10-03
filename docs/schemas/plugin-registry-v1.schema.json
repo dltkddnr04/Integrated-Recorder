@@ -63,7 +63,7 @@
       "additionalProperties": false,
       "required": ["os", "arch", "url", "filename", "size", "sha256"],
       "properties": {
-        "os": {"const": "linux"},
+      "os": {"enum": ["linux", "darwin"]},
         "arch": {"enum": ["amd64", "arm64"]},
         "url": {"type": "string", "minLength": 9, "maxLength": 2048, "pattern": "^https://[^/@?#]+/[^#]*$"},
         "filename": {
